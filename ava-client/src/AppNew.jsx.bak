@@ -1,0 +1,393 @@
+import React, { useEffect, useRef, useState } from 'react'
+import './ChatHistory.css'
+
+export default function App(){
+  const [connected, setConnected] = useState(false)
+  const [vad, setVad] = useState('silent')
+  const [msgs, setMsgs] = useState([{who:'bot', text:'Ready. Choose Voice Mode or Text Chat Mode.'}])
+  const [playing, setPlaying] = useState(false)
+  
+  // New state for chat history and sessions
+  const [showHistory, setShowHistory] = useState(false)
+  const [chatHistory, setChatHistory] = useState([])
+  const [searchQuery, setSearchQuery] = useState('')
+  const [searchResults, setSearchResults] = useState([])
+  const [currentSessionId, setCurrentSessionId] = useState(null)
+  const [isTextMode, setIsTextMode] = useState(true)
+  const [isLoading, setIsLoading] = useState(false)
+
+  const pcRef = useRef(null)
+  const dataRef = useRef(null)
+  const micRef = useRef(null)
+  const audioRef = useRef(null)
+  const vuRef = useRef(null)
+  const rtSessionRef = useRef(null)
+  const wsRef = useRef(null)
+
+  // Load chat history on component mount
+  useEffect(() => {
+    if (isTextMode) {
+      loadChatHistory()
+    }
+  }, [isTextMode])
+
+  // Load chat history from AVA Bridge
+  async function loadChatHistory() {
+    try {
+      const response = await fetch('http://127.0.0.1:5051/api/history')
+      const data = await response.json()
+      if (data.status === 'success') {
+        setChatHistory(data.sessions || [])
+      }
+    } catch (e) {
+      console.error('Failed to load chat history:', e)
+    }
+  }
+
+  // Search chat history
+  async function searchHistory(query) {
+    if (!query.trim()) {
+      setSearchResults([])
+      return
+    }
+    
+    try {
+      const response = await fetch('http://127.0.0.1:5051/api/history/search', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ query })
+      })
+      const data = await response.json()
+      if (data.status === 'success') {
+        setSearchResults(data.results || [])
+      }
+    } catch (e) {
+      console.error('Failed to search history:', e)
+    }
+  }
+
+  // Create new chat session
+  async function createNewSession() {
+    try {
+      const response = await fetch('http://127.0.0.1:5051/api/session/new', {
+        method: 'POST'
+      })
+      const data = await response.json()
+      if (data.status === 'success') {
+        setCurrentSessionId(data.session_id)
+        setMsgs([{who:'bot', text:'New chat session started. How can I help you?'}])
+        loadChatHistory() // Refresh history
+      }
+    } catch (e) {
+      console.error('Failed to create new session:', e)
+      addMsg('bot', 'Error creating new session')
+    }
+  }
+
+  // Send text message to AVA Bridge
+  async function sendTextMessage(message) {
+    setIsLoading(true)
+    try {
+      const response = await fetch('http://127.0.0.1:5051/api/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ 
+          message,
+          session_id: currentSessionId 
+        })
+      })
+      const data = await response.json()
+      if (data.status === 'success') {
+        addMsg('bot', data.message)
+        if (data.session_id) {
+          setCurrentSessionId(data.session_id)
+        }
+        loadChatHistory() // Refresh history after new message
+      } else {
+        addMsg('bot', `Error: ${data.message}`)
+      }
+    } catch (e) {
+      addMsg('bot', `Connection error: ${e.message}`)
+    } finally {
+      setIsLoading(false)
+    }
+  }
+
+  // Load specific chat session
+  function loadChatSession(session) {
+    setCurrentSessionId(session.id)
+    setMsgs([])
+    session.messages.forEach(msg => {
+      if (msg.user) addMsg('user', msg.user)
+      if (msg.ava) addMsg('bot', msg.ava)
+    })
+  }
+
+  // Live mic VU + simple VAD for barge-in (Voice Mode)
+  function startLocalVAD(stream){
+    const ctx = new (window.AudioContext||window.webkitAudioContext)({sampleRate:48000})
+    const src = ctx.createMediaStreamSource(stream)
+    const analyser = ctx.createAnalyser()
+    analyser.fftSize = 512
+    const bins = new Uint8Array(analyser.fftSize)
+    src.connect(analyser)
+
+    let smooth = 0
+    const loop = () => {
+      analyser.getByteTimeDomainData(bins)
+      let sum=0; for (let i=0;i<bins.length;i++){ const d=(bins[i]-128)/128; sum+=d*d }
+      const rms = Math.sqrt(sum/bins.length)
+      smooth = 0.8*smooth + 0.2*rms
+      const pct = Math.min(100, Math.max(0, (smooth*6)*100))
+      if (vuRef.current) vuRef.current.style.width = pct.toFixed(0)+'%'
+      const speaking = smooth > 0.05
+      setVad(speaking ? 'speaking' : 'silent')
+
+      // barge-in: pause model audio if user speaks
+      if (speaking && playing && audioRef.current && !audioRef.current.paused) {
+        try { audioRef.current.pause(); audioRef.current.currentTime = 0 } catch {}
+        setPlaying(false)
+        addMsg('bot', '(barge-in) Stopped talking to listen.')
+      }
+      requestAnimationFrame(loop)
+    }
+    loop()
+  }
+
+  function addMsg(who, text){
+    setMsgs(m => [...m, {who, text}])
+    setTimeout(() => {
+      const scroller = document.querySelector('.msgs')
+      if (scroller) scroller.scrollTop = scroller.scrollHeight
+    }, 0)
+  }
+
+  function doSend(){
+    const el = document.getElementById('composer')
+    const txt = (el?.value || '').trim()
+    if (!txt) return
+    
+    addMsg('user', txt)
+    if (el) el.value = ''
+    
+    if (isTextMode) {
+      sendTextMessage(txt)
+      return
+    }
+    
+    // Voice mode logic (existing)
+    const content = txt.toLowerCase().startsWith('ava') ? txt : ('ava ' + txt)
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      try { wsRef.current.send(JSON.stringify({ type: 'response.create', response: { instructions: content } })) }
+      catch (e) { addMsg('bot', `Send failed (WS): ${e}`) }
+      return
+    }
+    addMsg('bot','Connect first.')
+  }
+
+  async function connect(){
+    if (pcRef.current) { try{ pcRef.current.close() }catch{} pcRef.current=null }
+    setConnected(false)
+
+    // 1) fetch ephemeral session from configured server (default: :8080)
+    let key = null
+    let model = 'gpt-4o-realtime-preview'
+    try {
+      const base = import.meta.env.VITE_AVA_SERVER_URL || 'http://localhost:8080'
+      const resp = await fetch(`${base.replace(/\\/$/, '')}/session`)
+      if (!resp.ok) {
+        const txt = await resp.text().catch(()=>resp.statusText)
+        addMsg('bot', `Session error: ${resp.status} ${txt}`)
+        return
+      }
+      const s = await resp.json()
+      key = s?.client_secret?.value
+      if (s?.model) model = s.model
+      if (!key) {
+        addMsg('bot','No client_secret returned by /session')
+        return
+      }
+    } catch (e) {
+      addMsg('bot', `Failed to call /session: ${e}`)
+      return
+    }
+
+    // 2) WebSocket transport via backend proxy (no SDP)
+    try {
+      const base = import.meta.env.VITE_AVA_SERVER_URL || 'http://localhost:8080'
+      const wsUrl = (base.startsWith('https://') ? base.replace('https://','wss://') : base.replace('http://','ws://')).replace(/\\/$/, '') + '/realtime/ws'
+      const ws = new WebSocket(wsUrl)
+      wsRef.current = ws
+      ws.onopen = () => {
+        setConnected(true)
+        addMsg('bot','Connected via WebSocket (proxied).')
+        try { ws.send(JSON.stringify({ type: 'session.update', session: { instructions: 'You are AVa, a helpful, concise assistant with a warm, natural voice.', voice: 'nova' } })) } catch {}
+      }
+      ws.onmessage = (ev) => {
+        try {
+          const obj = JSON.parse(ev.data)
+          // Minimal text handling for common event shapes
+          if (obj?.type === 'response.output_text.delta' && obj?.delta) {
+            addMsg('bot', String(obj.delta))
+          } else if (obj?.output_text) {
+            addMsg('bot', String(obj.output_text))
+          } else if (obj?.response?.output_text) {
+            addMsg('bot', String(obj.response.output_text))
+          }
+        } catch {
+          // Non-JSON events; ignore or log
+        }
+      }
+      ws.onerror = () => { addMsg('bot','WebSocket error. Check backend logs.') }
+      ws.onclose = () => { setConnected(false); addMsg('bot','Disconnected.') }
+    } catch (e) {
+      addMsg('bot', `Connect error: ${e}`)
+      return
+    }
+  }
+
+  async function startMic(){
+    if (!pcRef.current){ addMsg('bot','Connect first.'); return }
+    if (micRef.current) return
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: { channelCount:1, sampleRate:16000, echoCancellation:true, noiseSuppression:true, autoGainControl:true }
+    })
+    micRef.current = stream
+    const track = stream.getAudioTracks()[0]
+    pcRef.current.addTrack(track, stream)
+    addMsg('bot','Mic on. Say "ava" to wake me.')
+    startLocalVAD(stream)
+  }
+
+  function stopAll(){
+    if (micRef.current) { micRef.current.getTracks().forEach(t=>t.stop()); micRef.current=null }
+    if (pcRef.current){ pcRef.current.getSenders().forEach(s=>{ try{s.track && s.track.stop()}catch{} }); pcRef.current.close(); pcRef.current=null }
+    setConnected(false)
+    addMsg('bot','Disconnected.')
+  }
+
+  return (
+    <div className="shell">
+      <div className="topbar">
+        <div className={`dot ${connected || isTextMode ? 'on' : 'off'}`}></div>
+        <div className="brand">
+          AVA — Ambient Voice Assistant
+          <span className="pill">
+            {isTextMode ? 'Text Chat Mode' : 'Voice Mode: "ava"'}
+          </span>
+        </div>
+        <div className="row">
+          <button 
+            onClick={() => setIsTextMode(!isTextMode)}
+            className={isTextMode ? 'active' : ''}
+          >
+            {isTextMode ? 'Switch to Voice' : 'Switch to Text'}
+          </button>
+          <button onClick={() => setShowHistory(!showHistory)}>
+            {showHistory ? 'Hide History' : 'Show History'}
+          </button>
+          {isTextMode && (
+            <button onClick={createNewSession}>New Chat</button>
+          )}
+          {!isTextMode && (
+            <>
+              <button onClick={connect}>Connect</button>
+              <button onClick={startMic}>Start Mic</button>
+              <button onClick={stopAll}>Stop</button>
+            </>
+          )}
+        </div>
+      </div>
+
+      <div className="wrap">
+        <div className={`main-content ${showHistory ? 'with-sidebar' : ''}`}>
+          {/* Chat History Sidebar */}
+          {showHistory && (
+            <div className="chat-sidebar">
+              <div className="sidebar-header">
+                <h3>Chat History</h3>
+                <div className="search-box">
+                  <input
+                    type="text"
+                    placeholder="Search conversations..."
+                    value={searchQuery}
+                    onChange={(e) => {
+                      setSearchQuery(e.target.value)
+                      searchHistory(e.target.value)
+                    }}
+                  />
+                </div>
+              </div>
+              
+              <div className="sidebar-content">
+                {searchResults.length > 0 ? (
+                  <div className="search-results">
+                    <h4>Search Results ({searchResults.length})</h4>
+                    {searchResults.map((result, i) => (
+                      <div key={i} className="search-result">
+                        <div className="result-timestamp">
+                          {new Date(result.timestamp).toLocaleDateString()}
+                        </div>
+                        <div className="result-user">{result.user_message}</div>
+                        <div className="result-ava">{result.ava_response.substring(0, 100)}...</div>
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <div className="chat-sessions">
+                    {chatHistory.length === 0 ? (
+                      <div className="no-history">No chat history yet</div>
+                    ) : (
+                      chatHistory.map((session) => (
+                        <div 
+                          key={session.id} 
+                          className={`session-item ${currentSessionId === session.id ? 'active' : ''}`}
+                          onClick={() => loadChatSession(session)}
+                        >
+                          <div className="session-date">{session.date}</div>
+                          <div className="session-preview">{session.preview}</div>
+                          <div className="session-count">{session.messages.length} messages</div>
+                        </div>
+                      ))
+                    )}
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+
+          {/* Main Chat Area */}
+          <div className="card">
+            <div className="msgs">
+              {msgs.map((m,i)=>(<div key={i} className={`msg ${m.who==='user'?'user':'bot'}`}>{m.text}</div>))}
+              {isLoading && <div className="msg bot loading">AVA is thinking...</div>}
+            </div>
+            
+            {!isTextMode && (
+              <div className="status">
+                <div>Connection: <span className="small">{connected?'connected':'disconnected'}</span> • Speech: <span className="small">{vad}</span></div>
+                <div className="meter"><div ref={vuRef}></div></div>
+                <div className="hint">Say "ava" to talk hands-free. Speaking while AVA talks will interrupt (barge-in).</div>
+              </div>
+            )}
+            
+            <div className="composer">
+              <input 
+                id="composer" 
+                type="text" 
+                placeholder={isTextMode ? "Type your message..." : "Type to chat (optional)..."} 
+                onKeyDown={(e)=>{ if(e.key==='Enter') doSend() }} 
+                disabled={isLoading}
+              />
+              <button onClick={doSend} disabled={isLoading}>
+                {isLoading ? 'Sending...' : 'Send'}
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <audio ref={audioRef} autoPlay />
+    </div>
+  )
+}

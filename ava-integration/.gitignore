@@ -1,0 +1,54 @@
+# AVA Security-Sensitive Files
+# ============================
+# These files contain API keys and should NEVER be committed!
+
+# Environment files with secrets
+.env
+.env.local
+.env.*.local
+
+# Plain text API key files (DEPRECATED - migrate to keyring)
+*api key.txt
+*api.txt
+*key.txt
+*.key
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+*.egg
+
+# Log files (may contain sensitive info)
+*.log
+*.err.log
+*.out.log
+
+# Database files
+*.db
+*.sqlite
+*.sqlite3
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Test artifacts
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Backup files
+*.backup
+*.bak
+*.backup-*
+
+# OS files
+.DS_Store
+Thumbs.db

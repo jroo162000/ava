@@ -1,0 +1,11 @@
+Version note - Stable baseline
+Date: 2025-12-17
+
+Summary:
+- Deepgram Agent voice path integrated (mic → Agent ASR, audio out → PCM) with symbol-safe local TTS routing to server brain.
+- Auto-start and health-check for ava-server (hot runner + standalone fallback).
+- Half-duplex echo gating during TTS; barge-in with debounce and dynamic thresholds.
+- Hot-reload for config and identity; hot-runner auto-restarts on code changes.
+
+If rollback is needed, reference this snapshot date.
+

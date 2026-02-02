@@ -1,0 +1,276 @@
+import React, { useEffect, useRef, useState } from 'react'
+import './ChatHistory.css'
+
+export default function App(){
+  const [connected, setConnected] = useState(false)
+  const [vad, setVad] = useState('silent')
+  const [msgs, setMsgs] = useState([{who:'bot', text:'Ready. Choose Voice Mode or Text Chat Mode.'}])
+  const [playing, setPlaying] = useState(false)
+  
+  // New state for chat history and sessions
+  const [showHistory, setShowHistory] = useState(false)
+  const [chatHistory, setChatHistory] = useState([])
+  const [searchQuery, setSearchQuery] = useState('')
+  const [searchResults, setSearchResults] = useState([])
+  const [currentSessionId, setCurrentSessionId] = useState(null)
+  const [isTextMode, setIsTextMode] = useState(true)
+  const [isLoading, setIsLoading] = useState(false)
+
+  const pcRef = useRef(null)
+  const dataRef = useRef(null)
+  const micRef = useRef(null)
+  const audioRef = useRef(null)
+  const vuRef = useRef(null)
+  const rtSessionRef = useRef(null)
+  const wsRef = useRef(null)
+
+  // Load chat history on component mount
+  useEffect(() => {
+    if (isTextMode) {
+      loadChatHistory()
+    }
+  }, [isTextMode])
+
+  // Load chat history from AVA Bridge
+  async function loadChatHistory() {
+    try {
+      const response = await fetch('http://127.0.0.1:5051/api/history')
+      const data = await response.json()
+      if (data.status === 'success') {
+        setChatHistory(data.sessions || [])
+      }
+    } catch (e) {
+      console.error('Failed to load chat history:', e)
+    }
+  }
+
+  // Search chat history
+  async function searchHistory(query) {
+    if (!query.trim()) {
+      setSearchResults([])
+      return
+    }
+    
+    try {
+      const response = await fetch('http://127.0.0.1:5051/api/history/search', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ query })
+      })
+      const data = await response.json()
+      if (data.status === 'success') {
+        setSearchResults(data.results || [])
+      }
+    } catch (e) {
+      console.error('Failed to search history:', e)
+    }
+  }
+
+  // Create new chat session
+  async function createNewSession() {
+    try {
+      const response = await fetch('http://127.0.0.1:5051/api/session/new', {
+        method: 'POST'
+      })
+      const data = await response.json()
+      if (data.status === 'success') {
+        setCurrentSessionId(data.session_id)
+        setMsgs([{who:'bot', text:'New chat session started. How can I help you?'}])
+        loadChatHistory() // Refresh history
+      }
+    } catch (e) {
+      console.error('Failed to create new session:', e)
+      addMsg('bot', 'Error creating new session')
+    }
+  }
+
+  // Send text message to AVA Bridge
+  async function sendTextMessage(message) {
+    setIsLoading(true)
+    try {
+      const response = await fetch('http://127.0.0.1:5051/api/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ 
+          message,
+          session_id: currentSessionId 
+        })
+      })
+      const data = await response.json()
+      if (data.status === 'success') {
+        addMsg('bot', data.message)
+        if (data.session_id) {
+          setCurrentSessionId(data.session_id)
+        }
+        loadChatHistory() // Refresh history after new message
+      } else {
+        addMsg('bot', `Error: ${data.message}`)
+      }
+    } catch (e) {
+      addMsg('bot', `Connection error: ${e.message}`)
+    } finally {
+      setIsLoading(false)
+    }
+  }
+
+  // Load specific chat session
+  function loadChatSession(session) {
+    setCurrentSessionId(session.id)
+    setMsgs([])
+    session.messages.forEach(msg => {
+      if (msg.user) addMsg('user', msg.user)
+      if (msg.ava) addMsg('bot', msg.ava)
+    })
+  }
+
+  function addMsg(who, text){
+    setMsgs(m => [...m, {who, text}])
+    setTimeout(() => {
+      const scroller = document.querySelector('.msgs')
+      if (scroller) scroller.scrollTop = scroller.scrollHeight
+    }, 0)
+  }
+
+  function doSend(){
+    const el = document.getElementById('composer')
+    const txt = (el?.value || '').trim()
+    if (!txt) return
+    
+    addMsg('user', txt)
+    if (el) el.value = ''
+    
+    if (isTextMode) {
+      sendTextMessage(txt)
+      return
+    }
+    
+    addMsg('bot','Voice mode not implemented yet. Switch to Text Chat Mode.')
+  }
+
+  async function connect(){
+    try {
+      setConnected(true)
+      addMsg('bot','Connected to AVA Bridge on port 5051.')
+    } catch (e) {
+      addMsg('bot', `Connect error: ${e}`)
+      return
+    }
+  }
+
+  return (
+    <div className="shell">
+      <div className="topbar">
+        <div className={`dot ${connected || isTextMode ? 'on' : 'off'}`}></div>
+        <div className="brand">
+          AVA — Ambient Voice Assistant
+          <span className="pill">
+            {isTextMode ? 'Text Chat Mode' : 'Voice Mode: \"ava\"'}
+          </span>
+        </div>
+        <div className="row">
+          <button 
+            onClick={() => setIsTextMode(!isTextMode)}
+            className={isTextMode ? 'active' : ''}
+          >
+            {isTextMode ? 'Switch to Voice' : 'Switch to Text'}
+          </button>
+          <button onClick={() => setShowHistory(!showHistory)}>
+            {showHistory ? 'Hide History' : 'Show History'}
+          </button>
+          {isTextMode && (
+            <button onClick={createNewSession}>New Chat</button>
+          )}
+          {!isTextMode && (
+            <>
+              <button onClick={connect}>Connect</button>
+              <button onClick={() => addMsg('bot', 'Voice features coming soon')}>Start Mic</button>
+              <button onClick={() => setConnected(false)}>Stop</button>
+            </>
+          )}
+        </div>
+      </div>
+
+      <div className="wrap">
+        <div className={`main-content ${showHistory ? 'with-sidebar' : ''}`}>
+          {/* Chat History Sidebar */}
+          {showHistory && (
+            <div className="chat-sidebar">
+              <div className="sidebar-header">
+                <h3>Chat History</h3>
+                <div className="search-box">
+                  <input
+                    type="text"
+                    placeholder="Search conversations..."
+                    value={searchQuery}
+                    onChange={(e) => {
+                      setSearchQuery(e.target.value)
+                      searchHistory(e.target.value)
+                    }}
+                  />
+                </div>
+              </div>
+              
+              <div className="sidebar-content">
+                {searchResults.length > 0 ? (
+                  <div className="search-results">
+                    <h4>Search Results ({searchResults.length})</h4>
+                    {searchResults.map((result, i) => (
+                      <div key={i} className="search-result">
+                        <div className="result-timestamp">
+                          {new Date(result.timestamp).toLocaleDateString()}
+                        </div>
+                        <div className="result-user">{result.user_message}</div>
+                        <div className="result-ava">{result.ava_response.substring(0, 100)}...</div>
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <div className="chat-sessions">
+                    {chatHistory.length === 0 ? (
+                      <div className="no-history">No chat history yet</div>
+                    ) : (
+                      chatHistory.map((session) => (
+                        <div 
+                          key={session.id} 
+                          className={`session-item ${currentSessionId === session.id ? 'active' : ''}`}
+                          onClick={() => loadChatSession(session)}
+                        >
+                          <div className="session-date">{session.date}</div>
+                          <div className="session-preview">{session.preview}</div>
+                          <div className="session-count">{session.messages.length} messages</div>
+                        </div>
+                      ))
+                    )}
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+
+          {/* Main Chat Area */}
+          <div className="card">
+            <div className="msgs">
+              {msgs.map((m,i)=>(<div key={i} className={`msg ${m.who==='user'?'user':'bot'}`}>{m.text}</div>))}
+              {isLoading && <div className="msg bot loading">AVA is thinking...</div>}
+            </div>
+            
+            <div className="composer">
+              <input 
+                id="composer" 
+                type="text" 
+                placeholder={isTextMode ? "Type your message..." : "Type to chat (optional)..."} 
+                onKeyDown={(e)=>{ if(e.key==='Enter') doSend() }} 
+                disabled={isLoading}
+              />
+              <button onClick={doSend} disabled={isLoading}>
+                {isLoading ? 'Sending...' : 'Send'}
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <audio ref={audioRef} autoPlay />
+    </div>
+  )
+} 

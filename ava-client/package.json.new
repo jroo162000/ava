@@ -1,0 +1,47 @@
+{
+  "name": "ava-client",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "main": "electron-main.cjs",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "lint": "eslint . && eslint . --config .eslintrc-ava.js",
+    "lint:ava": "eslint . --config .eslintrc-ava.js",
+    "preview": "vite preview",
+    "desktop": "npx electron .",
+    "check-duplication": "node scripts/check-duplication.js",
+    "precommit": "npm run lint:ava && npm run check-duplication"
+  },
+  "dependencies": {
+    "@openai/agents": "^0.1.0",
+    "react": "^19.1.1",
+    "react-dom": "^19.1.1"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.33.0",
+    "@types/react": "^19.1.10",
+    "@types/react-dom": "^19.1.7",
+    "@vitejs/plugin-react": "^5.0.0",
+    "electron": "^38.0.0",
+    "eslint": "^9.33.0",
+    "eslint-plugin-react-hooks": "^5.2.0",
+    "eslint-plugin-react-refresh": "^0.4.20",
+    "globals": "^16.3.0",
+    "react-devtools": "^1.0.5",
+    "vite": "^7.1.5"
+  },
+  "ava": {
+    "architecture": {
+      "unified_component": "src/components/AVA.jsx",
+      "prohibited_patterns": [
+        "src/**/App*.jsx",
+        "src/**/ModernAVA*.jsx", 
+        "src/**/EnhancedAVA*.jsx",
+        "src/**/SimpleAVA*.jsx"
+      ],
+      "last_cleanup": "2025-01-12"
+    }
+  }
+}

@@ -1,0 +1,72 @@
+# Dependencies
+node_modules/
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Environment and secrets - SECURITY CRITICAL
+.env
+.env.*
+.env.local
+.env.*.local
+*.env
+secrets.json
+secrets/
+*.secret
+*.secrets
+
+# API keys - NEVER commit these
+*api*key*.txt
+*api*.txt
+*.key
+*.pem
+*.p12
+*.pfx
+credentials.json
+service-account*.json
+
+# Data files (local only)
+data/*.jsonl
+data/*.sqlite
+data/*_model.json
+memory.json
+memory.sqlite
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Build
+dist/
+build/
+*.tsbuildinfo
+
+# Test
+coverage/
+.nyc_output/
+
+# Archive (legacy code)
+archive/
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+
+# Security - block common sensitive patterns
+*password*
+*token*.txt
+*credential*
+private/

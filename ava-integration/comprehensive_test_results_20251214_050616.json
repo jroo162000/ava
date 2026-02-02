@@ -1,0 +1,359 @@
+{
+  "summary": {
+    "total": 31,
+    "passed": 28,
+    "failed": 3,
+    "success_rate": 90.32258064516128
+  },
+  "tool_results": {
+    "analysis_ops": {
+      "total": 3,
+      "passed": 3,
+      "failed": 0
+    },
+    "memory_system": {
+      "total": 3,
+      "passed": 3,
+      "failed": 0
+    },
+    "json_ops": {
+      "total": 2,
+      "passed": 2,
+      "failed": 0
+    },
+    "sys_ops": {
+      "total": 1,
+      "passed": 1,
+      "failed": 0
+    },
+    "fs_ops": {
+      "total": 1,
+      "passed": 1,
+      "failed": 0
+    },
+    "screen_ops": {
+      "total": 1,
+      "passed": 0,
+      "failed": 1
+    },
+    "net_ops": {
+      "total": 1,
+      "passed": 0,
+      "failed": 1
+    },
+    "window_ops": {
+      "total": 1,
+      "passed": 1,
+      "failed": 0
+    },
+    "calendar_ops": {
+      "total": 1,
+      "passed": 0,
+      "failed": 1
+    },
+    "audio_ops": {
+      "total": 1,
+      "passed": 1,
+      "failed": 0
+    },
+    "boot_repair": {
+      "total": 1,
+      "passed": 1,
+      "failed": 0
+    },
+    "browser_automation": {
+      "total": 1,
+      "passed": 1,
+      "failed": 0
+    },
+    "camera_ops": {
+      "total": 1,
+      "passed": 1,
+      "failed": 0
+    },
+    "comm_ops": {
+      "total": 1,
+      "passed": 1,
+      "failed": 0
+    },
+    "iot_ops": {
+      "total": 1,
+      "passed": 1,
+      "failed": 0
+    },
+    "key_ops": {
+      "total": 1,
+      "passed": 1,
+      "failed": 0
+    },
+    "layered_planner": {
+      "total": 1,
+      "passed": 1,
+      "failed": 0
+    },
+    "learning_db": {
+      "total": 1,
+      "passed": 1,
+      "failed": 0
+    },
+    "mouse_ops": {
+      "total": 1,
+      "passed": 1,
+      "failed": 0
+    },
+    "open_item": {
+      "total": 1,
+      "passed": 1,
+      "failed": 0
+    },
+    "proactive_ops": {
+      "total": 1,
+      "passed": 1,
+      "failed": 0
+    },
+    "ps_exec": {
+      "total": 1,
+      "passed": 1,
+      "failed": 0
+    },
+    "remote_ops": {
+      "total": 1,
+      "passed": 1,
+      "failed": 0
+    },
+    "security_ops": {
+      "total": 1,
+      "passed": 1,
+      "failed": 0
+    },
+    "vision_ops": {
+      "total": 1,
+      "passed": 1,
+      "failed": 0
+    },
+    "voice_ops": {
+      "total": 1,
+      "passed": 1,
+      "failed": 0
+    }
+  },
+  "detailed_tests": [
+    {
+      "tool": "analysis_ops",
+      "operation": "calculate (basic)",
+      "passed": true,
+      "details": "2+2 = None",
+      "timestamp": "2025-12-14T05:06:09.700989"
+    },
+    {
+      "tool": "analysis_ops",
+      "operation": "statistics",
+      "passed": true,
+      "details": "Mean of [1,2,3,4,5] = 3.0",
+      "timestamp": "2025-12-14T05:06:12.601771"
+    },
+    {
+      "tool": "analysis_ops",
+      "operation": "code_analysis",
+      "passed": true,
+      "details": "Found 1 functions",
+      "timestamp": "2025-12-14T05:06:12.602809"
+    },
+    {
+      "tool": "memory_system",
+      "operation": "store",
+      "passed": true,
+      "details": "Memory stored",
+      "timestamp": "2025-12-14T05:06:12.618443"
+    },
+    {
+      "tool": "memory_system",
+      "operation": "get_context",
+      "passed": true,
+      "details": "Retrieved 2 entries",
+      "timestamp": "2025-12-14T05:06:12.630897"
+    },
+    {
+      "tool": "memory_system",
+      "operation": "summary",
+      "passed": true,
+      "details": "Summary retrieved",
+      "timestamp": "2025-12-14T05:06:12.640606"
+    },
+    {
+      "tool": "json_ops",
+      "operation": "validate",
+      "passed": true,
+      "details": "Valid JSON",
+      "timestamp": "2025-12-14T05:06:12.643833"
+    },
+    {
+      "tool": "json_ops",
+      "operation": "merge",
+      "passed": true,
+      "details": "Merged: {'x': 1, 'y': 2}",
+      "timestamp": "2025-12-14T05:06:12.643833"
+    },
+    {
+      "tool": "sys_ops",
+      "operation": "info",
+      "passed": true,
+      "details": "OS: {'system': 'Windows', 'release': '10', 'version': '10.0.26100', 'machine': 'AMD64', 'processor': 'Intel64 Family 6 Model 122 Stepping 1, GenuineIntel', 'architecture': ('64bit', 'WindowsPE'), 'node': 'DESKTOP-A5GUKA5', 'python': '3.11.9'}",
+      "timestamp": "2025-12-14T05:06:16.560901"
+    },
+    {
+      "tool": "fs_ops",
+      "operation": "list",
+      "passed": true,
+      "details": "Found 0 items",
+      "timestamp": "2025-12-14T05:06:16.567695"
+    },
+    {
+      "tool": "screen_ops",
+      "operation": "size",
+      "passed": false,
+      "details": "Screen: NonexNone",
+      "timestamp": "2025-12-14T05:06:16.569713"
+    },
+    {
+      "tool": "net_ops",
+      "operation": "status",
+      "passed": false,
+      "details": "Network status retrieved",
+      "timestamp": "2025-12-14T05:06:16.570750"
+    },
+    {
+      "tool": "window_ops",
+      "operation": "list",
+      "passed": true,
+      "details": "Found 11 windows",
+      "timestamp": "2025-12-14T05:06:16.579856"
+    },
+    {
+      "tool": "calendar_ops",
+      "operation": "today",
+      "passed": false,
+      "details": "Today: None",
+      "timestamp": "2025-12-14T05:06:16.580900"
+    },
+    {
+      "tool": "audio_ops",
+      "operation": "registration",
+      "passed": true,
+      "details": "Tool registered",
+      "timestamp": "2025-12-14T05:06:16.580900"
+    },
+    {
+      "tool": "boot_repair",
+      "operation": "registration",
+      "passed": true,
+      "details": "Tool registered",
+      "timestamp": "2025-12-14T05:06:16.580900"
+    },
+    {
+      "tool": "browser_automation",
+      "operation": "registration",
+      "passed": true,
+      "details": "Tool registered",
+      "timestamp": "2025-12-14T05:06:16.580900"
+    },
+    {
+      "tool": "camera_ops",
+      "operation": "registration",
+      "passed": true,
+      "details": "Tool registered",
+      "timestamp": "2025-12-14T05:06:16.580900"
+    },
+    {
+      "tool": "comm_ops",
+      "operation": "registration",
+      "passed": true,
+      "details": "Tool registered",
+      "timestamp": "2025-12-14T05:06:16.580900"
+    },
+    {
+      "tool": "iot_ops",
+      "operation": "registration",
+      "passed": true,
+      "details": "Tool registered",
+      "timestamp": "2025-12-14T05:06:16.580900"
+    },
+    {
+      "tool": "key_ops",
+      "operation": "registration",
+      "passed": true,
+      "details": "Tool registered",
+      "timestamp": "2025-12-14T05:06:16.580900"
+    },
+    {
+      "tool": "layered_planner",
+      "operation": "registration",
+      "passed": true,
+      "details": "Tool registered",
+      "timestamp": "2025-12-14T05:06:16.580900"
+    },
+    {
+      "tool": "learning_db",
+      "operation": "registration",
+      "passed": true,
+      "details": "Tool registered",
+      "timestamp": "2025-12-14T05:06:16.580900"
+    },
+    {
+      "tool": "mouse_ops",
+      "operation": "registration",
+      "passed": true,
+      "details": "Tool registered",
+      "timestamp": "2025-12-14T05:06:16.580900"
+    },
+    {
+      "tool": "open_item",
+      "operation": "registration",
+      "passed": true,
+      "details": "Tool registered",
+      "timestamp": "2025-12-14T05:06:16.580900"
+    },
+    {
+      "tool": "proactive_ops",
+      "operation": "registration",
+      "passed": true,
+      "details": "Tool registered",
+      "timestamp": "2025-12-14T05:06:16.580900"
+    },
+    {
+      "tool": "ps_exec",
+      "operation": "registration",
+      "passed": true,
+      "details": "Tool registered",
+      "timestamp": "2025-12-14T05:06:16.580900"
+    },
+    {
+      "tool": "remote_ops",
+      "operation": "registration",
+      "passed": true,
+      "details": "Tool registered",
+      "timestamp": "2025-12-14T05:06:16.580900"
+    },
+    {
+      "tool": "security_ops",
+      "operation": "registration",
+      "passed": true,
+      "details": "Tool registered",
+      "timestamp": "2025-12-14T05:06:16.580900"
+    },
+    {
+      "tool": "vision_ops",
+      "operation": "registration",
+      "passed": true,
+      "details": "Tool registered",
+      "timestamp": "2025-12-14T05:06:16.580900"
+    },
+    {
+      "tool": "voice_ops",
+      "operation": "registration",
+      "passed": true,
+      "details": "Tool registered",
+      "timestamp": "2025-12-14T05:06:16.580900"
+    }
+  ]
+}

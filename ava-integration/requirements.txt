@@ -1,0 +1,5 @@
+groq
+deepgram-sdk
+edge-tts
+pydub
+pyaudio

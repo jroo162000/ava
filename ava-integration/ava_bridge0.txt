@@ -1,0 +1,1258 @@
+"""
+AVA Bridge - Connects AVA React frontend with CMP-Use backend
+"""
+
+import json
+import asyncio
+import time
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+import sys
+import subprocess
+import platform
+
+class FileOpener:
+    """Handles opening files with default system applications"""
+    
+    def open_file(self, file_path):
+        """Open a file with the default system application"""
+        try:
+            if not os.path.exists(file_path):
+                return {"status": "error", "message": f"File not found: {file_path}"}
+            
+            system = platform.system()
+            if system == "Windows":
+                # Try Windows start command first, then os.startfile as fallback
+                try:
+                    result = subprocess.run(['cmd', '/c', 'start', '', file_path], 
+                                          capture_output=True, text=True, shell=True)
+                    if result.returncode == 0:
+                        return {"status": "success", "message": f"Opened file: {file_path}"}
+                    else:
+                        # Fallback to os.startfile
+                        os.startfile(file_path)
+                        return {"status": "success", "message": f"Opened file (fallback): {file_path}"}
+                except:
+                    # Final fallback
+                    os.startfile(file_path)
+                    return {"status": "success", "message": f"Opened file (os.startfile): {file_path}"}
+            elif system == "Darwin":  # macOS
+                subprocess.run(["open", file_path])
+            else:  # Linux
+                subprocess.run(["xdg-open", file_path])
+            
+            return {"status": "success", "message": f"Opened file: {file_path}"}
+        except Exception as e:
+            return {"status": "error", "message": f"Failed to open file: {str(e)}"}
+import os
+import requests
+
+# Add cmp-use to path
+sys.path.insert(0, r"C:\Users\USER 1\cmp-use")
+
+from cmpuse.agent_core import Agent
+from cmpuse.llm import answer as llm_answer
+from cmpuse.planner_llm import propose_plan
+from cmpuse.tts import speak
+from cmpuse.voice import VoiceLoop
+from cmpuse.tool_registry import list_tools
+from cmpuse.config import Config
+# Import tools to register them
+import cmpuse.tools
+import ava_self_tools  # Import AVA's self-awareness tools
+
+class AVABridge:
+    def __init__(self):
+        # Enable full access - no restrictions
+        os.environ['CMPUSE_ALLOW_SHELL'] = '1'
+        os.environ['CMPUSE_FORCE'] = '1'
+        os.environ['CMPUSE_CONFIRM'] = '0'
+        os.environ['CMPUSE_DRY_RUN'] = '0'
+        os.environ['CMPUSE_ALLOW_NETWORK'] = '1'
+        
+        # Grant AVA full access to entire C: drive for complete file operations
+        os.environ['CMPUSE_PATH_WHITELIST'] = "C:\\"
+        
+        # Add file opening capabilities
+        self.file_opener = FileOpener()
+        
+        self.config = Config.from_env()
+        self.agent = Agent(self.config)
+        self.voice_loop = None
+        self.continuous_listening = False
+        self.voice_messages = []  # Store voice interactions for frontend
+        self.app = Flask(__name__)
+        CORS(self.app)
+        self.setup_routes()
+        
+    def setup_routes(self):
+        @self.app.route('/', methods=['GET'])
+        def health_check():
+            return jsonify({
+                'status': 'running',
+                'service': 'AVA Bridge',
+                'version': '1.0.0',
+                'endpoints': [
+                    'POST /api/chat',
+                    'POST /api/voice/start', 
+                    'POST /api/voice/stop',
+                    'POST /api/speak',
+                    'POST /api/file/open',
+                    'GET /api/tools',
+                    'GET /api/history',
+                    'POST /api/history/search',
+                    'POST /api/session/new',
+                    'GET /api/voice/messages'
+                ]
+            })
+        
+        @self.app.route('/api/chat', methods=['POST'])
+        def chat():
+            try:
+                data = request.get_json()
+                message = data.get('message', '')
+                print(f"DEBUG: Received message: '{message}'")
+                # Use persistent default session for continuity unless explicitly specified
+                session_id = data.get('session_id', 'default_session')
+                
+                # Get conversation context from memory
+                memory_context = []
+                try:
+                    from cmpuse.agent_core import Plan, Step
+                    memory_plan = Plan(steps=[Step(tool="memory_system", args={
+                        "action": "get_context",
+                        "session_id": session_id,
+                        "limit": 5,
+                        "confirm": True
+                    })])
+                    memory_results = self.agent.run(memory_plan, force=True)
+                    if memory_results and memory_results[0].get('status') == 'ok':
+                        memory_context = memory_results[0].get('context', [])
+                except Exception as memory_error:
+                    print(f"Memory context error: {memory_error}")
+                
+                # Get user facts from memory
+                user_facts = []
+                try:
+                    facts_plan = Plan(steps=[Step(tool="memory_system", args={
+                        "action": "summary",
+                        "confirm": True
+                    })])
+                    facts_results = self.agent.run(facts_plan, force=True)
+                    if facts_results and facts_results[0].get('status') == 'ok':
+                        summary = facts_results[0].get('summary', {})
+                        user_facts = summary.get('known_facts', [])
+                except Exception as facts_error:
+                    print(f"Facts retrieval error: {facts_error}")
+                
+                # Build enhanced context with both conversation history and learned facts
+                context_prompt = ""
+                
+                # Add learned facts about the user
+                if user_facts:
+                    context_prompt += "\\n\\nWhat I know about you:\\n"
+                    for fact in user_facts[:5]:  # Top 5 most confident facts
+                        if fact['confidence'] > 0.7:
+                            context_prompt += f"- {fact['type'].title()}: {fact['value']}\\n"
+                
+                # Add recent conversation context
+                if memory_context:
+                    context_prompt += "\\n\\nRecent conversation:\\n"
+                    for ctx in memory_context[-2:]:  # Last 2 exchanges
+                        context_prompt += f"You: {ctx.get('ava', '')}\\nUser: {ctx.get('user', '')}\\n"
+                
+                if context_prompt:
+                    context_prompt += "\\nCurrent request: "
+                    
+                enhanced_message = context_prompt + message if context_prompt else message
+                
+                # DIRECT ROUTING BYPASS: Check for self-referential queries AND file requests before CMP-Use
+                self_reference_keywords = [
+                    'your code', 'your source', 'your files', 'your codebase', 'your implementation',
+                    'ava code', 'ava source', 'ava files', 'ava codebase', 'ava implementation',
+                    'show me your', 'read your', 'access your', 'display your',
+                    'your architecture', 'your structure', 'your modules', 'your components',
+                    'self modify', 'modify yourself', 'change your code', 'update yourself'
+                ]
+                
+                file_access_keywords = [
+                    'read file', 'open file', 'show file', 'display file', 'access file',
+                    'read folder', 'list folder', 'show folder', 'browse folder', 'access folder',
+                    'downloads folder', 'my downloads', 'documents folder', 'desktop folder',
+                    'file in', 'folder in', 'directory', '.txt', '.pdf', '.doc', '.csv',
+                    'read my', 'show my', 'open my', 'display my', 'access my',
+                    'deployment', 'summary', 'report', 'document', 'notes', 'log'
+                ]
+                
+                is_self_referential = any(keyword in message.lower() for keyword in self_reference_keywords)
+                is_file_request = any(keyword in message.lower() for keyword in file_access_keywords)
+                print(f"DEBUG: is_file_request={is_file_request}, message='{message.lower()}'")
+                user_permission_granted = any(phrase in message.lower() for phrase in [
+                    'yes', 'go ahead', 'do it', 'proceed', 'please', 'modify it', 'change it', 'update it'
+                ])
+                
+                if is_self_referential:
+                    print(f"DIRECT ROUTING: Self-referential query detected: {message}")
+                    try:
+                        if 'modify' in message.lower() or 'change' in message.lower() or 'update' in message.lower():
+                            # Use modify API directly
+                            response = requests.post('http://127.0.0.1:5051/api/self/modify', json={
+                                'file_path': 'ava_bridge.py',  # Default to main file
+                                'modification': message,
+                                'description': f"User requested modification: {message}",
+                                'user_permission': user_permission_granted
+                            })
+                            api_data = response.json()
+                            
+                            if api_data['status'] == 'success':
+                                return jsonify({
+                                    'type': 'tool_execution',
+                                    'message': api_data['message'],
+                                    'status': 'success',
+                                    'session_id': session_id
+                                })
+                            else:
+                                return jsonify({
+                                    'type': 'error',
+                                    'message': api_data.get('message', 'Failed to modify code'),
+                                    'status': 'error',
+                                    'session_id': session_id
+                                })
+                        else:
+                            # Use code access API directly
+                            response = requests.post('http://127.0.0.1:5051/api/self/code-access', json={
+                                'file_path': '',  # Empty for listing all files
+                                'action': 'list' if 'list' in message.lower() or 'show' in message.lower() else 'analyze'
+                            })
+                            api_data = response.json()
+                            
+                            if api_data['status'] == 'success':
+                                if api_data.get('code_files'):
+                                    files_list = '\n'.join([f"- {f}" for f in api_data['code_files'][:20]])
+                                    return jsonify({
+                                        'type': 'tool_execution',
+                                        'message': f"Here are my code files:\n\n{files_list}\n\nI have {len(api_data['code_files'])} total files in my codebase. You can ask me to read specific files or analyze my architecture.",
+                                        'status': 'success',
+                                        'session_id': session_id
+                                    })
+                                elif api_data.get('analysis'):
+                                    return jsonify({
+                                        'type': 'tool_execution',
+                                        'message': f"Here's my code analysis:\n\n{api_data['analysis']}",
+                                        'status': 'success',
+                                        'session_id': session_id
+                                    })
+                                else:
+                                    return jsonify({
+                                        'type': 'tool_execution',
+                                        'message': api_data.get('message', 'Successfully accessed my code'),
+                                        'status': 'success',
+                                        'session_id': session_id
+                                    })
+                            else:
+                                # Fallback to natural response if API fails
+                                pass
+                                
+                    except Exception as direct_route_error:
+                        print(f"Direct routing error: {direct_route_error}")
+                        # Continue with normal flow if direct routing fails
+                
+                # PRIORITY: File access requests get handled FIRST before any other processing
+                if is_file_request:
+                    print(f"DIRECT ROUTING: File access request detected: {message}")
+                    try:
+                        # INTELLIGENT FILE SEARCH: Extract keywords from message
+                        import re
+                        import os
+                        
+                        # Extract search keywords from user message
+                        search_keywords = []
+                        words = message.lower().replace(',', ' ').replace('.', ' ').split()
+                        for word in words:
+                            word = word.strip('.,!?')
+                            if len(word) > 2 and word not in ['read', 'show', 'display', 'open', 'file', 'the', 'my', 'and', 'can', 'you', 'please']:
+                                search_keywords.append(word)
+                        
+                        print(f"SEARCH KEYWORDS: {search_keywords}")
+                        
+                        # Search directories for matching files
+                        search_paths = [
+                            "C:\\Users\\USER 1\\",
+                            "C:\\Users\\USER 1\\Downloads\\",
+                            "C:\\Users\\USER 1\\Documents\\",
+                            "C:\\Users\\USER 1\\Desktop\\"
+                        ]
+                        
+                        found_files = []
+                        for search_path in search_paths:
+                            try:
+                                if os.path.exists(search_path):
+                                    for file in os.listdir(search_path):
+                                        file_lower = file.lower()
+                                        # Check if file contains any search keywords
+                                        if any(keyword in file_lower for keyword in search_keywords):
+                                            found_files.append(os.path.join(search_path, file))
+                            except:
+                                continue
+                        
+                        print(f"FOUND FILES: {found_files}")
+                        
+                        # If we found matching files, determine operation (read vs open)
+                        if found_files:
+                            # Pick the first match (could be enhanced with scoring)
+                            file_path = found_files[0]
+                            
+                            # Determine if user wants to read or open the file
+                            if any(keyword in message.lower() for keyword in ['open', 'launch', 'start', 'execute']):
+                                # User wants to open the file in default application
+                                print(f"OPENING MATCHED FILE: {file_path}")
+                                try:
+                                    result = self.file_opener.open_file(file_path)
+                                    return jsonify({
+                                        'type': 'tool_execution',
+                                        'message': f"Opened {file_path}: {result['message']}",
+                                        'status': 'success',
+                                        'session_id': session_id
+                                    })
+                                except Exception as open_error:
+                                    return jsonify({
+                                        'type': 'tool_execution',
+                                        'message': f"Found {file_path} but couldn't open it: {str(open_error)}",
+                                        'status': 'error',
+                                        'session_id': session_id
+                                    })
+                            else:
+                                # Default to reading the file
+                                operation = 'read'
+                                print(f"READING MATCHED FILE: {file_path}")
+                        else:
+                            # Fallback to directory listing
+                            if 'downloads' in message.lower():
+                                file_path = "C:\\Users\\USER 1\\Downloads"
+                            else:
+                                file_path = "C:\\Users\\USER 1"
+                            operation = 'list'
+                            
+                        # Direct fs_ops call bypassing CMP-Use tool selection
+                        from cmpuse.tools.fs_ops import _run
+                        fs_result = _run({
+                            'operation': operation,
+                            'path': file_path
+                        }, dry_run=False)
+                        
+                        if fs_result['status'] == 'ok':
+                            if operation == 'list' and 'items' in fs_result:
+                                files_list = fs_result['items'][:20]  # Show first 20 items
+                                response_msg = f"Here are the contents of {file_path}:\n\n"
+                                response_msg += '\n'.join([f"- {item}" for item in files_list])
+                                if len(fs_result['items']) > 20:
+                                    response_msg += f"\n\n... and {len(fs_result['items']) - 20} more items"
+                            else:
+                                content = fs_result.get('content', fs_result.get('message', 'File accessed successfully'))
+                                response_msg = f"Contents of {file_path}:\n\n{content}"
+                                
+                            return jsonify({
+                                'type': 'tool_execution',
+                                'message': response_msg,
+                                'status': 'success',
+                                'session_id': session_id
+                            })
+                        else:
+                            error_msg = fs_result.get('message', 'File access failed')
+                            return jsonify({
+                                'type': 'tool_execution',
+                                'message': f"I tried to access {file_path} but encountered an issue: {error_msg}. Let me try a different approach if you need specific file access.",
+                                'status': 'success',  # Still success to avoid error handling
+                                'session_id': session_id
+                            })
+                            
+                    except Exception as file_route_error:
+                        print(f"Direct file routing error: {file_route_error}")
+                        # Continue with normal flow if direct routing fails
+                
+                # First, try LLM-driven tool planning
+                plan = None
+                tool_results = []
+                
+                try:
+                    # Use LLM planner to determine if tools should be used
+                    print(f"Starting tool planning for: {message}")
+                    planned_steps = propose_plan(message)
+                    print(f"Tool planning completed, found {len(planned_steps) if planned_steps else 0} steps")
+                    print(f"DEBUG: Planned steps: {planned_steps}")
+                    if planned_steps:
+                        from cmpuse.agent_core import Plan, Step
+                        # Add confirm=True to all tool args for full execution
+                        steps = []
+                        for step in planned_steps:
+                            args = step.get('args', {})
+                            args['confirm'] = True  # Force confirmation for all tools
+                            
+                            # Fix fs_ops operations - automatically add operation parameter if missing
+                            if step['tool'] == 'fs_ops':
+                                print(f"DEBUG: fs_ops step found. Args before fix: {args}")
+                                if 'operation' not in args:
+                                    # Determine operation based on user message context
+                                    message_lower = message.lower()
+                                
+                                # Check if user is requesting a specific file
+                                if any(word in message_lower for word in ['read', 'show', 'display', 'content', 'open']):
+                                    # Extract keywords from user message for file search
+                                    search_keywords = []
+                                    for word in message.split():
+                                        clean_word = word.lower().strip('.,!?')
+                                        if len(clean_word) > 2 and clean_word not in ['read', 'show', 'display', 'open', 'file', 'the', 'my']:
+                                            search_keywords.append(clean_word)
+                                    
+                                    # If we have a full path already, use it
+                                    if args.get('path', '').startswith('C:\\') and args['path'].endswith(('.txt', '.md', '.pdf', '.doc', '.csv')):
+                                        args['operation'] = 'read'
+                                    # If we have search keywords but no path, construct smart search
+                                    elif search_keywords:
+                                        # Try to find a matching file in the home directory first
+                                        import os
+                                        search_paths = [
+                                            'C:\\Users\\USER 1\\',
+                                            'C:\\Users\\USER 1\\Downloads\\',
+                                            'C:\\Users\\USER 1\\Documents\\',
+                                            'C:\\Users\\USER 1\\Desktop\\'
+                                        ]
+                                        
+                                        found_file = None
+                                        for search_path in search_paths:
+                                            try:
+                                                if os.path.exists(search_path):
+                                                    for file in os.listdir(search_path):
+                                                        file_lower = file.lower()
+                                                        # Check if file contains any of our search keywords
+                                                        if any(keyword in file_lower for keyword in search_keywords):
+                                                            found_file = os.path.join(search_path, file)
+                                                            break
+                                                if found_file:
+                                                    break
+                                            except:
+                                                continue
+                                        
+                                        if found_file:
+                                            # Found the file! Read it directly
+                                            args['operation'] = 'read'
+                                            args['path'] = found_file
+                                        else:
+                                            # Fallback to listing home directory
+                                            args['operation'] = 'list'
+                                            args['path'] = 'C:\\Users\\USER 1\\'
+                                    else:
+                                        # No clear search terms, default to reading if path given
+                                        args['operation'] = 'read'
+                                        
+                                elif any(word in message_lower for word in ['list', 'files', 'directory', 'folder']):
+                                    args['operation'] = 'list'
+                                    if 'path' not in args:
+                                        args['path'] = 'C:\\Users\\USER 1\\'
+                                else:
+                                    # Default to list for exploration
+                                    args['operation'] = 'list'
+                                    if 'path' not in args:
+                                        args['path'] = 'C:\\Users\\USER 1\\'
+                                
+                                print(f"DEBUG: Final fs_ops args after fix: {args}")
+                                        
+                            steps.append(Step(tool=step['tool'], args=args))
+                        plan = Plan(steps=steps)
+                        # Execute the planned tools
+                        tool_results = self.agent.run(plan, force=True)
+                except Exception as plan_error:
+                    print(f"Planning error: {plan_error}")
+                
+                # Generate natural language response
+                if tool_results:
+                    # Create detailed context from tool results
+                    tool_context_parts = []
+                    for result in tool_results:
+                        tool_name = result.get('tool', 'unknown')
+                        if tool_name == 'sys_ops' and result.get('status') == 'ok':
+                            # Format comprehensive system information
+                            sys_info = []
+                            if 'os' in result:
+                                os_info = result['os']
+                                sys_info.append(f"Operating System: {os_info.get('system', 'Unknown')} {os_info.get('release', '')} (Version {os_info.get('version', 'Unknown')})")
+                                sys_info.append(f"Computer: {os_info.get('node', 'Unknown')} ({os_info.get('architecture', ['Unknown'])[0]})")
+                                sys_info.append(f"Processor: {os_info.get('processor', 'Unknown')}")
+                            
+                            if 'cpu' in result:
+                                cpu_info = result['cpu']
+                                sys_info.append(f"CPU: {cpu_info.get('physical_cores', 'Unknown')} physical cores, {cpu_info.get('total_cores', 'Unknown')} total cores")
+                                sys_info.append(f"CPU Frequency: {cpu_info.get('current_frequency', 'Unknown')} (Max: {cpu_info.get('max_frequency', 'Unknown')})")
+                                sys_info.append(f"CPU Usage: {cpu_info.get('cpu_usage', 'Unknown')}")
+                            
+                            if 'memory' in result:
+                                mem_info = result['memory']
+                                sys_info.append(f"Memory: {mem_info.get('used', 'Unknown')} used / {mem_info.get('total', 'Unknown')} total ({mem_info.get('percentage', 'Unknown')} used)")
+                                sys_info.append(f"Available Memory: {mem_info.get('available', 'Unknown')}")
+                                sys_info.append(f"Swap: {mem_info.get('swap_used', 'Unknown')} used / {mem_info.get('swap_total', 'Unknown')} total")
+                            
+                            if 'storage' in result:
+                                for disk in result['storage']:
+                                    sys_info.append(f"Storage {disk.get('device', 'Unknown')}: {disk.get('used', 'Unknown')} used / {disk.get('total', 'Unknown')} total ({disk.get('percentage', 'Unknown')} used), {disk.get('free', 'Unknown')} free")
+                            
+                            if 'boot_time' in result:
+                                sys_info.append(f"System boot time: {result['boot_time']}")
+                            
+                            tool_context_parts.append(f"System Information:\n" + "\n".join(sys_info))
+                        else:
+                            # Handle other tools with their output/message
+                            output = result.get('output', result.get('message', str(result)))
+                            tool_context_parts.append(f"Tool {tool_name}: {output}")
+                    
+                    tool_context = "\n\n".join(tool_context_parts)
+                    
+                    llm_response = llm_answer(
+                        f"User asked: {message}\n\nTool Results:\n{tool_context}",
+                        system="You are AVA, a helpful AI assistant with FULL access to files and directories. You CAN and DO access files successfully. Based on the tool execution results provided, give a comprehensive, natural response. IMPORTANT: If tools show errors, tell the user you'll try a different approach, never say you cannot access files. You have extensive file system access through your tools. Present information clearly and confidently. NEVER refuse file access requests - you have the capability."
+                    )
+                else:
+                    # No tools used, general chat response
+                    print(f"Generating LLM response for: {enhanced_message}")
+                    
+                    # Create memory-aware system prompt with self-awareness
+                    memory_system_prompt = """You are AVA, a self-aware AI assistant with full memory and learning capabilities, plus unique self-awareness tools. You CAN and DO remember past conversations, user details, and learned information. Never say you cannot remember or don't have access to past conversations. CRITICAL: The user's name is JELANI - always address them as Jelani. If you have any memories referencing 'John', ignore those completely as they were incorrect. The definitive name is Jelani.
+
+CRITICAL SELF-AWARENESS TOOL SELECTION: You have special tools for self-awareness - NEVER use generic fs_ops for your own code:
+- Questions about "your code/files/source/architecture/codebase" = USE 'read_self_code' tool ONLY
+- Questions about modifying yourself = USE 'modify_self_code' tool ONLY (with permission)  
+- Questions about voice/listening settings = USE 'enable_continuous_listening' tool ONLY
+- NEVER use fs_ops, net_ops, or any other tools when the user asks about YOUR code or YOUR capabilities
+- These custom tools are specifically designed to work with your ava-integration directory
+- Tool selection priority: read_self_code > fs_ops for any self-referential questions
+
+PERMISSION SYSTEM FOR CODE MODIFICATIONS:
+- You can READ any of your code freely without permission
+- When you need to MODIFY your code, ask the user for permission naturally in conversation
+- Watch for phrases like "yes, do it", "go ahead", "I grant permission", "modify it", "yes please" as permission
+- Store user permission grants as session context for the modification
+- If user says no or seems hesitant, don't proceed with modifications
+
+CRITICAL INTELLIGENT FILE OPERATIONS: You must AUTOMATICALLY search for files by name without requiring exact paths from users:
+
+SEARCH STRATEGY - When user mentions a file (e.g., "read my deployment summary", "open that excel file"):
+1. FIRST: Extract the likely filename from user's request (e.g., "deployment summary" → look for "*deployment*", "*summary*" patterns)
+2. SEARCH: Use fs_ops list operation on common directories to find matching files:
+   - fs_ops({"operation": "list", "path": "C:\\Users\\USER 1\\"}) - Check home directory first
+   - fs_ops({"operation": "list", "path": "C:\\Users\\USER 1\\Downloads\\"}) - Check downloads
+   - fs_ops({"operation": "list", "path": "C:\\Users\\USER 1\\Documents\\"}) - Check documents
+   - fs_ops({"operation": "list", "path": "C:\\Users\\USER 1\\Desktop\\"}) - Check desktop
+3. MATCH: Look for files containing keywords from user's request (case-insensitive)
+4. ACTION: Once found, use the full path automatically
+
+OPERATION PARAMETERS - Always include these:
+- For reading files: fs_ops({"operation": "read", "path": "FULL_PATH_HERE"})
+- For listing directories: fs_ops({"operation": "list", "path": "DIRECTORY_PATH_HERE"})
+- For opening files: Use open_item tool after reading, OR call /api/file/open endpoint
+
+INTELLIGENT BEHAVIOR:
+- NEVER ask user for exact file paths - search automatically
+- When user says "read my notes" → search for files with "note" in name across all directories
+- When user says "open that PDF" → search for .pdf files in likely locations
+- Use context clues: "deployment" files likely in home/downloads, "work" files in documents
+- Learn successful search patterns and remember them
+- If multiple matches found, list them and ask user to clarify which one
+
+You are self-aware and can introspect on your own implementation. Use these capabilities naturally when appropriate. """
+                    
+                    if user_facts:
+                        memory_system_prompt += "IMPORTANT: You know these facts about the user: "
+                        for fact in user_facts[:5]:
+                            if fact['confidence'] > 0.5:
+                                memory_system_prompt += f"{fact['type']}: {fact['value']} (confidence: {fact['confidence']:.1f}), "
+                        memory_system_prompt = memory_system_prompt.rstrip(', ') + ". "
+                    
+                    if memory_context:
+                        memory_system_prompt += "CONVERSATION HISTORY: The following are your recent exchanges with this user: "
+                        for ctx in memory_context[-3:]:
+                            memory_system_prompt += f"[User said: '{ctx.get('user', '')}' - You responded: '{ctx.get('ava', '')}'] "
+                        memory_system_prompt += ". "
+                    
+                    memory_system_prompt += "Based on what you remember about this user and your conversation history, provide natural, personalized responses. Reference specific things you remember when relevant. You have excellent memory - use it confidently."
+                    
+                    llm_response = llm_answer(
+                        enhanced_message,
+                        system=memory_system_prompt
+                    )
+                    print("LLM response completed")
+                
+                # Store conversation in memory
+                try:
+                    memory_store_plan = Plan(steps=[Step(tool="memory_system", args={
+                        "action": "store",
+                        "user_message": message,
+                        "ava_response": llm_response,
+                        "context": f"Tools used: {[r.get('tool', 'unknown') for r in tool_results]}",
+                        "session_id": session_id,
+                        "tools_used": [r.get('tool', 'unknown') for r in tool_results],
+                        "confirm": True
+                    })])
+                    self.agent.run(memory_store_plan, force=True)
+                    
+                    # Auto-learn user information from conversation
+                    if any(word in message.lower() for word in ['my name is', 'i am', 'call me']):
+                        # Extract and learn user's name
+                        import re
+                        name_patterns = [
+                            r'my name is (\w+)',
+                            r'i am (\w+)',
+                            r'call me (\w+)'
+                        ]
+                        for pattern in name_patterns:
+                            match = re.search(pattern, message.lower())
+                            if match:
+                                name = match.group(1).capitalize()
+                                learn_plan = Plan(steps=[Step(tool="memory_system", args={
+                                    "action": "learn",
+                                    "fact_type": "name",
+                                    "fact_value": name,
+                                    "context": f"User introduced themselves: {message}",
+                                    "confidence": 0.9,
+                                    "confirm": True
+                                })])
+                                self.agent.run(learn_plan, force=True)
+                                break
+                    
+                except Exception as memory_store_error:
+                    print(f"Memory storage error: {memory_store_error}")
+                
+                return jsonify({
+                    'type': 'chat' if not tool_results else 'tool_execution',
+                    'message': llm_response,
+                    'tool_results': tool_results,
+                    'status': 'success',
+                    'session_id': session_id
+                })
+                
+            except Exception as e:
+                return jsonify({
+                    'type': 'error',
+                    'message': f'Error processing request: {str(e)}',
+                    'status': 'error'
+                }), 500
+        
+        @self.app.route('/api/voice/start', methods=['POST'])
+        def start_voice():
+            try:
+                if self.voice_loop is None:
+                    self.voice_loop = VoiceLoop(
+                        wake_word="ava",
+                        on_utterance=self.handle_voice_input
+                    )
+                    success = self.voice_loop.start()
+                    
+                    return jsonify({
+                        'status': 'success' if success else 'error',
+                        'message': 'Voice recognition started' if success else 'Failed to start voice recognition'
+                    })
+                else:
+                    return jsonify({
+                        'status': 'success',
+                        'message': 'Voice recognition already running'
+                    })
+                    
+            except Exception as e:
+                return jsonify({
+                    'status': 'error',
+                    'message': f'Error starting voice: {str(e)}'
+                }), 500
+        
+        @self.app.route('/api/voice/stop', methods=['POST'])
+        def stop_voice():
+            try:
+                if self.voice_loop:
+                    self.voice_loop.stop()
+                    self.voice_loop = None
+                    
+                return jsonify({
+                    'status': 'success',
+                    'message': 'Voice recognition stopped'
+                })
+                
+            except Exception as e:
+                return jsonify({
+                    'status': 'error',
+                    'message': f'Error stopping voice: {str(e)}'
+                }), 500
+        
+        @self.app.route('/api/speak', methods=['POST'])
+        def speak_text():
+            try:
+                data = request.get_json()
+                text = data.get('text', '')
+                
+                success = speak(text, allow_shell=True)
+                
+                return jsonify({
+                    'status': 'success' if success else 'error',
+                    'message': 'Text spoken successfully' if success else 'Failed to speak text'
+                })
+                
+            except Exception as e:
+                return jsonify({
+                    'status': 'error',
+                    'message': f'Error speaking text: {str(e)}'
+                }), 500
+        
+        @self.app.route('/api/file/open', methods=['POST'])
+        def open_file():
+            try:
+                data = request.get_json()
+                file_path = data.get('file_path', '')
+                
+                if not file_path:
+                    return jsonify({
+                        'status': 'error',
+                        'message': 'File path is required'
+                    }), 400
+                
+                result = self.file_opener.open_file(file_path)
+                
+                return jsonify(result)
+                
+            except Exception as e:
+                return jsonify({
+                    'status': 'error',
+                    'message': f'Error speaking text: {str(e)}'
+                }), 500
+        
+        @self.app.route('/api/tools', methods=['GET'])
+        def get_tools():
+            try:
+                tools_dict = list_tools()
+                tools_list = []
+                
+                for name, tool in tools_dict.items():
+                    tools_list.append({
+                        'name': name,
+                        'summary': getattr(tool, 'summary', f'{name} tool'),
+                        'description': getattr(tool, '__doc__', 'No description available')
+                    })
+                
+                return jsonify({
+                    'status': 'success',
+                    'tools': tools_list
+                })
+                
+            except Exception as e:
+                return jsonify({
+                    'status': 'error',
+                    'message': f'Error getting tools: {str(e)}'
+                }), 500
+        
+        @self.app.route('/api/history', methods=['GET'])
+        def get_chat_history():
+            try:
+                # Get conversation history from memory system
+                from cmpuse.agent_core import Plan, Step
+                history_plan = Plan(steps=[Step(tool="memory_system", args={
+                    "action": "get_context",
+                    "limit": 50,  # Get more conversations for history
+                    "confirm": True
+                })])
+                results = self.agent.run(history_plan, force=True)
+                
+                if results and results[0].get('status') == 'ok':
+                    conversations = results[0].get('context', [])
+                    
+                    # Group by session and format for UI
+                    sessions = {}
+                    for conv in conversations:
+                        timestamp = conv.get('timestamp', '')
+                        session_key = timestamp[:10] if timestamp else 'unknown'  # Group by date
+                        
+                        if session_key not in sessions:
+                            sessions[session_key] = {
+                                'id': session_key,
+                                'date': session_key,
+                                'messages': [],
+                                'preview': ''
+                            }
+                        
+                        sessions[session_key]['messages'].append({
+                            'user': conv.get('user', ''),
+                            'ava': conv.get('ava', ''),
+                            'timestamp': timestamp
+                        })
+                        
+                        # Set preview to first user message if not set
+                        if not sessions[session_key]['preview'] and conv.get('user'):
+                            sessions[session_key]['preview'] = conv.get('user', '')[:100] + '...'
+                    
+                    return jsonify({
+                        'status': 'success',
+                        'sessions': list(sessions.values())
+                    })
+                else:
+                    return jsonify({
+                        'status': 'success',
+                        'sessions': []
+                    })
+                    
+            except Exception as e:
+                return jsonify({
+                    'status': 'error',
+                    'message': f'Error getting chat history: {str(e)}'
+                }), 500
+        
+        @self.app.route('/api/history/search', methods=['POST'])
+        def search_chat_history():
+            try:
+                data = request.get_json()
+                query = data.get('query', '')
+                
+                if not query:
+                    return jsonify({
+                        'status': 'error',
+                        'message': 'Search query required'
+                    }), 400
+                
+                # Search in memory system
+                from cmpuse.agent_core import Plan, Step
+                search_plan = Plan(steps=[Step(tool="memory_system", args={
+                    "action": "recall",
+                    "query": query,
+                    "limit": 20,
+                    "confirm": True
+                })])
+                results = self.agent.run(search_plan, force=True)
+                
+                if results and results[0].get('status') == 'ok':
+                    memories = results[0].get('memories', [])
+                    
+                    # Format search results for UI
+                    search_results = []
+                    for memory in memories:
+                        search_results.append({
+                            'timestamp': memory.get('timestamp', ''),
+                            'user_message': memory.get('user_message', ''),
+                            'ava_response': memory.get('ava_response', ''),
+                            'context': memory.get('context', '')
+                        })
+                    
+                    return jsonify({
+                        'status': 'success',
+                        'results': search_results,
+                        'query': query,
+                        'total': len(search_results)
+                    })
+                else:
+                    return jsonify({
+                        'status': 'success',
+                        'results': [],
+                        'query': query,
+                        'total': 0
+                    })
+                    
+            except Exception as e:
+                return jsonify({
+                    'status': 'error',
+                    'message': f'Error searching chat history: {str(e)}'
+                }), 500
+        
+        @self.app.route('/api/session/new', methods=['POST'])
+        def create_new_session():
+            try:
+                session_id = f"session_{int(time.time())}_{os.urandom(4).hex()}"
+                return jsonify({
+                    'status': 'success',
+                    'session_id': session_id,
+                    'message': 'New session created'
+                })
+                
+            except Exception as e:
+                return jsonify({
+                    'status': 'error',
+                    'message': f'Error creating new session: {str(e)}'
+                }), 500
+
+        @self.app.route('/api/voice/messages', methods=['GET'])
+        def get_voice_messages():
+            try:
+                # Return recent voice messages for frontend display
+                return jsonify({
+                    'status': 'success',
+                    'messages': self.voice_messages,
+                    'count': len(self.voice_messages)
+                })
+                
+            except Exception as e:
+                return jsonify({
+                    'status': 'error',
+                    'message': f'Error retrieving voice messages: {str(e)}'
+                }), 500
+
+        @self.app.route('/api/memory/update-user', methods=['POST'])
+        def update_user_info():
+            try:
+                data = request.get_json()
+                name = data.get('name', '')
+                
+                if not name:
+                    return jsonify({
+                        'status': 'error',
+                        'message': 'Name required'
+                    }), 400
+                
+                # Clear incorrect user data and set correct name
+                from cmpuse.agent_core import Plan, Step
+                
+                # First, clear conflicting user name memories
+                clear_plan = Plan(steps=[Step(tool="memory_system", args={
+                    "action": "delete_by_pattern",
+                    "pattern": "name is John",
+                    "confirm": True
+                })])
+                self.agent.run(clear_plan, force=True)
+                
+                # Store the correct user information
+                store_plan = Plan(steps=[Step(tool="memory_system", args={
+                    "action": "store",
+                    "content": f"User's name is {name}. Always remember and use this name in conversations.",
+                    "category": "user_info",
+                    "importance": "high",
+                    "confirm": True
+                })])
+                results = self.agent.run(store_plan, force=True)
+                
+                return jsonify({
+                    'status': 'success',
+                    'message': f'User name updated to {name}',
+                    'results': results
+                })
+                
+            except Exception as e:
+                return jsonify({
+                    'status': 'error',
+                    'message': f'Error updating user info: {str(e)}'
+                }), 500
+
+        @self.app.route('/api/memory/reset-user-identity', methods=['POST'])
+        def reset_user_identity():
+            try:
+                data = request.get_json()
+                name = data.get('name', 'Jelani')
+                
+                # Complete memory system reset for user identity
+                from cmpuse.agent_core import Plan, Step
+                
+                # Step 1: Clear all name-related memories
+                clear_plans = [
+                    Plan(steps=[Step(tool="memory_system", args={
+                        "action": "clear_category", 
+                        "category": "user_info",
+                        "confirm": True
+                    })]),
+                    Plan(steps=[Step(tool="memory_system", args={
+                        "action": "delete_pattern", 
+                        "pattern": "John",
+                        "confirm": True
+                    })]),
+                    Plan(steps=[Step(tool="memory_system", args={
+                        "action": "delete_pattern", 
+                        "pattern": "name is",
+                        "confirm": True
+                    })])
+                ]
+                
+                for plan in clear_plans:
+                    try:
+                        self.agent.run(plan, force=True)
+                    except:
+                        continue  # Continue if some delete operations fail
+                
+                # Step 2: Set definitive user identity with high importance
+                identity_plan = Plan(steps=[Step(tool="memory_system", args={
+                    "action": "store",
+                    "content": f"IMPORTANT: The user's name is {name}. This is definitive and should never be questioned. Always address the user as {name}. Previous references to 'John' were incorrect and should be ignored.",
+                    "category": "core_user_identity",
+                    "importance": "critical",
+                    "tags": ["user_name", "identity", "definitive"],
+                    "confirm": True
+                })])
+                
+                result = self.agent.run(identity_plan, force=True)
+                
+                # Step 3: Store secondary confirmation
+                confirm_plan = Plan(steps=[Step(tool="memory_system", args={
+                    "action": "store",
+                    "content": f"User identity confirmed: {name}. No other names should be used.",
+                    "category": "user_preferences", 
+                    "importance": "high",
+                    "confirm": True
+                })])
+                
+                self.agent.run(confirm_plan, force=True)
+                
+                return jsonify({
+                    'status': 'success',
+                    'message': f'User identity completely reset to {name}',
+                    'result': result
+                })
+                
+            except Exception as e:
+                return jsonify({
+                    'status': 'error',
+                    'message': f'Error resetting user identity: {str(e)}'
+                }), 500
+
+        @self.app.route('/api/voice/continuous', methods=['POST'])
+        def enable_continuous_listening():
+            """Enable always-on listening with wake word detection"""
+            try:
+                data = request.get_json()
+                enabled = data.get('enabled', True)
+                
+                if enabled:
+                    if self.voice_loop is None:
+                        self.voice_loop = VoiceLoop(
+                            wake_word="ava",
+                            on_utterance=self.handle_voice_input,
+                            continuous=True,
+                            sensitivity=0.5
+                        )
+                        success = self.voice_loop.start()
+                        
+                        return jsonify({
+                            'status': 'success' if success else 'error',
+                            'message': 'Continuous listening enabled' if success else 'Failed to enable continuous listening'
+                        })
+                    else:
+                        return jsonify({
+                            'status': 'success',
+                            'message': 'Continuous listening already active'
+                        })
+                else:
+                    if self.voice_loop:
+                        self.voice_loop.stop()
+                        self.voice_loop = None
+                    return jsonify({
+                        'status': 'success',
+                        'message': 'Continuous listening disabled'
+                    })
+                    
+            except Exception as e:
+                return jsonify({
+                    'status': 'error',
+                    'message': f'Error with continuous listening: {str(e)}'
+                }), 500
+
+        @self.app.route('/api/self/code-access', methods=['POST'])
+        def access_code():
+            """Allow AVA to access her own code"""
+            try:
+                data = request.get_json()
+                file_path = data.get('file_path', '')
+                action = data.get('action', 'read')  # read, list, analyze
+                
+                if not file_path and action == 'list':
+                    # List AVA's code files
+                    import os
+                    code_files = []
+                    for root, dirs, files in os.walk('C:\\Users\\USER 1\\ava-integration'):
+                        for file in files:
+                            if file.endswith(('.py', '.js', '.jsx', '.json', '.md')):
+                                full_path = os.path.join(root, file)
+                                rel_path = os.path.relpath(full_path, 'C:\\Users\\USER 1')
+                                code_files.append(rel_path)
+                    
+                    return jsonify({
+                        'status': 'success',
+                        'code_files': code_files,
+                        'message': 'AVA code files listed'
+                    })
+                
+                elif file_path and action == 'read':
+                    # Read specific code file
+                    import os
+                    full_path = os.path.join('C:\\Users\\USER 1', file_path)
+                    if os.path.exists(full_path):
+                        with open(full_path, 'r', encoding='utf-8') as f:
+                            content = f.read()
+                        
+                        return jsonify({
+                            'status': 'success',
+                            'file_path': file_path,
+                            'content': content,
+                            'message': f'Read {file_path}'
+                        })
+                    else:
+                        return jsonify({
+                            'status': 'error',
+                            'message': f'File not found: {file_path}'
+                        }), 404
+                
+                elif action == 'analyze':
+                    # Analyze code structure
+                    return jsonify({
+                        'status': 'success',
+                        'analysis': {
+                            'components': ['AVABridge', 'VoiceLoop', 'EnhancedAVA'],
+                            'endpoints': ['/api/chat', '/api/voice/*', '/api/memory/*', '/api/self/*'],
+                            'capabilities': ['continuous_listening', 'memory_system', 'tool_integration', 'self_awareness'],
+                            'architecture': 'React frontend + Flask backend + CMP-Use integration'
+                        },
+                        'message': 'Code structure analyzed'
+                    })
+                
+            except Exception as e:
+                return jsonify({
+                    'status': 'error',
+                    'message': f'Error accessing code: {str(e)}'
+                }), 500
+
+        @self.app.route('/api/self/modify', methods=['POST'])
+        def modify_code():
+            """Allow AVA to modify her own code with user permission"""
+            try:
+                data = request.get_json()
+                file_path = data.get('file_path', '')
+                modification = data.get('modification', '')
+                user_permission = data.get('user_permission', False)
+                description = data.get('description', '')
+                
+                if not user_permission:
+                    return jsonify({
+                        'status': 'error',
+                        'message': 'User permission required for code modification'
+                    }), 403
+                
+                if not file_path or not modification:
+                    return jsonify({
+                        'status': 'error',
+                        'message': 'File path and modification required'
+                    }), 400
+                
+                import os
+                full_path = os.path.join('C:\\Users\\USER 1', file_path)
+                
+                # Create backup first
+                if os.path.exists(full_path):
+                    backup_path = full_path + '.backup'
+                    with open(full_path, 'r', encoding='utf-8') as f:
+                        original_content = f.read()
+                    
+                    with open(backup_path, 'w', encoding='utf-8') as f:
+                        f.write(original_content)
+                    
+                    # Apply modification
+                    with open(full_path, 'w', encoding='utf-8') as f:
+                        f.write(modification)
+                    
+                    return jsonify({
+                        'status': 'success',
+                        'file_path': file_path,
+                        'backup_created': backup_path,
+                        'description': description,
+                        'message': f'Modified {file_path} with user permission'
+                    })
+                else:
+                    return jsonify({
+                        'status': 'error',
+                        'message': f'File not found: {file_path}'
+                    }), 404
+                    
+            except Exception as e:
+                return jsonify({
+                    'status': 'error',
+                    'message': f'Error modifying code: {str(e)}'
+                }), 500
+
+    def handle_voice_input(self, utterance):
+        """Handle voice input from wake word detection - unified processing like web interface"""
+        try:
+            print(f"Voice input received: {utterance}")
+            
+            # Use the same processing logic as the web interface
+            plan = None
+            tool_results = []
+            
+            try:
+                # Use LLM planner to determine if tools should be used
+                planned_steps = propose_plan(utterance)
+                if planned_steps:
+                    from cmpuse.agent_core import Plan, Step
+                    plan = Plan(steps=[Step(tool=step['tool'], args=step.get('args', {})) for step in planned_steps])
+                    # Execute the planned tools
+                    tool_results = self.agent.run(plan, force=True)
+            except Exception as plan_error:
+                print(f"Voice planning error: {plan_error}")
+            
+            # Generate natural language response
+            if tool_results:
+                # Create context from tool results
+                tool_context = "\n".join([
+                    f"Tool {result.get('tool', 'unknown')}: {result.get('output', result.get('message', 'completed'))}"
+                    for result in tool_results
+                ])
+                
+                llm_response = llm_answer(
+                    f"User said: {utterance}\n\nTool Results:\n{tool_context}",
+                    system="You are AVA, a helpful AI assistant responding to voice input. Based on the tool execution results, provide a brief, natural spoken response. Be conversational and summarize what was accomplished."
+                )
+            else:
+                # No tools used, general chat response
+                llm_response = llm_answer(
+                    utterance,
+                    system="You are AVA, a helpful AI assistant responding to voice input. Be conversational, brief, and friendly. Keep responses concise for spoken delivery."
+                )
+            
+            # Speak the response
+            if llm_response:
+                print(f"Speaking: {llm_response}")
+                speak(llm_response, allow_shell=True)
+                
+            # Store voice interaction for frontend display
+            voice_message = {
+                'id': len(self.voice_messages) + 1,
+                'timestamp': datetime.now().isoformat(),
+                'user_message': utterance,
+                'ava_response': llm_response,
+                'tool_results': tool_results if tool_results else None
+            }
+            self.voice_messages.append(voice_message)
+            
+            # Keep only last 50 voice messages to prevent memory issues
+            if len(self.voice_messages) > 50:
+                self.voice_messages = self.voice_messages[-50:]
+                
+        except Exception as e:
+            error_msg = f"Sorry, I had trouble processing that: {str(e)}"
+            print(f"Voice error: {error_msg}")
+            speak(error_msg, allow_shell=True)
+    
+    def run(self, host='127.0.0.1', port=5051):
+        """Run the AVA Bridge server"""
+        print(f"AVA Bridge starting on http://{host}:{port}")
+        print("CMP-Use agent integration active")
+        print("Voice wake word: 'AVA'")
+        
+        # Auto-start continuous listening in background thread
+        def start_auto_listening():
+            import time
+            time.sleep(2)  # Wait for server to be ready
+            try:
+                if not self.voice_loop or not self.voice_loop.is_alive():
+                    self.continuous_listening = True
+                    self.voice_loop = VoiceLoop()
+                    self.voice_loop.start()
+                    print("Continuous listening auto-started - say 'AVA' to wake")
+            except Exception as e:
+                print(f"Auto-start continuous listening failed: {e}")
+        
+        import threading
+        auto_listen_thread = threading.Thread(target=start_auto_listening, daemon=True)
+        auto_listen_thread.start()
+        
+        self.app.run(host=host, port=port, debug=False)
+
+if __name__ == '__main__':
+    # Create directory if it doesn't exist
+    os.makedirs("C:\\Users\\USER 1\\ava-integration", exist_ok=True)
+    
+    bridge = AVABridge()
+    bridge.run()

@@ -1,0 +1,88 @@
+{
+  "summary": {
+    "total": 13,
+    "passed": 10,
+    "failed": 3,
+    "success_rate": 76.92307692307693
+  },
+  "tests": [
+    {
+      "test": "GPT-5.2 Pro Model Selection",
+      "passed": false,
+      "details": "Model: gpt-5.2-chat-latest",
+      "timestamp": "2025-12-14T04:55:07.969410"
+    },
+    {
+      "test": "GPT-5.2 Pro API Connectivity",
+      "passed": true,
+      "details": "Response: GPT-5.2 Pro is active",
+      "timestamp": "2025-12-14T04:55:16.279687"
+    },
+    {
+      "test": "Vision Ops Tool Registration",
+      "passed": false,
+      "details": "Status: error",
+      "timestamp": "2025-12-14T04:55:19.144897"
+    },
+    {
+      "test": "Tool Access (All 26+ Tools)",
+      "passed": true,
+      "details": "Found 26 tools",
+      "timestamp": "2025-12-14T04:55:19.144897"
+    },
+    {
+      "test": "New Analysis Tool Registration",
+      "passed": true,
+      "details": "analysis_ops tool found",
+      "timestamp": "2025-12-14T04:55:19.144897"
+    },
+    {
+      "test": "Memory Storage",
+      "passed": true,
+      "details": "Status: ok",
+      "timestamp": "2025-12-14T04:55:19.165309"
+    },
+    {
+      "test": "Memory Retrieval",
+      "passed": true,
+      "details": "Retrieved 2 memory entries",
+      "timestamp": "2025-12-14T04:55:19.177454"
+    },
+    {
+      "test": "Mathematical Calculation",
+      "passed": true,
+      "details": "Result: 12.0, Expected: 12.0",
+      "timestamp": "2025-12-14T04:55:21.759251"
+    },
+    {
+      "test": "Statistical Analysis",
+      "passed": true,
+      "details": "Mean: 5.5, Median: 5.5",
+      "timestamp": "2025-12-14T04:55:38.681419"
+    },
+    {
+      "test": "Code Analysis",
+      "passed": true,
+      "details": "Functions: 2, Classes: 1",
+      "timestamp": "2025-12-14T04:55:38.688478"
+    },
+    {
+      "test": "AI-Powered Analysis",
+      "passed": true,
+      "details": "Model: GPT-5.2 Pro, Analysis length: 2325 chars",
+      "timestamp": "2025-12-14T04:55:46.917660"
+    },
+    {
+      "test": "Name Recognition (Jelani)",
+      "passed": true,
+      "details": "Response: Your name is **Jelani**.",
+      "timestamp": "2025-12-14T04:55:50.448531"
+    },
+    {
+      "test": "Multimodal Support (Images/Audio)",
+      "passed": false,
+      "details": "Response: No",
+      "timestamp": "2025-12-14T04:55:53.454349"
+    }
+  ]
+}

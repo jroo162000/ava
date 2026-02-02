@@ -1,0 +1,60 @@
+{
+  "voice_mode": "unified",
+  "server_route": "respond",
+  "audio": {
+    "playback_rate": 22050,
+    "output_device": null,
+    "input_device": null
+  },
+  "vad": {
+    "start_rms": 300,
+    "stop_rms": 150,
+    "hold_sec": 1.2,
+    "dyn_thresh_scale": 1.0
+  },
+  "local_fallback": {
+    "tts_engine": "piper",
+    "edge_voice": "en-US-MichelleNeural",
+    "whisper_model": "small",
+    "auto_switch": true,
+    "force_local": false,
+    "piper": {
+      "exe": "C:/Users/USER 1/ava-integration/vendor/piper/piper.exe",
+      "model": "C:/Users/USER 1/ava-integration/voices/piper/en_US-lessac-medium.onnx"
+    }
+  },
+  "asr": {
+    "early_commit": {
+      "enabled": true,
+      "stable_time_sec": 0.5,
+      "max_words": 3,
+      "comment": "Conservative early commit to reduce false activations from Vosk partials"
+    }
+  },
+  "intent_routing": {
+    "enabled": true,
+    "local_patterns": [
+      "pause automation",
+      "resume automation", 
+      "stop automation",
+      "create file",
+      "remember that",
+      "send email",
+      "turn on",
+      "turn off",
+      "system info",
+      "camera"
+    ]
+  },
+  "safety": {
+    "confirm_destructive": true,
+    "destructive_keywords": ["delete", "remove", "format", "restart", "shutdown", "send", "kill", "terminate"]
+  },
+  "echo_cancellation": {
+    "enabled": true,
+    "suppress_tts_during_mic": true,
+    "grace_period_sec": 3.0,
+    "tts_cooldown_sec": 2.5,
+    "rms_boost_during_tts": 2.0
+  }
+}

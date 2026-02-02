@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AVA - Intelligent Assistant</title>
+    <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+</head>
+<body>
+    <div id="root"></div>
+    
+    <script type="text/babel">
+        const { useState } = React;
+        
+        function AVAApp() {
+            const [input, setInput] = useState('');
+            const [messages, setMessages] = useState([
+                { who: 'bot', text: 'AVA Web Interface Restored! Intelligent file search is ready. Try: "open my resume", "find python files", "show me the readme"' }
+            ]);
+            const [loading, setLoading] = useState(false);
+
+            const sendMessage = async (message) => {
+                if (!message.trim()) return;
+                
+                setMessages(prev => [...prev, { who: 'user', text: message }]);
+                setInput('');
+                setLoading(true);
+                
+                try {
+                    const response = await fetch('http://127.0.0.1:5051/chat', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ text: message, session_id: 'web-client' })
+                    });
+                    
+                    const data = await response.json();
+                    if (data.ok) {
+                        setMessages(prev => [...prev, { who: 'bot', text: data.text }]);
+                    } else {
+                        setMessages(prev => [...prev, { who: 'bot', text: `Error: ${data.error || 'Unknown error'}` }]);
+                    }
+                } catch (error) {
+                    setMessages(prev => [...prev, { who: 'bot', text: `Connection error: ${error.message}` }]);
+                } finally {
+                    setLoading(false);
+                }
+            };
+
+            return React.createElement('div', { 
+                style: { 
+                    padding: '20px', 
+                    fontFamily: 'Arial, sans-serif',
+                    maxWidth: '800px',
+                    margin: '0 auto'
+                } 
+            }, [
+                React.createElement('h1', { key: 'title' }, 'AVA - Intelligent Assistant'),
+                React.createElement('div', { 
+                    key: 'status',
+                    style: { 
+                        padding: '10px',
+                        backgroundColor: '#e8f5e8',
+                        borderRadius: '4px',
+                        marginBottom: '10px'
+                    }
+                }, '✅ Connected to AVA Bridge on http://127.0.0.1:5051'),
+                React.createElement('div', { 
+                    key: 'messages',
+                    style: { 
+                        border: '1px solid #ccc', 
+                        height: '400px', 
+                        overflowY: 'auto', 
+                        padding: '10px', 
+                        marginBottom: '10px',
+                        backgroundColor: '#fafafa'
+                    } 
+                }, [
+                    ...messages.map((msg, i) => 
+                        React.createElement('div', { 
+                            key: i,
+                            style: { 
+                                marginBottom: '10px',
+                                padding: '8px',
+                                backgroundColor: msg.who === 'user' ? '#e3f2fd' : '#f5f5f5',
+                                borderRadius: '4px',
+                                borderLeft: `4px solid ${msg.who === 'user' ? '#2196f3' : '#4caf50'}`
+                            }
+                        }, [
+                            React.createElement('strong', { key: 'who' }, msg.who === 'user' ? 'You: ' : 'AVA: '),
+                            msg.text
+                        ])
+                    ),
+                    loading && React.createElement('div', { 
+                        key: 'loading',
+                        style: { 
+                            padding: '8px',
+                            backgroundColor: '#fff3e0',
+                            borderRadius: '4px',
+                            fontStyle: 'italic'
+                        }
+                    }, '🤖 AVA is thinking...')
+                ]),
+                React.createElement('div', { 
+                    key: 'input',
+                    style: { display: 'flex', gap: '10px' }
+                }, [
+                    React.createElement('input', {
+                        key: 'textinput',
+                        type: 'text',
+                        value: input,
+                        onChange: (e) => setInput(e.target.value),
+                        onKeyPress: (e) => e.key === 'Enter' && !loading && sendMessage(input),
+                        placeholder: "Ask AVA to open a file, search for something, or help with tasks...",
+                        disabled: loading,
+                        style: { 
+                            flex: 1, 
+                            padding: '12px', 
+                            border: '1px solid #ccc',
+                            borderRadius: '4px',
+                            fontSize: '14px'
+                        }
+                    }),
+                    React.createElement('button', {
+                        key: 'button',
+                        onClick: () => !loading && sendMessage(input),
+                        disabled: loading || !input.trim(),
+                        style: { 
+                            padding: '12px 20px',
+                            backgroundColor: loading || !input.trim() ? '#ccc' : '#2196f3',
+                            color: 'white',
+                            border: 'none',
+                            borderRadius: '4px',
+                            cursor: loading || !input.trim() ? 'not-allowed' : 'pointer',
+                            fontSize: '14px'
+                        }
+                    }, loading ? 'Sending...' : 'Send')
+                ]),
+                React.createElement('p', {
+                    key: 'help',
+                    style: { 
+                        marginTop: '15px', 
+                        fontSize: '12px', 
+                        color: '#666',
+                        backgroundColor: '#f9f9f9',
+                        padding: '10px',
+                        borderRadius: '4px'
+                    }
+                }, 'Try saying: "open my resume", "find python files", "show me the readme", "read the changelog", etc.')
+            ]);
+        }
+
+        ReactDOM.render(React.createElement(AVAApp), document.getElementById('root'));
+    </script>
+</body>
+</html>

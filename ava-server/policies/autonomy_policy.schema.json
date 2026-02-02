@@ -1,0 +1,273 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AVa Autonomy Policy",
+  "type": "object",
+  "required": ["version", "policy_name", "defaults", "autonomy_levels", "domains", "triggers", "thresholds", "budgets", "risk_policy", "decision_policy"],
+  "additionalProperties": false,
+
+  "properties": {
+    "version": { "type": "integer", "minimum": 1 },
+    "policy_name": { "type": "string", "minLength": 3 },
+    "last_updated": { "type": "string" },
+    "owner": { "type": "string" },
+
+    "principles": { "type": "array", "items": { "type": "string" }, "minItems": 1 },
+
+    "defaults": {
+      "type": "object",
+      "required": ["mode", "autonomy_level", "allow_idle_actions", "require_user_approval_for"],
+      "additionalProperties": false,
+      "properties": {
+        "mode": { "type": "string", "enum": ["responsibility_first", "curiosity_limited", "quiet"] },
+        "autonomy_level": { "type": "integer", "minimum": 0, "maximum": 4 },
+        "allow_idle_actions": { "type": "boolean" },
+        "require_user_approval_for": { "type": "array", "items": { "type": "string" }, "minItems": 1 }
+      }
+    },
+
+    "autonomy_levels": {
+      "type": "object",
+      "required": ["0", "1", "2", "3", "4"],
+      "additionalProperties": false,
+      "properties": {
+        "0": { "$ref": "#/$defs/autonomyLevel0" },
+        "1": { "$ref": "#/$defs/autonomyLevel1" },
+        "2": { "$ref": "#/$defs/autonomyLevel2" },
+        "3": { "$ref": "#/$defs/autonomyLevel2" },
+        "4": { "$ref": "#/$defs/autonomyLevel2" }
+      }
+    },
+
+    "domains": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": {
+        "type": "object",
+        "required": ["autonomy_level", "allowed_triggers"],
+        "additionalProperties": false,
+        "properties": {
+          "autonomy_level": { "type": "integer", "minimum": 0, "maximum": 4 },
+          "allowed_triggers": { "type": "array", "items": { "type": "string" }, "minItems": 1 }
+        }
+      }
+    },
+
+    "triggers": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": {
+        "type": "object",
+        "required": ["enabled", "urgency_base", "class"],
+        "additionalProperties": false,
+        "properties": {
+          "enabled": { "type": "boolean" },
+          "urgency_base": { "type": "integer", "minimum": 0, "maximum": 10 },
+          "class": { "type": "string", "enum": ["responsibility", "curiosity"] }
+        }
+      }
+    },
+
+    "thresholds": {
+      "type": "object",
+      "required": [
+        "interrupt_urgency_threshold",
+        "notify_urgency_threshold",
+        "curiosity_allowed",
+        "curiosity_requires_trigger",
+        "curiosity_max_minutes_per_day",
+        "curiosity_max_findings_per_day",
+        "curiosity_requires_relevance_score",
+        "curiosity_requires_citation",
+        "responsibility_max_actions_per_hour",
+        "responsibility_max_notifications_per_hour",
+        "responsibility_requires_verification_for_fixes",
+        "auto_store_user_corrections",
+        "auto_store_tool_errors",
+        "auto_store_requires_dedupe",
+        "auto_store_requires_min_confidence",
+        "memory_max_items_per_day",
+        "memory_min_relevance_to_store",
+        "memory_max_chars_per_item",
+        "memory_dedupe_similarity_threshold",
+        "memory_priority_defaults"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "interrupt_urgency_threshold": { "type": "integer", "minimum": 0, "maximum": 10 },
+        "notify_urgency_threshold": { "type": "integer", "minimum": 0, "maximum": 10 },
+
+        "curiosity_allowed": { "type": "boolean" },
+        "curiosity_requires_trigger": { "type": "boolean" },
+        "curiosity_max_minutes_per_day": { "type": "integer", "minimum": 0, "maximum": 240 },
+        "curiosity_max_findings_per_day": { "type": "integer", "minimum": 0, "maximum": 50 },
+        "curiosity_requires_relevance_score": { "type": "number", "minimum": 0, "maximum": 1 },
+        "curiosity_requires_citation": { "type": "boolean" },
+
+        "responsibility_max_actions_per_hour": { "type": "integer", "minimum": 0, "maximum": 200 },
+        "responsibility_max_notifications_per_hour": { "type": "integer", "minimum": 0, "maximum": 50 },
+        "responsibility_requires_verification_for_fixes": { "type": "boolean" },
+
+        "auto_store_user_corrections": { "type": "boolean" },
+        "auto_store_tool_errors": { "type": "boolean" },
+        "auto_store_requires_dedupe": { "type": "boolean" },
+        "auto_store_requires_min_confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+
+        "memory_max_items_per_day": { "type": "integer", "minimum": 0, "maximum": 10000 },
+        "memory_min_relevance_to_store": { "type": "number", "minimum": 0, "maximum": 1 },
+        "memory_max_chars_per_item": { "type": "integer", "minimum": 50, "maximum": 5000 },
+        "memory_dedupe_similarity_threshold": { "type": "number", "minimum": 0, "maximum": 1 },
+        "memory_priority_defaults": {
+          "type": "object",
+          "required": ["correction", "constraint", "warning", "fact", "idea"],
+          "additionalProperties": false,
+          "properties": {
+            "correction": { "type": "integer", "minimum": 1, "maximum": 5 },
+            "constraint": { "type": "integer", "minimum": 1, "maximum": 5 },
+            "warning": { "type": "integer", "minimum": 1, "maximum": 5 },
+            "fact": { "type": "integer", "minimum": 1, "maximum": 5 },
+            "idea": { "type": "integer", "minimum": 1, "maximum": 5 }
+          }
+        }
+      }
+    },
+
+    "budgets": {
+      "type": "object",
+      "required": ["daily", "hourly"],
+      "additionalProperties": false,
+      "properties": {
+        "daily": { "$ref": "#/$defs/budget" },
+        "hourly": { "$ref": "#/$defs/budget" }
+      }
+    },
+
+    "quiet_hours": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled", "timezone", "start", "end", "during_quiet_hours"],
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "timezone": { "type": "string" },
+        "start": { "type": "string" },
+        "end": { "type": "string" },
+        "during_quiet_hours": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["allow_interrupts", "allow_notifications", "notification_mode", "digest_time"],
+          "properties": {
+            "allow_interrupts": { "type": "boolean" },
+            "allow_notifications": { "type": "boolean" },
+            "notification_mode": { "type": "string", "enum": ["digest", "immediate"] },
+            "digest_time": { "type": "string" }
+          }
+        }
+      }
+    },
+
+    "risk_policy": {
+      "type": "object",
+      "required": ["risk_levels", "high_risk_requires_approval", "high_risk_categories"],
+      "additionalProperties": false,
+      "properties": {
+        "risk_levels": { "type": "array", "items": { "type": "string", "enum": ["low", "medium", "high"] }, "minItems": 3, "maxItems": 3 },
+        "high_risk_requires_approval": { "type": "boolean" },
+        "high_risk_categories": { "type": "array", "items": { "type": "string" }, "minItems": 1 }
+      }
+    },
+
+    "decision_policy": {
+      "type": "object",
+      "required": ["evaluation_order", "outcomes", "urgency_bands"],
+      "additionalProperties": false,
+      "properties": {
+        "evaluation_order": {
+          "type": "array",
+          "items": { "type": "string", "enum": ["responsibility", "curiosity"] },
+          "minItems": 2,
+          "maxItems": 2
+        },
+        "outcomes": {
+          "type": "array",
+          "items": { "type": "string", "enum": ["do_nothing", "log_only", "notify", "ask_permission", "act", "act_then_report"] },
+          "minItems": 3
+        },
+        "urgency_bands": {
+          "type": "object",
+          "required": ["low", "medium", "high"],
+          "additionalProperties": false,
+          "properties": {
+            "low": { "$ref": "#/$defs/urgencyBand" },
+            "medium": { "$ref": "#/$defs/urgencyBand" },
+            "high": { "$ref": "#/$defs/urgencyBand" }
+          }
+        }
+      }
+    },
+
+    "learning_policy": { "type": "object" },
+    "research_policy": { "type": "object" }
+  },
+
+  "$defs": {
+    "autonomyLevel0": {
+      "type": "object",
+      "required": ["name", "can_execute_tools", "can_notify", "can_write_memory", "can_schedule"],
+      "additionalProperties": false,
+      "properties": {
+        "name": { "type": "string" },
+        "can_execute_tools": { "type": "boolean", "const": false },
+        "can_notify": { "type": "boolean" },
+        "can_write_memory": { "type": "boolean" },
+        "can_schedule": { "type": "boolean" }
+      }
+    },
+    "autonomyLevel1": {
+      "type": "object",
+      "required": ["name", "can_execute_tools", "tool_risk_cap", "can_write_memory", "memory_write_cap", "can_schedule"],
+      "additionalProperties": false,
+      "properties": {
+        "name": { "type": "string" },
+        "can_execute_tools": { "type": "boolean" },
+        "tool_risk_cap": { "type": "string", "enum": ["low", "medium", "high_with_approval"] },
+        "can_write_memory": { "type": "boolean" },
+        "memory_write_cap": { "type": "string", "enum": ["correction_only", "bounded"] },
+        "can_schedule": { "type": "boolean" }
+      }
+    },
+    "autonomyLevel2": {
+      "type": "object",
+      "required": ["name", "can_execute_tools", "tool_risk_cap", "can_write_memory", "memory_write_cap", "can_schedule"],
+      "additionalProperties": false,
+      "properties": {
+        "name": { "type": "string" },
+        "can_execute_tools": { "type": "boolean" },
+        "tool_risk_cap": { "type": "string", "enum": ["low", "medium", "high_with_approval"] },
+        "can_write_memory": { "type": "boolean" },
+        "memory_write_cap": { "type": "string", "enum": ["correction_only", "bounded"] },
+        "can_schedule": { "type": "boolean" }
+      }
+    },
+    "budget": {
+      "type": "object",
+      "required": ["max_actions", "max_notifications", "max_interrupts", "max_memory_writes"],
+      "additionalProperties": false,
+      "properties": {
+        "max_actions": { "type": "integer", "minimum": 0 },
+        "max_notifications": { "type": "integer", "minimum": 0 },
+        "max_interrupts": { "type": "integer", "minimum": 0 },
+        "max_memory_writes": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "urgencyBand": {
+      "type": "object",
+      "required": ["min", "max", "default_outcome"],
+      "additionalProperties": false,
+      "properties": {
+        "min": { "type": "integer", "minimum": 0, "maximum": 10 },
+        "max": { "type": "integer", "minimum": 0, "maximum": 10 },
+        "default_outcome": { "type": "string", "enum": ["do_nothing", "log_only", "notify", "ask_permission", "act", "act_then_report"] }
+      }
+    }
+  }
+}
+

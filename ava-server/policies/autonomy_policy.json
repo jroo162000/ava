@@ -1,0 +1,145 @@
+{
+  "version": 1,
+  "policy_name": "AVa Autonomy: Responsibility + Curiosity",
+  "last_updated": "2026-01-24",
+  "owner": "Jelani",
+
+  "principles": [
+    "Responsibility beats novelty.",
+    "No idle wandering. Curiosity must be triggered.",
+    "No actions without authority: permissions + risk gating.",
+    "No long-term memory writes without relevance + dedupe.",
+    "Never interrupt unless urgency threshold is met."
+  ],
+
+  "defaults": {
+    "mode": "responsibility_first",
+    "autonomy_level": 2,
+    "allow_idle_actions": false,
+    "require_user_approval_for": [
+      "high_risk_tool",
+      "any_write_operation",
+      "external_contact",
+      "credential_or_payment_flow"
+    ]
+  },
+
+  "autonomy_levels": {
+    "0": { "name": "observe_only", "can_execute_tools": false, "can_notify": true, "can_write_memory": false, "can_schedule": false },
+    "1": { "name": "suggest", "can_execute_tools": true, "tool_risk_cap": "low", "can_write_memory": true, "memory_write_cap": "correction_only", "can_schedule": false },
+    "2": { "name": "assist", "can_execute_tools": true, "tool_risk_cap": "medium", "can_write_memory": true, "memory_write_cap": "bounded", "can_schedule": true },
+    "3": { "name": "operate", "can_execute_tools": true, "tool_risk_cap": "high_with_approval", "can_write_memory": true, "memory_write_cap": "bounded", "can_schedule": true },
+    "4": { "name": "maintain", "can_execute_tools": true, "tool_risk_cap": "high_with_approval", "can_write_memory": true, "memory_write_cap": "bounded", "can_schedule": true }
+  },
+
+  "domains": {
+    "system_health": { "autonomy_level": 4, "allowed_triggers": ["health_degrade", "error_repeat", "scheduled_maintenance"] },
+    "dev_maintenance": { "autonomy_level": 3, "allowed_triggers": ["test_fail", "error_repeat", "dependency_drift", "scheduled_maintenance"] },
+    "finance_tax": { "autonomy_level": 1, "allowed_triggers": ["user_request", "deadline_approaching"] },
+    "communications": { "autonomy_level": 1, "allowed_triggers": ["user_request"] },
+    "web_research": { "autonomy_level": 2, "allowed_triggers": ["error_repeat", "explicit_research_request", "gap_detected"] },
+    "personal_assistant": { "autonomy_level": 2, "allowed_triggers": ["deadline_approaching", "user_request"] }
+  },
+
+  "triggers": {
+    "health_degrade": { "enabled": true, "urgency_base": 3, "class": "responsibility" },
+    "error_repeat": { "enabled": true, "urgency_base": 2, "class": "responsibility" },
+    "deadline_approaching": { "enabled": true, "urgency_base": 4, "class": "responsibility" },
+    "scheduled_maintenance": { "enabled": true, "urgency_base": 2, "class": "responsibility" },
+
+    "gap_detected": { "enabled": true, "urgency_base": 1, "class": "curiosity" },
+    "explicit_research_request": { "enabled": true, "urgency_base": 1, "class": "curiosity" }
+  },
+
+  "thresholds": {
+    "interrupt_urgency_threshold": 7,
+    "notify_urgency_threshold": 4,
+
+    "curiosity_allowed": true,
+    "curiosity_requires_trigger": true,
+    "curiosity_max_minutes_per_day": 10,
+    "curiosity_max_findings_per_day": 3,
+    "curiosity_requires_relevance_score": 0.72,
+    "curiosity_requires_citation": true,
+
+    "responsibility_max_actions_per_hour": 8,
+    "responsibility_max_notifications_per_hour": 3,
+    "responsibility_requires_verification_for_fixes": true,
+
+    "auto_store_user_corrections": true,
+    "auto_store_tool_errors": true,
+    "auto_store_requires_dedupe": true,
+    "auto_store_requires_min_confidence": 0.7,
+
+    "memory_max_items_per_day": 20,
+    "memory_min_relevance_to_store": 0.7,
+    "memory_max_chars_per_item": 600,
+    "memory_dedupe_similarity_threshold": 0.92,
+    "memory_priority_defaults": {
+      "correction": 4,
+      "constraint": 4,
+      "warning": 3,
+      "fact": 2,
+      "idea": 1
+    }
+  },
+
+  "budgets": {
+    "daily": { "max_actions": 40, "max_notifications": 10, "max_interrupts": 2, "max_memory_writes": 20 },
+    "hourly": { "max_actions": 8, "max_notifications": 3, "max_interrupts": 1, "max_memory_writes": 6 }
+  },
+
+  "quiet_hours": {
+    "enabled": true,
+    "timezone": "America/Chicago",
+    "start": "22:00",
+    "end": "07:00",
+    "during_quiet_hours": { "allow_interrupts": false, "allow_notifications": true, "notification_mode": "digest", "digest_time": "07:15" }
+  },
+
+  "risk_policy": {
+    "risk_levels": ["low", "medium", "high"],
+    "high_risk_requires_approval": true,
+    "high_risk_categories": [
+      "credential_or_payment_flow",
+      "system_commands",
+      "file_write_outside_allowlist",
+      "external_contact",
+      "code_apply_patch"
+    ]
+  },
+
+  "decision_policy": {
+    "evaluation_order": ["responsibility", "curiosity"],
+    "outcomes": ["do_nothing", "log_only", "notify", "ask_permission", "act", "act_then_report"],
+    "urgency_bands": {
+      "low": { "min": 0, "max": 3, "default_outcome": "log_only" },
+      "medium": { "min": 4, "max": 6, "default_outcome": "notify" },
+      "high": { "min": 7, "max": 10, "default_outcome": "ask_permission" }
+    }
+  },
+
+  "learning_policy": {
+    "store_types": ["constraint", "warning", "preference", "fact"],
+    "correction_markers": [
+      "use ",
+      "instead",
+      "should be",
+      "correct to",
+      "no, ",
+      "dont ",
+      "do not ",
+      "the right",
+      "actually"
+    ],
+    "tool_error_storage": { "enabled": true, "min_severity": "medium", "store_as": "warning", "include_context": true },
+    "must_be_actionable": true
+  },
+
+  "research_policy": {
+    "require_scope": { "enabled": true, "default_scope_minutes": 5, "max_scope_minutes": 10 },
+    "allowed_sources": { "require_high_quality": true },
+    "storage": { "store_findings_as": "fact", "require_url_or_citation": true, "store_only_top_k": 3 }
+  }
+}
+

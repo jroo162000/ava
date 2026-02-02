@@ -1,0 +1,11 @@
+# Requirements for AVA Realtime Voice Chat
+
+# Core dependencies
+websockets>=12.0
+pyaudio>=0.2.14
+google.genai
+
+# Already installed (from existing AVA setup)
+# openai>=1.0.0
+# pyttsx3
+# edge-tts

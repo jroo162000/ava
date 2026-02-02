@@ -1,0 +1,23 @@
+﻿:root { --bg:#0c0d10; --panel:#151720; --ink:#e9ecf1; --muted:#9aa3b2; --brand:#6aa2ff; --brand2:#89f; }
+*{box-sizing:border-box} body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.45 ui-sans-serif,system-ui,Segoe UI,Roboto}
+.shell{max-width:980px;margin:0 auto;min-height:100vh;display:flex;flex-direction:column}
+.topbar{display:flex;align-items:center;gap:12px;padding:14px 18px;border-bottom:1px solid #23263a;background:var(--panel);position:sticky;top:0;z-index:10}
+.dot{width:10px;height:10px;border-radius:50%}.off{background:#444}.on{background:#39d27d;box-shadow:0 0 0 3px #39d27d22}
+.brand{font-weight:600;letter-spacing:.35px}.row{margin-left:auto;display:flex;gap:8px}
+button{background:#1e2130;color:var(--ink);border:1px solid #2a2e44;border-radius:10px;padding:8px 12px;cursor:pointer}
+button:hover{border-color:#3a3f60}
+.wrap{flex:1;display:flex;gap:14px;padding:14px}
+.card{flex:1;background:var(--panel);border:1px solid #23263a;border-radius:16px;display:flex;flex-direction:column;overflow:hidden}
+.msgs{flex:1;overflow:auto;padding:16px;display:flex;flex-direction:column;gap:12px}
+.msg{max-width:76%;padding:10px 12px;border-radius:12px;white-space:pre-wrap}
+.user{align-self:flex-end;background:#224;border:1px solid #445}
+.bot{align-self:flex-start;background:#18212e;border:1px solid #24324a}
+.status{font-size:12px;color:var(--muted);padding:8px 12px;border-top:1px solid #23263a;background:#121420}
+.composer{display:flex;gap:8px;padding:12px;border-top:1px solid #23263a;background:#121420}
+input[type="text"]{flex:1;background:#0d0f18;color:var(--ink);border:1px solid #23263a;border-radius:10px;padding:10px}
+.pill{font-size:12px;color:#b7c2d6;background:#0e1320;border:1px dashed #2a3350;border-radius:999px;padding:4px 10px;margin-left:8px}
+.pill.green{color:#0c311a;background:#c5f7db;border:1px solid #7be0a8}
+.meter{height:6px;background:#0d1020;border-radius:999px;overflow:hidden}
+.meter > div{height:100%;background:linear-gradient(90deg,var(--brand),var(--brand2));width:0%}
+.hint{color:var(--muted);font-size:12px;margin-top:4px}
+.small{font-size:12px;color:#9aa3b2}
