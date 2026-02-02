@@ -1,0 +1,13 @@
+{"ts":1757045582928,"type":"user","text":"hi"}
+{"ts":"2025-09-05T04:13:03.724Z","session_id":"rt-7z6r7m","channel":"text","user_text":"hi","assistant_text":"","tools_used":[],"status_snapshot":null,"latency_ms":829,"like":null,"tags":[]}
+{"ts":1757045789833,"type":"user","text":"hi"}
+{"ts":"2025-09-05T04:16:31.009Z","session_id":"rt-ir2fsu","channel":"text","user_text":"hi","assistant_text":"","tools_used":[],"status_snapshot":null,"latency_ms":1261,"like":null,"tags":[]}
+{"ts":1757046145652,"type":"user","text":"hi"}
+{"ts":"2025-09-05T04:22:26.609Z","session_id":"rt-1xswmq","channel":"text","user_text":"hi","assistant_text":"","tools_used":[],"status_snapshot":null,"latency_ms":975,"like":null,"tags":[]}
+{"ts":1757046164931,"type":"user","text":"hi"}
+{"ts":"2025-09-05T04:22:45.971Z","session_id":"rt-1xswmq","channel":"text","user_text":"hi","assistant_text":"","tools_used":[],"status_snapshot":null,"latency_ms":1056,"like":null,"tags":[]}
+{"ts":"2025-09-05T04:24:42.550Z","session_id":"rt-1xswmq","channel":"voice","user_text":"hi","assistant_text":"","tools_used":[],"status_snapshot":null,"latency_ms":117635,"like":null,"tags":[]}
+{"ts":1757046716735,"type":"user","text":"hi"}
+{"ts":"2025-09-05T04:31:57.590Z","session_id":"rt-2iwcgi","channel":"text","user_text":"hi","assistant_text":"","tools_used":[],"status_snapshot":null,"latency_ms":870,"like":null,"tags":[]}
+{"ts":1757046829640,"type":"user","text":"hi"}
+{"ts":"2025-09-05T04:33:50.569Z","session_id":"rt-9vd4yk","channel":"text","user_text":"hi","assistant_text":"","tools_used":[],"status_snapshot":null,"latency_ms":947,"like":null,"tags":[]}

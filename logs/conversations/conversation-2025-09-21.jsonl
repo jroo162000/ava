@@ -1,0 +1,3 @@
+{"timestamp":"2025-09-21T17:33:39.761Z","unixTime":1758476019764,"direction":"user","content":"Test message from Claude Code testing","sessionId":"test-session","metadata":{"testMode":true}}
+{"timestamp":"2025-09-21T17:33:39.782Z","unixTime":1758476019782,"direction":"assistant","content":"Test response logged successfully","sessionId":"test-session","metadata":{"testMode":true}}
+{"timestamp":"2025-09-21T17:54:41.333Z","unixTime":1758477281337,"direction":"test","content":"Testing AVA file operations","sessionId":"default","metadata":{"testMode":true,"testType":"file-operations"}}

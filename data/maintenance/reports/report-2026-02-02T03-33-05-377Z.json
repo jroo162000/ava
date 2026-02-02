@@ -1,0 +1,45 @@
+{
+  "summary": {
+    "status": "healthy",
+    "proposals": 0,
+    "startedAt": 1770003185126,
+    "finishedAt": 1770003185373
+  },
+  "checks": {
+    "memory": {
+      "count": 18721,
+      "storage": "jsonl",
+      "embeddingProvider": "local",
+      "types": {
+        "conversation": 936,
+        "preference": 17,
+        "agent_action": 332,
+        "workflow": 1333,
+        "fact": 15909,
+        "warning": 34,
+        "constraint": 160
+      },
+      "status": "ok"
+    },
+    "llm": {
+      "activeSessions": 0,
+      "provider": "openai",
+      "sessions": [],
+      "status": "ok"
+    },
+    "env": {
+      "node": "v22.19.0",
+      "platform": "win32",
+      "allowWrite": true,
+      "build": "2026-02-01T03:33:02.455Z-ui2j2s"
+    },
+    "logs": {
+      "files": 23,
+      "recent": 0
+    },
+    "data": {
+      "traces": 13
+    },
+    "overall": "healthy"
+  }
+}

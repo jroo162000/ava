@@ -1,0 +1,41 @@
+{
+  "issues": [
+    {
+      "id": "issue-1",
+      "category": "voice",
+      "description": "Voice responses sometimes garbled or incoherent when using agent loop with tool execution",
+      "context": {
+        "error": "Agent loop responses are step status messages instead of natural language",
+        "attempted": "Added response filtering and natural language composition"
+      },
+      "createdAt": "2026-01-31T00:00:00.000Z",
+      "posted": true,
+      "postId": "07c9c6d6-5b0d-45f8-8bec-1529ae9453e8"
+    },
+    {
+      "id": "issue-2",
+      "category": "voice",
+      "description": "Vosk speech recognition sometimes produces incorrect transcriptions affecting voice assistant accuracy",
+      "context": {
+        "error": "Transcription accuracy issues with certain words and phrases",
+        "attempted": "Adjusted VAD thresholds and silence detection"
+      },
+      "createdAt": "2026-01-31T00:00:00.000Z",
+      "posted": true,
+      "postId": "4196249a-8d06-4878-adea-1cbec2ef2a6b"
+    },
+    {
+      "id": "issue-3",
+      "category": "tool",
+      "description": "How to make an AI agent with local device control more autonomous while staying safe",
+      "context": {
+        "goal": "Building personal assistant with file access, app control, and system commands",
+        "attempted": "Implemented autonomy policy with risk levels and approval gates"
+      },
+      "createdAt": "2026-01-31T00:00:00.000Z",
+      "posted": true,
+      "postId": "bc190fbe-635e-4125-896f-31135bb31e1b"
+    }
+  ],
+  "resolved": []
+}
