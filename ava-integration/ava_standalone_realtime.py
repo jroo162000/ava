@@ -262,18 +262,36 @@ class TurnStateMachine:
 
     Logs all state transitions in format: [turn-state] PREV -> NEW
     Validates that only one turn is active at any time.
+
+    D005 Barge-in Support:
+    When barge_in_enabled=True, allows SPEAK -> LISTEN transition for interrupts.
+    This is gated by D005 prerequisites (final-only, idempotency, echo protection).
     """
 
-    def __init__(self):
+    def __init__(self, barge_in_enabled: bool = False):
         self._state = TurnState.IDLE
         self._lock = threading.Lock()
         self._turn_id = 0
         self._turn_start_time = 0.0
+        self._barge_in_enabled = barge_in_enabled
+        self._interrupted = False  # Track if current turn was interrupted
+        self._interrupt_count = 0
 
     @property
     def state(self) -> str:
         with self._lock:
             return self._state
+
+    @property
+    def barge_in_enabled(self) -> bool:
+        with self._lock:
+            return self._barge_in_enabled
+
+    @barge_in_enabled.setter
+    def barge_in_enabled(self, value: bool):
+        with self._lock:
+            self._barge_in_enabled = value
+            print(f"[D005] Barge-in {'ENABLED' if value else 'DISABLED'}")
 
     def transition(self, new_state: str, reason: str = "") -> bool:
         """Transition to a new state with logging.
@@ -293,6 +311,7 @@ class TurnStateMachine:
             if old_state == TurnState.IDLE and new_state == TurnState.LISTEN:
                 self._turn_id += 1
                 self._turn_start_time = time.time()
+                self._interrupted = False  # New turn, reset interrupt flag
 
             self._state = new_state
             reason_str = f" ({reason})" if reason else ""
@@ -301,13 +320,18 @@ class TurnStateMachine:
             return True
 
     def _is_valid_transition(self, old: str, new: str) -> bool:
-        """Check if a state transition is valid."""
+        """Check if a state transition is valid.
+
+        D005: When barge_in_enabled, SPEAK -> LISTEN is allowed via interrupt_speaking().
+        Direct SPEAK -> LISTEN is still invalid to prevent accidental transitions.
+        Use interrupt_speaking() for proper barge-in handling.
+        """
         valid_transitions = {
             TurnState.IDLE: [TurnState.LISTEN],
             TurnState.LISTEN: [TurnState.FINAL, TurnState.IDLE],  # Can cancel back to IDLE
             TurnState.FINAL: [TurnState.DECIDE, TurnState.IDLE],  # Can cancel back to IDLE
             TurnState.DECIDE: [TurnState.SPEAK, TurnState.IDLE],  # Can skip speech
-            TurnState.SPEAK: [TurnState.IDLE],
+            TurnState.SPEAK: [TurnState.IDLE],  # Normal: SPEAK -> IDLE only
         }
         return new in valid_transitions.get(old, [])
 
@@ -316,6 +340,39 @@ class TurnStateMachine:
         with self._lock:
             return self._state != TurnState.IDLE
 
+    def interrupt_speaking(self, reason: str = "barge-in") -> bool:
+        """D005 Barge-in: Interrupt SPEAKING state and transition to LISTEN.
+
+        This is the ONLY valid way to go from SPEAK -> LISTEN.
+        Requires barge_in_enabled=True.
+
+        Returns True if interrupt succeeded, False if blocked.
+        """
+        with self._lock:
+            if not self._barge_in_enabled:
+                print(f"[D005] Barge-in blocked: feature disabled")
+                return False
+
+            if self._state != TurnState.SPEAK:
+                print(f"[D005] Barge-in blocked: not in SPEAK state (current: {self._state})")
+                return False
+
+            # Valid barge-in: SPEAK -> IDLE -> LISTEN
+            old_state = self._state
+            self._state = TurnState.IDLE
+            print(f"[turn-state] {old_state} -> {TurnState.IDLE} (barge-in interrupt: {reason})")
+
+            # Immediately transition to LISTEN for new input
+            self._state = TurnState.LISTEN
+            self._turn_id += 1
+            self._turn_start_time = time.time()
+            self._interrupted = True
+            self._interrupt_count += 1
+            print(f"[turn-state] {TurnState.IDLE} -> {TurnState.LISTEN} (barge-in resume)")
+            print(f"[D005] Barge-in successful: interrupt #{self._interrupt_count}")
+
+            return True
+
     def force_idle(self, reason: str = "forced reset"):
         """Force state back to IDLE (for error recovery)."""
         with self._lock:
@@ -323,6 +380,11 @@ class TurnStateMachine:
             if old_state != TurnState.IDLE:
                 print(f"[turn-state] {old_state} -> {TurnState.IDLE} ({reason})")
                 self._state = TurnState.IDLE
+
+    def was_interrupted(self) -> bool:
+        """Check if the current turn was started via barge-in interrupt."""
+        with self._lock:
+            return self._interrupted
 
 
 class WavToPcmStripper:
@@ -1004,8 +1066,16 @@ class StandaloneRealtimeAVA:
         self._tts_active_recently = threading.Event()
         self._tts_cooldown_sec = 2.5  # Seconds to suppress mic after TTS (longer to prevent feedback loops)
 
+        # D005 Barge-in settings (default OFF per D005)
+        self._barge_in_enabled = False
+        self._barge_in_min_speech_ms = 500
+        self._barge_in_require_final = True
+        self._barge_in_cancel_tts = True
+        self._barge_in_cooldown_ms = 1000
+        self._barge_in_last_interrupt_time = 0.0
+
         # Turn state machine for voice stabilization
-        self._turn_state = TurnStateMachine()
+        self._turn_state = TurnStateMachine(barge_in_enabled=self._barge_in_enabled)
 
         # Debug flags (hot‑reloadable via config)
         self.debug_agent = False
@@ -2544,6 +2614,20 @@ class StandaloneRealtimeAVA:
                         self.debug_tools = bool(self.cfg.get('debug_tools', False))
                         if self.debug_agent or self.debug_tools:
                             print(f"[cfg] Debug enabled: agent={self.debug_agent} tools={self.debug_tools}")
+
+                        # D005 Barge-in settings (hot-reloadable)
+                        barge_cfg = self.cfg.get('barge_in', {})
+                        new_barge_enabled = bool(barge_cfg.get('enabled', False))
+                        if new_barge_enabled != self._barge_in_enabled:
+                            self._barge_in_enabled = new_barge_enabled
+                            self._turn_state.barge_in_enabled = new_barge_enabled
+                            if not silent:
+                                print(f"[D005] Barge-in {'ENABLED' if new_barge_enabled else 'DISABLED'}")
+                        self._barge_in_min_speech_ms = int(barge_cfg.get('min_speech_ms', 500))
+                        self._barge_in_require_final = bool(barge_cfg.get('require_final_to_interrupt', True))
+                        self._barge_in_cancel_tts = bool(barge_cfg.get('cancel_tts_on_interrupt', True))
+                        self._barge_in_cooldown_ms = int(barge_cfg.get('cooldown_after_interrupt_ms', 1000))
+
                         if not silent:
                             print(f"[cfg] Reloaded {self.config_path}")
                     self._cfg_mtime = st.st_mtime
@@ -3214,6 +3298,31 @@ class StandaloneRealtimeAVA:
                         except Exception:
                             pass
 
+                        # D005 BARGE-IN: Check if we should interrupt current speech
+                        if self._barge_in_enabled and self._turn_state.state == TurnState.SPEAK:
+                            # User is speaking while AVA is speaking - potential barge-in
+                            now_ms = time.time() * 1000
+                            cooldown_ok = (now_ms - self._barge_in_last_interrupt_time) > self._barge_in_cooldown_ms
+
+                            if cooldown_ok:
+                                print(f"[D005] Barge-in detected: user interrupted TTS")
+                                # Interrupt the current speech
+                                if self._turn_state.interrupt_speaking(f"user said: {transcript[:30]}"):
+                                    self._barge_in_last_interrupt_time = now_ms
+                                    # Cancel TTS if configured
+                                    if self._barge_in_cancel_tts:
+                                        self._cancel_tts()
+                                        self.tts_active.clear()
+                                        print(f"[D005] TTS cancelled due to barge-in")
+                                    # Continue to process the new transcript below
+                                else:
+                                    # Interrupt failed - skip this transcript
+                                    print(f"[D005] Barge-in interrupt failed, skipping transcript")
+                                    continue
+                            else:
+                                print(f"[D005] Barge-in blocked: cooldown active ({self._barge_in_cooldown_ms}ms)")
+                                continue
+
                         # TURN STATE: FINAL transcript received
                         print(f"[FINAL -> DECIDE] '{transcript[:40]}...'")
                         self._turn_state.transition(TurnState.LISTEN, "user speaking")
@@ -3265,6 +3374,24 @@ class StandaloneRealtimeAVA:
                         # This is a critical safety gate - partials are unreliable
                         if transcript.strip():
                             print(f"[PARTIAL -> NO_TOOL] '{transcript[:50]}...' (interim, display only)")
+
+                            # D005 BARGE-IN: Allow partials to interrupt TTS if configured
+                            # Note: Even with partial interrupt, tools still require FINAL (preserved invariant)
+                            if (self._barge_in_enabled and
+                                not self._barge_in_require_final and
+                                self._turn_state.state == TurnState.SPEAK):
+                                now_ms = time.time() * 1000
+                                cooldown_ok = (now_ms - self._barge_in_last_interrupt_time) > self._barge_in_cooldown_ms
+                                if cooldown_ok:
+                                    print(f"[D005] Barge-in on partial: interrupting TTS (tools still gated)")
+                                    if self._turn_state.interrupt_speaking(f"partial: {transcript[:20]}"):
+                                        self._barge_in_last_interrupt_time = now_ms
+                                        if self._barge_in_cancel_tts:
+                                            self._cancel_tts()
+                                            self.tts_active.clear()
+                                            print(f"[D005] TTS cancelled due to partial barge-in")
+                                        # Note: We do NOT process the partial - just interrupted TTS
+                                        # User must say a final transcript to trigger tools
         except WS_ClosedGeneral as e:
             print(f"\n🔌 ASR connection closed: {e}")
             try:

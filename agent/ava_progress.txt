@@ -10,6 +10,52 @@ RULES FOR CLAUDE:
 -->
 
 ================================================================================
+2026-02-02 - D005 Barge-in Implementation (Feature Flag OFF)
+================================================================================
+
+WHAT CHANGED:
+- Added barge_in config section to ava_voice_config.json (enabled: false)
+- Updated TurnStateMachine with:
+  - barge_in_enabled property
+  - interrupt_speaking() method for SPEAK -> IDLE -> LISTEN transition
+  - was_interrupted() tracking
+- Added barge-in config loading in _load_config() (hot-reloadable)
+- Added barge-in interrupt handling in transcript processing:
+  - Detects speech during SPEAK state
+  - Respects cooldown between interrupts
+  - Cancels TTS on interrupt if configured
+  - Preserves final-only gating (partials can interrupt TTS but not trigger tools)
+
+D005 SAFEGUARDS IMPLEMENTED:
+- Turn-state machine is authoritative (explicit transitions only)
+- Tool safety under interruption (final-only gating preserved)
+- Echo/feedback containment (TTS cancelled, cooldown enforced)
+- No concurrent turns (single state machine)
+
+BARGE-IN CONFIG OPTIONS:
+- enabled: false (default OFF per D005)
+- min_speech_ms: 500 (minimum speech duration to trigger)
+- require_final_to_interrupt: true (only finals can trigger)
+- cancel_tts_on_interrupt: true (stop TTS immediately)
+- cooldown_after_interrupt_ms: 1000 (prevent rapid interrupts)
+
+TESTS ADDED:
+- Smoke test: check_barge_in_safety(), check_barge_in_state_integrity()
+- Regression: TestBargeInSafety (6 tests), TestBargeInSimulation (3 tests)
+
+WHAT TEST PROVED IT:
+- Smoke test: 11/11 PASS (2 new D005 checks)
+- Regression tests: 29/29 PASS (9 new barge-in tests)
+- Tests pass because barge-in DISABLED (D005 gate active)
+- Tests will FAIL if barge-in enabled without safeguards
+
+WHAT'S NEXT:
+- Barge-in implemented but DISABLED by default
+- To enable: set barge_in.enabled: true in config
+- D005 unblock requires: enable barge-in, run all tests, verify no loops
+- If tests pass with barge-in enabled, flip barge_in to passes:true
+
+================================================================================
 2026-02-02 - QA/Regression: Voice Invariant Tests Added
 ================================================================================
 

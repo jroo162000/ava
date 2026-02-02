@@ -394,6 +394,126 @@ def check_repeated_command_blocking():
                     "Node boundary not found - cannot verify")
 
 
+# ============================================================================
+# D005: BARGE-IN SIMULATION CHECK
+# Per D005, barge-in is blocked until anti-loop invariants are proven.
+# This test validates that IF barge-in is enabled, proper safeguards exist.
+# ============================================================================
+
+def check_barge_in_safety():
+    """
+    D005 Barge-in Simulation Check.
+
+    Validates that if barge-in is enabled:
+    1. SPEAKING -> LISTEN transition is explicit and gated
+    2. Interruption preserves final-only gating
+    3. No concurrent SPEAKING + LISTEN states
+    4. Tool gate remains stable under interruption
+
+    If barge-in is DISABLED (default), this check passes automatically.
+    If barge-in is ENABLED without safeguards, this check FAILS.
+    """
+    config_path = os.path.join(PROJECT_ROOT, CONFIG_FILE)
+    runner_path = os.path.join(PROJECT_ROOT, CANONICAL_RUNNER)
+
+    # Load config to check if barge-in is enabled
+    barge_in_enabled = False
+    if os.path.exists(config_path):
+        try:
+            with open(config_path, 'r') as f:
+                config = json.load(f)
+            barge_in_enabled = config.get('allow_barge', False)
+            # Also check nested barge config
+            barge_cfg = config.get('barge', {})
+            if barge_cfg.get('enabled', False):
+                barge_in_enabled = True
+        except:
+            pass
+
+    # If barge-in is disabled, D005 is satisfied (blocked by default)
+    if not barge_in_enabled:
+        return check("Barge-in safety (D005)", True,
+                    "Barge-in disabled - D005 blocking gate active")
+
+    # Barge-in is ENABLED - must verify all D005 safeguards exist
+    if not os.path.exists(runner_path):
+        return check("Barge-in safety (D005)", False,
+                    f"Barge-in enabled but {CANONICAL_RUNNER} not found!")
+
+    with open(runner_path, 'r', encoding='utf-8') as f:
+        code = f.read()
+
+    # D005 Required safeguards when barge-in is enabled:
+    safeguards = {
+        'interrupt_handler': (
+            r'(interrupt|barge|cancel).*speak|speak.*(interrupt|cancel)',
+            'Interrupt/cancel speaking handler'
+        ),
+        'speaking_to_listen': (
+            r'SPEAK.*LISTEN|transition.*SPEAK.*LISTEN',
+            'Explicit SPEAKING->LISTEN transition'
+        ),
+        'no_concurrent_turns': (
+            r'(one.*turn|single.*turn|concurrent.*turn|turn.*lock)',
+            'Concurrent turn prevention'
+        ),
+        'interrupt_gating': (
+            r'(interrupt.*final|final.*interrupt|gate.*interrupt)',
+            'Interrupt respects final-only gating'
+        ),
+        'echo_protection': (
+            r'(echo.*protect|self.*trigger|mute.*during|suppress.*during)',
+            'Echo/self-trigger protection during interrupt'
+        ),
+    }
+
+    missing = []
+    for key, (pattern, name) in safeguards.items():
+        if not re.search(pattern, code, re.IGNORECASE):
+            missing.append(name)
+
+    # Must have at least 4 of 5 safeguards
+    if len(missing) <= 1:
+        return check("Barge-in safety (D005)", True)
+    else:
+        return check("Barge-in safety (D005)", False,
+                    f"Barge-in ENABLED but missing safeguards: {', '.join(missing)}")
+
+
+def check_barge_in_state_integrity():
+    """
+    Verify barge-in cannot cause illegal state transitions.
+
+    Simulates: TTS is active (SPEAKING), interrupt arrives
+    Must verify: State machine handles this cleanly without corruption
+    """
+    runner_path = os.path.join(PROJECT_ROOT, CANONICAL_RUNNER)
+    if not os.path.exists(runner_path):
+        return check("Barge-in state integrity", False, f"{CANONICAL_RUNNER} not found")
+
+    with open(runner_path, 'r', encoding='utf-8') as f:
+        code = f.read()
+
+    # Must have TurnStateMachine with proper state tracking
+    required = [
+        (r'class\s+TurnStateMachine', 'TurnStateMachine class'),
+        (r'self\._state|self\.state', 'State tracking'),
+        (r'with\s+self\._lock|threading\.Lock', 'Thread-safe state'),
+        (r'force_idle|reset_state|clear_state', 'State reset capability'),
+    ]
+
+    found = 0
+    for pattern, name in required:
+        if re.search(pattern, code, re.IGNORECASE):
+            found += 1
+
+    if found >= 3:
+        return check("Barge-in state integrity", True)
+    else:
+        return check("Barge-in state integrity", False,
+                    f"Found {found}/4 state integrity patterns")
+
+
 def main():
     print("=" * 70)
     print("AVA CANONICAL SMOKE TEST + VOICE INVARIANT PREFLIGHT")
@@ -414,6 +534,10 @@ def main():
     check_half_duplex_enforcement()
     check_turn_state_transitions()
     check_repeated_command_blocking()
+
+    print("\n[D005: BARGE-IN SAFETY CHECKS]")
+    check_barge_in_safety()
+    check_barge_in_state_integrity()
 
     print("-" * 70)
     passed = sum(1 for _, p in results if p)

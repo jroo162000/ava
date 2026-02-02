@@ -62,5 +62,13 @@
     "half_duplex": true,
     "turn_state_logging": true,
     "comment": "Partials display only, finals trigger DECIDE. Mic muted during SPEAK state."
+  },
+  "barge_in": {
+    "enabled": false,
+    "min_speech_ms": 500,
+    "require_final_to_interrupt": true,
+    "cancel_tts_on_interrupt": true,
+    "cooldown_after_interrupt_ms": 1000,
+    "comment": "D005: Barge-in disabled by default. When enabled, user can interrupt TTS with speech. Requires final transcript to trigger interrupt (not partials)."
   }
 }
