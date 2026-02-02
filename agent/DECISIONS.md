@@ -77,3 +77,72 @@ RULES FOR CLAUDE:
 **Date:** 2026-02-02
 **Decision:** `voice_watchdog.py` auto-restarts voice client on crash.
 **Rationale:** Native library segfaults bypass Python error handling.
+
+---
+
+# Subagent Scopes
+
+## Repo Curator
+
+**Allowed:**
+- `ava-integration/**` (file organization)
+- `ava-integration/archive/` (archival)
+- Startup scripts (`*.ps1`, `*.bat`)
+- README/docs related to starting AVa
+
+**Do NOT Touch:**
+- Node tool boundary logic (`ava-server/src/services/tools.js`)
+- Python tool execution logic
+- ASR logic inside canonical runner
+- Voice capture/playback code
+
+---
+
+## Tool Gate Engineer
+
+**Allowed:**
+- `ava-server/src/services/tools.js` (tool execution boundary)
+- `ava-server/src/routes/tools.js` (tool endpoints)
+- `ava-integration/ava_server_client.py` (Node client)
+- `ava-integration/ava_bridge.py` (only tool proxy logic)
+- Smoke test adjustments for boundary detection
+
+**Do NOT Touch:**
+- Voice capture/ASR
+- Turn-state logic
+- Autonomy, curiosity, memory modules
+- UI components
+- TTS playback logic
+
+---
+
+## Voice Stabilizer
+
+**Allowed:**
+- `ava_standalone_realtime.py` (turn-state, gating, half-duplex)
+- `ava_voice_config.json` (stability settings)
+- `voice/session.py` (TTS coordination)
+- `voice/tts/*.py` (TTS serialization)
+
+**Do NOT Touch:**
+- Node tool boundary (`ava-server/`)
+- Tool execution logic
+- New ASR pipelines (use existing Vosk+Whisper)
+- UI components
+- Memory/autonomy modules
+
+---
+
+## QA / Regression Agent
+
+**Allowed:**
+- `scripts/smoke_test.py`
+- `ava-server/tests/` (unit tests)
+- `ava-integration/tests/` (integration tests)
+- New test files
+
+**Do NOT Touch:**
+- Runtime behavior (tests only, no implementation changes)
+- Production code (except minimal hooks for testability)
+- Config files (unless test-specific)
+- Architecture decisions
