@@ -1,0 +1,94 @@
+{
+  "_purpose": "Feature implementation checklist. Tracks what passes and what doesn't.",
+  "_rules": [
+    "passes: false → true ONLY when feature is verified working.",
+    "Never set passes back to false unless feature is removed.",
+    "No freestyle edits - only update passes field.",
+    "Add test_proof when marking true."
+  ],
+
+  "phase_1_audio_foundation": {
+    "mic_capture": {
+      "passes": true,
+      "test_proof": "RMS values logged in [micdbg] output"
+    },
+    "vad_detection": {
+      "passes": true,
+      "test_proof": "Speech triggers ASR, silence ends it"
+    },
+    "vosk_streaming_asr": {
+      "passes": true,
+      "test_proof": "Partial transcripts appear in real-time"
+    },
+    "whisper_final_asr": {
+      "passes": true,
+      "test_proof": "Final transcripts are accurate"
+    },
+    "piper_tts": {
+      "passes": true,
+      "test_proof": "AVA speaks responses audibly"
+    },
+    "audio_playback": {
+      "passes": true,
+      "test_proof": "22050 Hz playback without distortion"
+    }
+  },
+
+  "phase_2_stability": {
+    "half_duplex_audio": {
+      "passes": true,
+      "test_proof": "Mic suppressed during TTS, no self-trigger"
+    },
+    "echo_cancellation": {
+      "passes": true,
+      "test_proof": "Grace period prevents echo loops"
+    },
+    "tts_serialization": {
+      "passes": true,
+      "test_proof": "New speech cancels previous, no overlap"
+    },
+    "queue_management": {
+      "passes": true,
+      "test_proof": "Queue drains on tts.start/tts.end"
+    },
+    "crash_recovery_watchdog": {
+      "passes": true,
+      "test_proof": "Watchdog restarts after segfault"
+    },
+    "final_only_transcript_gating": {
+      "passes": false,
+      "test_proof": null
+    }
+  },
+
+  "phase_3_tool_execution": {
+    "node_gateway_boundary": {
+      "passes": false,
+      "test_proof": null
+    },
+    "idempotency_cache": {
+      "passes": false,
+      "test_proof": null
+    },
+    "tool_routing": {
+      "passes": true,
+      "test_proof": "Intent patterns route to correct handlers"
+    },
+    "safety_confirmations": {
+      "passes": true,
+      "test_proof": "Destructive keywords prompt confirmation"
+    }
+  },
+
+  "phase_4_advanced": {
+    "barge_in": {
+      "passes": false,
+      "test_proof": null,
+      "blocked_by": "D005 - disabled until phase 3 complete"
+    },
+    "native_segfault_prevention": {
+      "passes": false,
+      "test_proof": null
+    }
+  }
+}

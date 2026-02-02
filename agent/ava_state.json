@@ -1,0 +1,50 @@
+{
+  "_purpose": "Authoritative runtime facts for AVA. Claude reads this to understand current system state.",
+  "_rules": [
+    "This file contains non-secret configuration facts only.",
+    "Update when canonical paths, ports, or feature flags change.",
+    "Do not store API keys or credentials here.",
+    "Reference DECISIONS.md for why these values were chosen."
+  ],
+
+  "canonical_runner": {
+    "path": "ava_standalone_realtime.py",
+    "watchdog": "voice_watchdog.py",
+    "config": "ava_voice_config.json"
+  },
+
+  "ports": {
+    "ava_server": 3001,
+    "voice_client": null
+  },
+
+  "feature_flags": {
+    "half_duplex": true,
+    "barge_in": false,
+    "echo_cancellation": true,
+    "tts_serialization": true,
+    "final_only_gating": true,
+    "tool_idempotency": false
+  },
+
+  "audio_pipeline": {
+    "sample_rate": 22050,
+    "tts_engine": "piper",
+    "asr_streaming": "vosk",
+    "asr_final": "whisper"
+  },
+
+  "tool_execution": {
+    "boundary": "node_gateway",
+    "python_direct_execution": false
+  },
+
+  "health_expectations": {
+    "voice_client_restarts_ok": true,
+    "max_restart_interval_sec": 3,
+    "expected_mic_rms_range": [100, 500],
+    "vad_threshold": 300
+  },
+
+  "last_updated": "2026-02-02"
+}

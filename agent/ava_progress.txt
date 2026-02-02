@@ -1,0 +1,65 @@
+# AVA Integration Progress Log
+
+<!--
+PURPOSE: Session-by-session log of changes, tests, and next steps.
+RULES FOR CLAUDE:
+- Append new sessions at the top (newest first).
+- Each entry: date, what changed, what test proved it, what's next.
+- Reference DECISIONS.md for architectural choices.
+- Reference ava_feature_list.json for pass/fail status.
+-->
+
+================================================================================
+2026-02-02 - Integration Lead Artifacts Setup
+================================================================================
+
+WHAT CHANGED:
+- Created agent/ folder with governance artifacts
+- Documented 9 architectural decisions in DECISIONS.md
+- Established feature checklist in ava_feature_list.json
+- Set runtime state in ava_state.json
+
+WHAT TEST PROVED IT:
+- Files committed to GitHub repo
+- Structure follows Integration Lead contract
+
+WHAT'S NEXT:
+- Implement final_only_transcript_gating (voice-stabilizer agent)
+- Enforce node_gateway_boundary (tool-gate-engineer agent)
+- Add regression tests (qa-regression-agent)
+
+================================================================================
+2026-02-02 - Voice Stability Fixes (Prior Session)
+================================================================================
+
+WHAT CHANGED:
+- Fixed segfaults by aligning sample rate to 22050 Hz throughout
+- Added TTS serialization in session.py speak() method
+- Implemented queue draining on tts.start and tts.end events
+- Created voice_watchdog.py for crash recovery
+- Lowered VAD threshold from 1200 to 300
+
+WHAT TEST PROVED IT:
+- Voice client runs longer without crashes
+- Watchdog restarts automatically on segfault (exit code 139)
+- Mic RMS values (~100-300) now exceed threshold
+- No more queue overflow (was q=200/20, now stable at q=0/20)
+
+WHAT'S NEXT:
+- Set up Integration Lead artifacts (DONE)
+- Implement remaining stability features
+
+================================================================================
+KNOWN ISSUES
+================================================================================
+1. Native PyAudio/PortAudio segfaults still occur occasionally
+   - Mitigated by watchdog auto-restart
+   - Root cause: threading issues in native libraries
+
+2. final_only_transcript_gating not implemented
+   - Partials can still trigger actions
+   - Assigned to voice-stabilizer agent
+
+3. Tool execution boundary not enforced
+   - Python may execute tools directly
+   - Assigned to tool-gate-engineer agent
