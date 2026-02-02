@@ -422,10 +422,12 @@ def check_barge_in_safety():
         try:
             with open(config_path, 'r') as f:
                 config = json.load(f)
-            barge_in_enabled = config.get('allow_barge', False)
-            # Also check nested barge config
-            barge_cfg = config.get('barge', {})
-            if barge_cfg.get('enabled', False):
+            # Check barge_in section (canonical D005 config)
+            barge_in_cfg = config.get('barge_in', {})
+            if barge_in_cfg.get('enabled', False):
+                barge_in_enabled = True
+            # Also check legacy allow_barge flag
+            if config.get('allow_barge', False):
                 barge_in_enabled = True
         except:
             pass

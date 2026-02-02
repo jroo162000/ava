@@ -20,11 +20,11 @@
 
   "feature_flags": {
     "half_duplex": true,
-    "barge_in": false,
+    "barge_in": true,
     "echo_cancellation": true,
     "tts_serialization": true,
     "final_only_gating": true,
-    "tool_idempotency": false
+    "tool_idempotency": true
   },
 
   "audio_pipeline": {
