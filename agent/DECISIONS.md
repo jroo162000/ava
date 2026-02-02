@@ -164,6 +164,27 @@ If enabling barge-in causes any regression (tests or smoke), immediately:
 
 ---
 
+## D010: Module vs Runner Distinction
+**Date:** 2026-02-02
+**Decision:** Only standalone runner scripts are archived. Support modules required by the canonical runner must remain in place.
+**Rationale:** `ava_hybrid_asr.py` was incorrectly archived as a "runner" when it's actually a module providing `HybridASREngine` to the canonical runner. This caused `HYBRID_ASR_AVAILABLE = False` at runtime.
+
+**Modules that MUST NOT be archived:**
+- `ava_hybrid_asr.py` (provides HybridASREngine)
+- `ava_personality.py` (provides personality functions)
+- `ava_server_client.py` (provides Node client)
+- `corrected_tool_definitions.py` (provides CORRECTED_TOOLS)
+- `voice/` package (provides unified voice scaffolding)
+
+**Files that ARE runners (can be archived if non-canonical):**
+- Files with `if __name__ == "__main__": asyncio.run(main())` as entry point
+- Files that start audio capture/playback loops
+- Files named `*_standalone*.py` or `*_voice.py` (check before archiving)
+
+**Enforcement:** Before archiving any Python file, check if the canonical runner imports it.
+
+---
+
 # Subagent Scopes
 
 ## Repo Curator

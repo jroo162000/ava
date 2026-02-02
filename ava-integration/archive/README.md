@@ -29,10 +29,11 @@ The following voice runners were archived on 2026-02-02:
 - **Reason for archival:** Replaced by ava_standalone_realtime.py
 - **Status:** Non-functional, depends on old cmpuse architecture
 
-### 2. `ava_hybrid_asr.py`
+### 2. `ava_hybrid_asr.py` - **RESTORED**
 - **Description:** Hybrid ASR engine combining Vosk + Whisper
-- **Reason for archival:** Integrated into voice/ module, no longer standalone
-- **Status:** Functionality preserved in voice/providers/hybrid_asr.py
+- **Status:** RESTORED to main directory (2026-02-02)
+- **Reason:** This is a MODULE, not a runner. The canonical runner imports `HybridASREngine` from it. Incorrectly archived.
+- **Note:** `voice/providers/hybrid_asr.py` provides a DIFFERENT class (`HybridASRProvider`) for the unified voice scaffolding. Both are needed.
 
 ### 3. `avas_voice.py`
 - **Description:** Early Deepgram Agent Voice implementation
