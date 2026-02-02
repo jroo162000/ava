@@ -74,6 +74,73 @@ def check_single_runner():
         return check("Single runner (no duplicates)", False, str(e))
 
 
+def check_runner_dependencies():
+    """
+    D010 Enforcement: Verify all modules imported by canonical runner exist.
+
+    Parses the runner's imports and asserts each module exists in-place
+    (not archived). Prevents "archived dependency" from ever happening again.
+    """
+    runner_path = os.path.join(PROJECT_ROOT, CANONICAL_RUNNER)
+    archive_dir = os.path.join(PROJECT_ROOT, "archive")
+
+    if not os.path.exists(runner_path):
+        return check("Runner dependencies (D010)", False, f"{CANONICAL_RUNNER} not found")
+
+    with open(runner_path, 'r', encoding='utf-8') as f:
+        code = f.read()
+
+    # Extract local module imports (not stdlib/site-packages)
+    # Patterns: from X import Y, import X
+    local_modules = set()
+
+    # Pattern: from ava_xxx import ... or from voice.xxx import ...
+    from_imports = re.findall(r'from\s+(ava_\w+|voice(?:\.\w+)*)\s+import', code)
+    local_modules.update(from_imports)
+
+    # Pattern: import ava_xxx
+    direct_imports = re.findall(r'^import\s+(ava_\w+)', code, re.MULTILINE)
+    local_modules.update(direct_imports)
+
+    missing = []
+    archived = []
+
+    for module in local_modules:
+        # Convert module path to file path
+        if '.' in module:
+            # voice.providers.local_hybrid -> voice/providers/local_hybrid.py
+            parts = module.split('.')
+            module_path = os.path.join(PROJECT_ROOT, *parts[:-1])
+            file_path = os.path.join(PROJECT_ROOT, *parts) + '.py'
+            pkg_init = os.path.join(module_path, '__init__.py')
+
+            # Check if it's a package or module
+            exists = os.path.exists(file_path) or os.path.exists(pkg_init) or os.path.isdir(module_path)
+        else:
+            # ava_hybrid_asr -> ava_hybrid_asr.py
+            file_path = os.path.join(PROJECT_ROOT, module + '.py')
+            pkg_path = os.path.join(PROJECT_ROOT, module)
+            exists = os.path.exists(file_path) or os.path.isdir(pkg_path)
+
+            # Check if it's in archive (BAD)
+            archived_file = os.path.join(archive_dir, module + '.py')
+            if os.path.exists(archived_file) and not exists:
+                archived.append(module)
+                continue
+
+        if not exists:
+            missing.append(module)
+
+    if archived:
+        return check("Runner dependencies (D010)", False,
+                    f"ARCHIVED but still imported: {', '.join(archived)}")
+    elif missing:
+        return check("Runner dependencies (D010)", False,
+                    f"Missing modules: {', '.join(missing)}")
+    else:
+        return check("Runner dependencies (D010)", True)
+
+
 def check_final_only_gating():
     """Verify code has final-only transcript gating (partials don't trigger tools)."""
     runner_path = os.path.join(PROJECT_ROOT, CANONICAL_RUNNER)
@@ -690,6 +757,7 @@ def main():
 
     print("\n[CORE CHECKS]")
     check_single_runner()
+    check_runner_dependencies()
     check_final_only_gating()
     check_idempotency()
     check_no_loop_indicators()
