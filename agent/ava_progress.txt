@@ -10,6 +10,27 @@ RULES FOR CLAUDE:
 -->
 
 ================================================================================
+2026-02-02 - Canonical Smoke Test Created
+================================================================================
+
+WHAT CHANGED:
+- Created scripts/smoke_test.py in ava-integration
+- Smoke test checks 4 invariants:
+  1. Single runner (no duplicates)
+  2. Final-only transcript gating
+  3. Idempotency cache
+  4. No loop indicators (config valid)
+
+WHAT TEST PROVED IT:
+- Ran smoke test: 3/4 passed
+- FAIL: Idempotency cache not implemented
+
+WHAT'S NEXT:
+- BLOCKED: Smoke test fails on idempotency
+- Must implement idempotency cache before any other work
+- Cannot proceed until smoke test passes
+
+================================================================================
 2026-02-02 - Integration Lead Artifacts Setup
 ================================================================================
 
