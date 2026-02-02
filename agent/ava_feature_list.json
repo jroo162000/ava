@@ -60,8 +60,8 @@
       "test_proof": "Non-canonical runners archived; smoke_test.py single runner PASS; start_ava.ps1 starts only canonical runner"
     },
     "final_only_transcript_gating": {
-      "passes": false,
-      "test_proof": null
+      "passes": true,
+      "test_proof": "TurnStateMachine enforces LISTEN→FINAL→DECIDE; [PARTIAL→NO_TOOL] logged; [FINAL→DECIDE] logged; smoke_test.py PASS"
     }
   },
 

@@ -10,6 +10,37 @@ RULES FOR CLAUDE:
 -->
 
 ================================================================================
+2026-02-02 - Voice Stabilization: Half-Duplex + Final-Only Gating
+================================================================================
+
+WHAT CHANGED:
+- Added TurnState enum and TurnStateMachine class
+- Implemented explicit turn-state transitions: IDLE → LISTEN → FINAL → DECIDE → SPEAK → IDLE
+- Added PARTIAL → NO_TOOL logging (partials cannot trigger tools)
+- Added FINAL → DECIDE logging (finals enter decision phase)
+- Enforced half-duplex: mic muted during SPEAK state
+- Added voice_stabilization config block to ava_voice_config.json
+
+TURN STATE MACHINE:
+- IDLE: Between turns
+- LISTEN: Mic active, waiting for speech
+- FINAL: Final transcript received
+- DECIDE: Processing response/action
+- SPEAK: TTS active, mic muted
+
+WHAT TEST PROVED IT:
+- Smoke test: 4/4 PASS (unchanged)
+- Logs show: [PARTIAL -> NO_TOOL] for interim transcripts
+- Logs show: [FINAL -> DECIDE] for final transcripts
+- Logs show: [turn-state] transitions
+- Logs show: [half-duplex] MIC MUTED/UNMUTED
+
+WHAT'S NEXT:
+- All phase_2 stability features complete
+- Phase_3 tool execution complete
+- Phase_4 advanced features remain (barge_in blocked by D005)
+
+================================================================================
 2026-02-02 - Node Tool Execution Boundary Enforced
 ================================================================================
 

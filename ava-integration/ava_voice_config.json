@@ -56,5 +56,11 @@
     "grace_period_sec": 3.0,
     "tts_cooldown_sec": 2.5,
     "rms_boost_during_tts": 2.0
+  },
+  "voice_stabilization": {
+    "final_only_gating": true,
+    "half_duplex": true,
+    "turn_state_logging": true,
+    "comment": "Partials display only, finals trigger DECIDE. Mic muted during SPEAK state."
   }
 }

@@ -238,6 +238,93 @@ DG_LISTEN_URL = (
 )
 DG_SPEAK_BASE = "https://api.deepgram.com/v1/speak?model=aura-2-andromeda-en"
 
+# ==================== TURN STATE MACHINE (Voice Stabilizer) ====================
+
+class TurnState:
+    """Explicit turn states for voice interaction.
+
+    State machine: IDLE -> LISTEN -> FINAL -> DECIDE -> SPEAK -> IDLE
+
+    This enforces deterministic voice behavior:
+    - Partial transcripts NEVER trigger tools (PARTIAL -> NO_TOOL)
+    - Only final transcripts can trigger DECIDE phase (FINAL -> DECIDE)
+    - Mic is muted during SPEAK state (half-duplex)
+    """
+    IDLE = "IDLE"
+    LISTEN = "LISTEN"
+    FINAL = "FINAL"
+    DECIDE = "DECIDE"
+    SPEAK = "SPEAK"
+
+
+class TurnStateMachine:
+    """Thread-safe state machine for voice turn management.
+
+    Logs all state transitions in format: [turn-state] PREV -> NEW
+    Validates that only one turn is active at any time.
+    """
+
+    def __init__(self):
+        self._state = TurnState.IDLE
+        self._lock = threading.Lock()
+        self._turn_id = 0
+        self._turn_start_time = 0.0
+
+    @property
+    def state(self) -> str:
+        with self._lock:
+            return self._state
+
+    def transition(self, new_state: str, reason: str = "") -> bool:
+        """Transition to a new state with logging.
+
+        Returns True if transition was valid, False if blocked.
+        """
+        with self._lock:
+            old_state = self._state
+            timestamp = time.strftime("%H:%M:%S")
+
+            # Validate transition
+            if not self._is_valid_transition(old_state, new_state):
+                print(f"[VOICE_ERROR] Invalid transition {old_state} -> {new_state} (reason: {reason})")
+                return False
+
+            # Check for concurrent turn violation
+            if old_state == TurnState.IDLE and new_state == TurnState.LISTEN:
+                self._turn_id += 1
+                self._turn_start_time = time.time()
+
+            self._state = new_state
+            reason_str = f" ({reason})" if reason else ""
+            print(f"[turn-state] {old_state} -> {new_state}{reason_str}")
+
+            return True
+
+    def _is_valid_transition(self, old: str, new: str) -> bool:
+        """Check if a state transition is valid."""
+        valid_transitions = {
+            TurnState.IDLE: [TurnState.LISTEN],
+            TurnState.LISTEN: [TurnState.FINAL, TurnState.IDLE],  # Can cancel back to IDLE
+            TurnState.FINAL: [TurnState.DECIDE, TurnState.IDLE],  # Can cancel back to IDLE
+            TurnState.DECIDE: [TurnState.SPEAK, TurnState.IDLE],  # Can skip speech
+            TurnState.SPEAK: [TurnState.IDLE],
+        }
+        return new in valid_transitions.get(old, [])
+
+    def is_in_turn(self) -> bool:
+        """Check if currently in an active turn (not IDLE)."""
+        with self._lock:
+            return self._state != TurnState.IDLE
+
+    def force_idle(self, reason: str = "forced reset"):
+        """Force state back to IDLE (for error recovery)."""
+        with self._lock:
+            old_state = self._state
+            if old_state != TurnState.IDLE:
+                print(f"[turn-state] {old_state} -> {TurnState.IDLE} ({reason})")
+                self._state = TurnState.IDLE
+
+
 class WavToPcmStripper:
     """Strips WAV header and forwards only PCM data bytes.
 
@@ -622,7 +709,7 @@ class LocalVoiceEngine:
                     rms = self._rms(audio_data)
                     now = time.time()
                     
-                    # Skip if TTS is playing
+                    # HALF-DUPLEX: Skip if TTS is playing (mic muted during speech)
                     if self.parent.tts_active.is_set():
                         time.sleep(0.01)
                         continue
@@ -647,6 +734,13 @@ class LocalVoiceEngine:
                                     self._store_overheard(transcript, responded=False)
                                     continue  # Skip responding, just listen and learn
 
+                                # TURN STATE: Final transcript from local engine
+                                print(f"[FINAL -> DECIDE] '{transcript[:40]}...'")
+                                if hasattr(self.parent, '_turn_state'):
+                                    self.parent._turn_state.transition(TurnState.LISTEN, "user speaking")
+                                    self.parent._turn_state.transition(TurnState.FINAL, "final transcript")
+                                    self.parent._turn_state.transition(TurnState.DECIDE, "processing")
+
                                 # Get response from server (only if addressed)
                                 loop = asyncio.new_event_loop()
                                 try:
@@ -670,9 +764,15 @@ class LocalVoiceEngine:
                                         )
                                         if reply:
                                             print(f"🤖 AVA: {reply}")
+                                            # TURN STATE: Entering SPEAK phase
+                                            if hasattr(self.parent, '_turn_state'):
+                                                self.parent._turn_state.transition(TurnState.SPEAK, "TTS starting")
                                             loop.run_until_complete(
                                                 self.synthesize_speech(reply)
                                             )
+                                            # TURN STATE: Back to IDLE
+                                            if hasattr(self.parent, '_turn_state'):
+                                                self.parent._turn_state.force_idle("TTS complete")
 
                                             # Track for correction detection
                                             self.parent._last_user_transcript = transcript
@@ -684,6 +784,14 @@ class LocalVoiceEngine:
                                                     record_interaction(transcript, reply, True)
                                                 except:
                                                     pass
+                                        else:
+                                            # No reply - return to IDLE
+                                            if hasattr(self.parent, '_turn_state'):
+                                                self.parent._turn_state.force_idle("no reply")
+                                    else:
+                                        # Local intent handled - return to IDLE
+                                        if hasattr(self.parent, '_turn_state'):
+                                            self.parent._turn_state.force_idle("local intent handled")
                                 finally:
                                     loop.close()
                             # In hybrid path, skip legacy buffer/silence logic
@@ -725,6 +833,13 @@ class LocalVoiceEngine:
                                 self._store_overheard(transcript, responded=False)
                                 continue  # Skip responding, just listen and learn
 
+                            # TURN STATE: Final transcript from local Whisper engine
+                            print(f"[FINAL -> DECIDE] '{transcript[:40]}...'")
+                            if hasattr(self.parent, '_turn_state'):
+                                self.parent._turn_state.transition(TurnState.LISTEN, "user speaking")
+                                self.parent._turn_state.transition(TurnState.FINAL, "final transcript")
+                                self.parent._turn_state.transition(TurnState.DECIDE, "processing")
+
                             # Get response from server (only if addressed)
                             loop = asyncio.new_event_loop()
                             try:
@@ -748,9 +863,15 @@ class LocalVoiceEngine:
                                     )
                                     if reply:
                                         print(f"🤖 AVA: {reply}")
+                                        # TURN STATE: Entering SPEAK phase
+                                        if hasattr(self.parent, '_turn_state'):
+                                            self.parent._turn_state.transition(TurnState.SPEAK, "TTS starting")
                                         loop.run_until_complete(
                                             self.synthesize_speech(reply)
                                         )
+                                        # TURN STATE: Back to IDLE
+                                        if hasattr(self.parent, '_turn_state'):
+                                            self.parent._turn_state.force_idle("TTS complete")
 
                                         # Track for correction detection
                                         self.parent._last_user_transcript = transcript
@@ -762,9 +883,17 @@ class LocalVoiceEngine:
                                                 record_interaction(transcript, reply, True)
                                             except:
                                                 pass
+                                    else:
+                                        # No reply - return to IDLE
+                                        if hasattr(self.parent, '_turn_state'):
+                                            self.parent._turn_state.force_idle("no reply")
+                                else:
+                                    # Local intent handled - return to IDLE
+                                    if hasattr(self.parent, '_turn_state'):
+                                        self.parent._turn_state.force_idle("local intent handled")
                             finally:
                                 loop.close()
-                    
+
                     # Limit buffer size (max 30 seconds)
                     max_buffer = 16000 * 2 * 30
                     with self._buffer_lock:
@@ -874,7 +1003,10 @@ class StandaloneRealtimeAVA:
         self._echo_suppression_enabled = True
         self._tts_active_recently = threading.Event()
         self._tts_cooldown_sec = 2.5  # Seconds to suppress mic after TTS (longer to prevent feedback loops)
-        
+
+        # Turn state machine for voice stabilization
+        self._turn_state = TurnStateMachine()
+
         # Debug flags (hot‑reloadable via config)
         self.debug_agent = False
         self.debug_tools = False
@@ -1223,6 +1355,13 @@ class StandaloneRealtimeAVA:
             if self._tts_ended_at and (time.time() - self._tts_ended_at) < grace_period:
                 print(f"[echo-gate] Ignoring ASR final in grace period: {txt[:30]}...")
                 return
+
+            # TURN STATE: Final transcript from unified voice session
+            print(f"[FINAL -> DECIDE] '{txt[:40]}...'")
+            self._turn_state.transition(TurnState.LISTEN, "user speaking")
+            self._turn_state.transition(TurnState.FINAL, "final transcript")
+            self._turn_state.transition(TurnState.DECIDE, "processing")
+
             # Mirror correction/local-intent/enhancement + respond flow
             try:
                 loop = asyncio.new_event_loop()
@@ -1243,12 +1382,15 @@ class StandaloneRealtimeAVA:
                     meta = self._last_asr_final_meta or {}
                     utt_id = meta.get('utterance_id')
                     if utt_id and utt_id in getattr(self, '_utt_committed', set()):
+                        self._turn_state.force_idle("duplicate utterance")
                         return
                     # Mark ASR final timestamp for metrics
                     asr_final_ts = time.time()
                     self._asr_final_ts = asr_final_ts
                     reply = loop.run_until_complete(self._ask_server_respond(enhanced))
                     if reply:
+                        # TURN STATE: Entering SPEAK phase
+                        self._turn_state.transition(TurnState.SPEAK, "TTS starting")
                         # Speak via unified TTS (Edge TTS streaming)
                         try:
                             self._awaiting_tts_since = time.time()
@@ -1264,6 +1406,7 @@ class StandaloneRealtimeAVA:
                                 self._utt_committed.add(utt_id)
                         except Exception:
                             pass
+                        # Note: TURN STATE -> IDLE handled by voice session's tts.end event
                         # Record interaction for passive learning
                         try:
                             self._last_user_transcript = txt
@@ -1272,8 +1415,14 @@ class StandaloneRealtimeAVA:
                                 record_interaction(txt, reply, True)
                         except Exception:
                             pass
+                    else:
+                        # No reply - return to IDLE
+                        self._turn_state.force_idle("no reply")
+                else:
+                    # Local intent handled - return to IDLE
+                    self._turn_state.force_idle("local intent handled")
             except Exception:
-                pass
+                self._turn_state.force_idle("error")
             finally:
                 try:
                     loop.close()
@@ -1364,6 +1513,8 @@ class StandaloneRealtimeAVA:
                     # Record when TTS ended for echo grace period
                     self._tts_ended_at = time.time()
                     print(f"[echo-gate] TTS ended, grace period started")
+                    # TURN STATE: Back to IDLE after TTS completes
+                    self._turn_state.force_idle("TTS complete (tts.end event)")
                     # Clear ASR buffer to prevent accumulated TTS audio from being transcribed
                     try:
                         if hasattr(self, '_voice_provider') and self._voice_provider:
@@ -2896,8 +3047,11 @@ class StandaloneRealtimeAVA:
         speak_text = self._prepare_tts_text(text)
         if not speak_text:
             return
+        # HALF-DUPLEX: Mute mic while speaking (set tts_active flag)
+        # Mic loop checks this flag and suppresses audio input during TTS
         self.tts_active.set()
         self._tts_last_active = time.time()
+        print("[half-duplex] MIC MUTED - TTS starting")
         speak_url = f"{DG_SPEAK_BASE}&encoding=linear16&sample_rate={self.playback_rate}"
         req = urllib.request.Request(
             url=speak_url,
@@ -2926,7 +3080,10 @@ class StandaloneRealtimeAVA:
         except Exception as e:
             print(f"TTS error: {e}")
         finally:
+            # HALF-DUPLEX: Unmute mic after TTS completes
             self.tts_active.clear()
+            self._tts_ended_at = time.time()
+            print("[half-duplex] MIC UNMUTED - TTS complete (grace period active)")
             try:
                 self.metrics['tts_utterances'] += 1
             except Exception:
@@ -3056,19 +3213,26 @@ class StandaloneRealtimeAVA:
                             self.metrics['asr_finals'] += 1
                         except Exception:
                             pass
-                        
+
+                        # TURN STATE: FINAL transcript received
+                        print(f"[FINAL -> DECIDE] '{transcript[:40]}...'")
+                        self._turn_state.transition(TurnState.LISTEN, "user speaking")
+                        self._turn_state.transition(TurnState.FINAL, "final transcript")
+                        self._turn_state.transition(TurnState.DECIDE, "processing")
+
                         # Check if this is a correction of AVA's last response
                         if self._detect_correction(transcript):
                             self._handle_correction(transcript)
-                        
+
                         # Intercept local intents (doctor/capabilities/approval)
                         handled = await self._maybe_handle_local_intent(transcript)
                         if handled:
+                            self._turn_state.force_idle("local intent handled")
                             continue
-                        
+
                         # Check for past mistakes and enhance transcript if needed
                         enhanced_transcript = self._get_enhanced_transcript(transcript)
-                        
+
                         reply = await self._ask_server_respond(enhanced_transcript)
                         if reply:
                             # Final safety filter - never speak step status messages
@@ -3076,21 +3240,31 @@ class StandaloneRealtimeAVA:
                                 print(f"[filter] Suppressing step status: {reply[:50]}...")
                                 reply = self._get_natural_response(enhanced_transcript, reply)
                             print(f"🤖 AVA: {reply}")
+
+                            # TURN STATE: Entering SPEAK phase
+                            self._turn_state.transition(TurnState.SPEAK, "TTS starting")
                             await self._speak_text(reply)
-                            
+                            # TURN STATE: Back to IDLE after speaking
+                            self._turn_state.force_idle("TTS complete")
+
                             # Track for correction detection
                             self._last_user_transcript = transcript
                             self._last_ava_response = reply
-                            
+
                             # Record interaction for passive learning
                             if self.passive_learning_enabled and PASSIVE_LEARNING_AVAILABLE:
                                 try:
                                     record_interaction(transcript, reply, True)
                                 except:
                                     pass
+                        else:
+                            # No reply - return to IDLE
+                            self._turn_state.force_idle("no reply")
                     else:
-                        # interim ignored
-                        pass
+                        # PARTIAL TRANSCRIPT: Display only, NEVER trigger tools
+                        # This is a critical safety gate - partials are unreliable
+                        if transcript.strip():
+                            print(f"[PARTIAL -> NO_TOOL] '{transcript[:50]}...' (interim, display only)")
         except WS_ClosedGeneral as e:
             print(f"\n🔌 ASR connection closed: {e}")
             try:
@@ -3133,6 +3307,7 @@ class StandaloneRealtimeAVA:
                     if int(time.time()*2) % 10 == 0:
                         print(f"[mic] rms={int(rms)}")
                 now = time.time()
+                # HALF-DUPLEX ENFORCEMENT: Skip mic frames when TTS is active
                 if self.tts_active.is_set():
                     if not self.user_speaking.is_set():
                         if rms >= self.START_THRESH:
@@ -3148,6 +3323,7 @@ class StandaloneRealtimeAVA:
                             self._last_user_voice_t = now
                         elif (now - self._last_user_voice_t) > self.SPEECH_HOLD_SEC:
                             self.user_speaking.clear()
+                    # HALF-DUPLEX: Don't send mic audio to ASR while TTS is playing
                     if not self.user_speaking.is_set():
                         await asyncio.sleep(CHUNK_SAMPLES / MIC_RATE)
                         continue
