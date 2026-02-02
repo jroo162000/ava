@@ -64,7 +64,7 @@
     "comment": "Partials display only, finals trigger DECIDE. Mic muted during SPEAK state."
   },
   "barge_in": {
-    "enabled": false,
+    "enabled": true,
     "min_speech_ms": 500,
     "require_final_to_interrupt": true,
     "cancel_tts_on_interrupt": true,

@@ -10,6 +10,26 @@ RULES FOR CLAUDE:
 -->
 
 ================================================================================
+2026-02-02 - D005 Barge-in COMPLETE (Feature Flag ON)
+================================================================================
+
+WHAT CHANGED:
+- Enabled barge-in in ava_voice_config.json (enabled: true)
+- Ran full verification with barge-in ENABLED
+- Flipped barge_in to passes: true in ava_feature_list.json
+
+D005 VERIFICATION RESULTS:
+- Smoke test: 11/11 PASS (with barge-in enabled)
+- Regression tests: 29/29 PASS (with barge-in enabled)
+- All D005 prerequisites satisfied:
+  ✓ Turn-state machine is authoritative
+  ✓ Tool safety under interruption (final-only gating preserved)
+  ✓ Echo/feedback containment (TTS cancelled, cooldown enforced)
+  ✓ No concurrent turns (single state machine)
+
+STATUS: D005 UNBLOCKED - barge_in feature complete and enabled
+
+================================================================================
 2026-02-02 - D005 Barge-in Implementation (Feature Flag OFF)
 ================================================================================
 
