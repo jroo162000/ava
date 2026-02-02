@@ -71,10 +71,65 @@ This prevents "context amnesia" — the exact failure mode Anthropic warns about
 
 ---
 
-## D005: No Barge-In Until Phase 3
+## D005: Barge-in Safety Gate
 **Date:** 2026-02-02
-**Decision:** Barge-in (interrupt TTS with speech) disabled until stability phase complete.
-**Rationale:** Barge-in caused self-triggering loops and audio corruption.
+**Status:** ACTIVE (blocks `barge_in` feature)
+
+### Problem
+Barge-in (allowing the mic to interrupt TTS) is a high-risk feature that can reintroduce:
+- Self-echo loops (AVA responds to herself)
+- Duplicate tool execution (partial/final churn under interruption)
+- Turn-state corruption (two "turns" at once)
+- Runaway repeats during reconnect/latency spikes
+
+### Decision
+Barge-in is disabled by default and stays disabled until all prerequisites below are satisfied and validated by automated tests and smoke checks.
+
+### Prerequisites to Unblock D005
+**All must be true:**
+
+1. **Turn-state machine is authoritative**
+   - State transitions are explicit and logged: `LISTEN → FINAL → DECIDE → SPEAK → IDLE`
+   - No concurrent turns (one active turn max)
+
+2. **Tool safety under interruption**
+   - Tools execute only at the single boundary (Node)
+   - Final-only gating remains enforced under barge-in conditions
+   - Idempotency TTL blocks repeated tool calls under transcript churn
+
+3. **Echo/feedback containment**
+   At least one of the following is enforced during SPEAKING:
+   - Mic muted (half-duplex), OR
+   - Echo suppression/ducking proven reliable enough that AVA does not self-trigger
+
+   (If barge-in is enabled, half-duplex is partially relaxed, so the alternative containment method must be validated.)
+
+4. **Regression coverage**
+   Add regression tests that prove:
+   - PARTIAL never triggers tools (even when barge-in interrupts)
+   - Duplicate finals within TTL do not execute tools twice
+   - Interruption does not cause SPEAKING and LISTENING to overlap without a state transition
+   - No-loop indicators remain clean after simulated interruption sequences
+
+5. **Smoke test extension**
+   The smoke test must include a "barge-in simulation" scenario that:
+   - Starts TTS
+   - Injects an interrupting transcript event
+   - Verifies: correct state transition, no self-echo loop, tool gate remains stable
+
+### Unblock Procedure
+D005 is considered satisfied only when:
+1. All prerequisite tests pass in CI/local
+2. Smoke test passes
+3. A PR explicitly flips `barge_in` from `passes:false` to `passes:true`
+4. Integration Lead updates `ava_progress.txt` with what changed and what tests prove safety
+
+### Rollback Rule
+If enabling barge-in causes any regression (tests or smoke), immediately:
+1. Disable barge-in
+2. Restore the previous gating behavior
+3. Record the failure mode in `ava_progress.txt`
+
 **Config:** `allow_barge: false`
 
 ---

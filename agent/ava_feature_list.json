@@ -92,7 +92,7 @@
     "barge_in": {
       "passes": false,
       "test_proof": null,
-      "blocked_by": "D005 - disabled until phase 3 complete"
+      "blocked_by": "D005: Barge-in Safety Gate - requires turn-state authority, tool safety under interruption, echo containment, regression coverage, and smoke test barge-in simulation"
     },
     "native_segfault_prevention": {
       "passes": false,
