@@ -11,6 +11,35 @@ RULES FOR CLAUDE:
 
 ---
 
+# SESSION RESTART PROTOCOL
+
+**MANDATORY: Every new Integration Lead session must start with these steps.**
+
+## Step 1: Read State Files
+```
+agent/ava_state.json
+agent/ava_feature_list.json
+agent/ava_progress.txt
+agent/DECISIONS.md
+```
+
+## Step 2: Run Smoke Test
+```bash
+cd "C:/Users/USER 1/ava-integration"
+python scripts/smoke_test.py
+```
+If smoke test fails → STOP. Fix the failure before any other work.
+
+## Step 3: Verbally Restate
+Before any work, confirm:
+- **Canonical runner:** `ava_standalone_realtime.py`
+- **Tool boundary:** Node `/tools/:name/execute` (Python never executes directly)
+- **Current phase:** Check `ava_feature_list.json` for `passes: false` items
+
+This prevents "context amnesia" — the exact failure mode Anthropic warns about.
+
+---
+
 ## D001: Canonical Voice Runner
 **Date:** 2026-02-02
 **Decision:** `ava_standalone_realtime.py` is the only voice runner.
