@@ -10,6 +10,41 @@ RULES FOR CLAUDE:
 -->
 
 ================================================================================
+2026-02-02 - QA/Regression: Voice Invariant Tests Added
+================================================================================
+
+WHAT CHANGED:
+- Created tests/test_voice_invariants.py (20 regression tests, 770 lines)
+- Extended scripts/smoke_test.py with voice invariant preflight checks
+- Created tests/README_VOICE_TESTS.md quick reference
+
+REGRESSION TESTS (20 total):
+- TestPartialTranscriptSafety (4 tests): Tools never execute on partials
+- TestNodeBoundaryEnforcement (2 tests): All tools via Node gateway
+- TestIdempotencyGuarantee (3 tests): Duplicates blocked within TTL
+- TestHalfDuplexDiscipline (3 tests): Mic muted during SPEAKING
+- TestTurnStateTransitions (4 tests): Valid state flow enforced
+- TestRegressionScenarios (3 tests): Complex bug scenarios
+- Integration check (1 test): Smoke test verification
+
+SMOKE TEST EXTENSIONS:
+- Partial→final sequence handling
+- Duplicate final protection
+- Half-duplex enforcement check
+- Turn state transitions check
+- Repeated command blocking check
+
+WHAT TEST PROVED IT:
+- pytest: 20/20 tests pass in 4.99s
+- smoke_test.py: All checks pass
+- Tests FAIL when invariants intentionally violated
+
+WHAT'S NEXT:
+- All invariants locked in with regression tests
+- Phase 1-3 complete
+- Phase 4 advanced features remain (barge_in blocked by D005)
+
+================================================================================
 2026-02-02 - Voice Stabilization: Half-Duplex + Final-Only Gating
 ================================================================================
 

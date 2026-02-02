@@ -62,6 +62,10 @@
     "final_only_transcript_gating": {
       "passes": true,
       "test_proof": "TurnStateMachine enforces LISTEN→FINAL→DECIDE; [PARTIAL→NO_TOOL] logged; [FINAL→DECIDE] logged; smoke_test.py PASS"
+    },
+    "regression_test_suite": {
+      "passes": true,
+      "test_proof": "20/20 pytest tests pass; tests fail when invariants violated; all voice invariants locked in"
     }
   },
 
