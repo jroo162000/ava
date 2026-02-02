@@ -10,6 +10,35 @@ RULES FOR CLAUDE:
 -->
 
 ================================================================================
+2026-02-02 - Repo Curation: Archive Duplicate Runners
+================================================================================
+
+WHAT CHANGED:
+- Created ava-integration/archive/ folder
+- Archived non-canonical runners:
+  - ava_standalone.py
+  - ava_hybrid_asr.py
+  - avas_voice.py
+  - avas_voice_websockets.py
+  - voice_legacy/ backups
+- Updated start_ava.ps1 to start only:
+  - Node server (port 5051)
+  - Canonical runner (ava_standalone_realtime.py)
+- Added archive/README.md documenting why files were archived
+- Created ARCHIVAL_REPORT_2026-02-02.md
+
+WHAT TEST PROVED IT:
+- Smoke test: 4/4 PASS (unchanged)
+- Verified no startup script references archived runners
+- Single banner prints on startup identifying canonical runner
+
+WHAT'S NEXT:
+- Smoke test green - steady progress mode
+- Continue with remaining features:
+  - final_only_transcript_gating (phase_2_stability)
+  - node_gateway_boundary (phase_3_tool_execution)
+
+================================================================================
 2026-02-02 - Idempotency Cache Implemented
 ================================================================================
 

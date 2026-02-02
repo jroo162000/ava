@@ -1,0 +1,1775 @@
+"""
+AVA Standalone (Server-Assisted) with Deepgram ASR+TTS
+
+This version removes OpenAI Realtime usage. It:
+- Streams microphone PCM16 to Deepgram Live (ASR)
+- Sends final transcripts to the local AVA server (/respond) for the brain/tools
+- Synthesizes TTS via Deepgram Speak and plays audio locally
+- Adds simple barge-in and echo gating
+"""
+
+import asyncio
+import base64
+import json
+import os
+import sys
+import wave
+import threading
+import queue
+from datetime import datetime
+from pathlib import Path
+import time
+import urllib.request
+import urllib.error
+import ssl
+import re
+import platform
+import subprocess
+
+# Set UTF-8 encoding for Windows console
+if sys.platform == 'win32':
+    try:
+        sys.stdout.reconfigure(encoding='utf-8')
+        sys.stderr.reconfigure(encoding='utf-8')
+    except:
+        os.environ['PYTHONIOENCODING'] = 'utf-8'
+
+import websockets
+import pyaudio
+from deepgram import DeepgramClient
+from deepgram.core.events import EventType
+from deepgram.extensions.types.sockets import (
+    AgentV1Agent,
+    AgentV1AudioConfig,
+    AgentV1AudioInput,
+    AgentV1AudioOutput,
+    AgentV1DeepgramSpeakProvider,
+    AgentV1Endpoint,
+    AgentV1GoogleThinkProvider,
+    AgentV1Listen,
+    AgentV1ListenProvider,
+    AgentV1SettingsMessage,
+    AgentV1SocketClientResponse,
+    AgentV1SpeakProviderConfig,
+    AgentV1Think,
+)
+from corrected_tool_definitions import CORRECTED_TOOLS
+
+# Add cmp-use to path
+sys.path.insert(0, r"C:\Users\USER 1\cmp-use")
+
+from cmpuse.secrets import load_into_env
+from cmpuse.agent_core import Agent, Plan, Step
+from cmpuse.config import Config
+import cmpuse.tools
+
+# Load secrets and configuration
+load_into_env()
+
+# Enable full access
+os.environ['CMPUSE_ALLOW_SHELL'] = '1'
+os.environ['CMPUSE_FORCE'] = '1'
+os.environ['CMPUSE_CONFIRM'] = '0'
+os.environ['CMPUSE_DRY_RUN'] = '0'
+os.environ['CMPUSE_ALLOW_NETWORK'] = '1'
+os.environ['CMPUSE_PATH_WHITELIST'] = "C:\\"
+
+# Audio configuration
+MIC_RATE = 44100           # Mic capture for ASR (iTalk-02 native rate)
+PLAYBACK_RATE = 24000      # TTS playback target
+CHANNELS = 1
+CHUNK_SIZE = 1024  # kept for compatibility in code below; mic loop uses ~30ms chunks
+CHUNK_SAMPLES = 1323       # ~30ms @44.1kHz for low-latency streaming
+FORMAT = pyaudio.paInt16
+
+# Deepgram endpoints
+DG_LISTEN_URL = (
+    "wss://api.deepgram.com/v1/listen?encoding=linear16&sample_rate="
+    f"{MIC_RATE}&channels=1&model=nova-2&smart_format=true"
+)
+DG_SPEAK_BASE = "https://api.deepgram.com/v1/speak?model=aura-2-andromeda-en"
+
+class StandaloneRealtimeAVA:
+    def __init__(self):
+        load_into_env()
+        self.deepgram_key = os.getenv("DEEPGRAM_API_KEY") or self._read_key_file("deepgram key.txt")
+        if not self.deepgram_key:
+            raise ValueError("DEEPGRAM_API_KEY not found (set env or provide 'deepgram key.txt')")
+
+        # Validate Gemini API key (required for agent voice "think" provider)
+        self.gemini_key = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY") or self._read_key_file("gemini api key.txt")
+        if not self.gemini_key:
+            raise ValueError("GEMINI_API_KEY not found (set GOOGLE_API_KEY/GEMINI_API_KEY env or provide 'gemini api key.txt')")
+        # Ensure the key is available in environment for Deepgram Agent
+        os.environ['GOOGLE_API_KEY'] = self.gemini_key
+
+        self.config = Config.from_env()
+        self.agent = Agent(self.config)
+
+        # Audio setup
+        self.audio = pyaudio.PyAudio()
+        self.websocket = None  # unused now; kept for cleanup compatibility
+        self.asr_ws = None
+        self.running = False
+
+        # Session state
+        self.session_id = None
+
+        # Audio playback queue and thread
+        self.audio_queue = queue.Queue()
+        self.playback_thread = None
+        self.playback_stream = None
+        # Barge-in / echo gating
+        self.tts_active = threading.Event()
+        self.user_speaking = threading.Event()
+        # Per-turn suppression of Agent TTS when executing tools to avoid the agent speaking tool names/JSON
+        self._drop_agent_tts = threading.Event()
+        self._drop_until_ts = 0.0
+        self.playback_busy = threading.Event()
+        self._last_user_voice_t = 0.0
+        self._loud_frames = 0
+        self.START_THRESH = 1200  # ~ -28 dBFS (int16 RMS)
+        self.STOP_THRESH = 800    # ~ -31 dBFS
+        self.SPEECH_HOLD_SEC = 0.6
+        self.playback_rate = PLAYBACK_RATE
+        self.output_device_index = None
+        self.input_device_index = None
+        # EMA of playback RMS to help echo gating across threads
+        self._playback_rms_ema = 0.0
+        # Debug flags (hot‑reloadable via config)
+        self.debug_agent = False
+        self.debug_tools = False
+        self._debug_log_path = str((Path(__file__).with_name('ava_debug.log')).resolve())
+
+        # Hot-reloadable runtime config
+        self.config_path = Path(__file__).with_name('ava_voice_config.json')
+        self.cfg = {
+            "speak_symbols": False,                 # if False: strip symbols/punctuation from TTS
+            "server_url": "http://127.0.0.1:5051/respond",
+            "server_route": "respond",  # 'chat' or 'respond'
+            "vad": {"start_rms": self.START_THRESH, "stop_rms": self.STOP_THRESH, "hold_sec": self.SPEECH_HOLD_SEC},
+            "audio": {"playback_rate": self.playback_rate, "output_device": None, "input_device": None},
+            "asr_model": "nova-2",
+            "tts_model": "aura-2-andromeda-en",
+            "deepgram_api_key": None,
+            "debug_asr": False,
+            "debug_rms": False,
+            "debug_text": False,
+            "allow_barge": True,
+            "voice_mode": "agent",
+            "auto_start_server": True,
+            "barge": {"min_tts_ms": 900, "debounce_frames": 6, "dyn_thresh_scale": 0.9}
+        }
+        self._cfg_mtime = 0.0
+        self._identity_mtime = 0.0
+        self._load_config(silent=True)
+        try:
+            if self.identity_path.exists():
+                self._identity_mtime = self.identity_path.stat().st_mtime
+        except Exception:
+            self._identity_mtime = 0.0
+
+        # Identity profile
+        self.identity_path = Path(__file__).with_name('ava_identity.json')
+        self.identity = self._load_identity()
+        self.started_at = time.time()
+        self.metrics = {
+            'asr_messages': 0,
+            'asr_finals': 0,
+            'tts_utterances': 0,
+            'reconnects': 0,
+            'last_error': '',
+        }
+
+        print("=" * 80)
+        print("AVA STANDALONE - DEEPGRAM VOICE (Server-Assisted)")
+        print("=" * 80)
+        print(f"Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"ASR: Deepgram nova-2 @ {MIC_RATE} Hz | TTS: aura-2-andromeda-en @ {PLAYBACK_RATE} Hz")
+        print(f"Intelligence: AVA Server / Agent (no OpenAI Realtime)")
+        print(f"Mode: ALWAYS-ON with Deepgram ASR+TTS")
+        print(f"Tools Available: 20 JARVIS-level capabilities")
+        print("=" * 80)
+        print("Features:")
+        print("  - Always listening (no wake word needed)")
+        print("  - Bidirectional realtime voice conversation")
+        print("  - Sub-second response latency")
+        print("  - Can interrupt AVA mid-sentence")
+        print("  - Full access to all 20 AVA tools")
+        print("  - Smart Voice Activity Detection")
+        print("=" * 80)
+
+    def _dbg(self, tag: str, msg: str, data: dict | None = None):
+        try:
+            if not (self.debug_agent or self.debug_tools):
+                return
+            ts = time.strftime('%H:%M:%S')
+            s = f"[DBG {tag} {ts}] {msg}"
+            if data:
+                try:
+                    import json as _json
+                    snippet = _json.dumps(data, ensure_ascii=False)
+                    if len(snippet) > 300:
+                        snippet = snippet[:300] + '…'
+                    s += f" | {snippet}"
+                except Exception:
+                    pass
+            print(s)
+            try:
+                with open(self._debug_log_path, 'a', encoding='utf-8') as lf:
+                    lf.write(s + "\n")
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    def get_tool_definitions(self):
+        """Get tool definitions for function calling during voice chat - CORRECTED ACTIONS"""
+        # TEMPORARY: Test with NO tools
+        # return []
+        from corrected_tool_definitions import CORRECTED_TOOLS
+        return CORRECTED_TOOLS
+
+    def _desktop_path(self) -> str:
+        try:
+            return str((Path.home() / 'Desktop').resolve())
+        except Exception:
+            return str(Path.home())
+
+    def _try_tool_dispatch(self, text: str) -> str | None:
+        """Lightweight intent → tool router using corrected tools via cmpuse Agent.
+        Returns a user-facing reply if a tool was executed, else None.
+        """
+        t = (text or '').strip()
+        low = t.lower()
+        try:
+            # Create/make a file intent
+            if ('create' in low or 'make' in low) and 'file' in low:
+                name = None
+                content = None
+                m_name = re.search(r"named\s+([\w\-. ]+?)(?:\s+(?:that|with|containing)|$)", t, re.IGNORECASE)
+                if m_name:
+                    name = m_name.group(1).strip()
+                m_content = re.search(r"(?:that|with|containing)\s+(?:says|say|text(?:\s+of)?|content)\s+(.+)$", t, re.IGNORECASE)
+                if m_content:
+                    content = m_content.group(1).strip()
+                if not content:
+                    # Fallback: use the whole request as content
+                    content = t
+                if not name:
+                    name = f"ava_note_{int(time.time())}.txt"
+                # Default to Desktop
+                full_path = str(Path(self._desktop_path()) / name)
+                res = asyncio.run(self.handle_tool_call('fs_ops', {
+                    'operation': 'write',
+                    'path': full_path,
+                    'content': content
+                }))
+                if isinstance(res, dict) and res.get('status') == 'ok':
+                    return f"I created the file {full_path}."
+                return f"I tried to create {full_path} but something went wrong."
+
+            # Remember that ... → memory store
+            if low.startswith('remember that '):
+                value = t[len('remember that '):].strip()
+                if value:
+                    res = asyncio.run(self.handle_tool_call('memory_system', {
+                        'action': 'store',
+                        'key': f'note_{int(time.time())}',
+                        'value': value
+                    }))
+                    return "Got it. I stored that in memory." if isinstance(res, dict) else "Stored."
+
+            # Send email to ... subject ... body ... (very basic)
+            if ('email' in low or 'send an email' in low) and ' to ' in low:
+                to = None; subject = None; body = None
+                m_to = re.search(r"to\s+([\w\-.+@]+)", t, re.IGNORECASE)
+                if m_to: to = m_to.group(1)
+                m_sub = re.search(r"subject\s*[:\-]\s*(.+?)(?:\s+body\s*[:\-]|$)", t, re.IGNORECASE)
+                if m_sub: subject = m_sub.group(1).strip()
+                m_body = re.search(r"body\s*[:\-]\s*(.+)$", t, re.IGNORECASE)
+                if m_body: body = m_body.group(1).strip()
+                if to and (subject or body):
+                    res = asyncio.run(self.handle_tool_call('comm_ops', {
+                        'action': 'send_email', 'to': to, 'subject': subject or '', 'body': body or ''
+                    }))
+                    return "Email sent." if isinstance(res, dict) else "Sent."
+
+            # Open/navigate browser
+            if ('open' in low or 'navigate' in low or 'go to' in low) and ('http://' in low or 'https://' in low or ' www.' in low or 'browser' in low):
+                m_url = re.search(r"(https?://\S+|www\.[^\s]+)", t, re.IGNORECASE)
+                url = m_url.group(1) if m_url else None
+                if url and url.startswith('www.'): url = 'https://' + url
+                res = asyncio.run(self.handle_tool_call('browser_automation', {
+                    'action': 'launch'
+                }))
+                if url:
+                    _ = asyncio.run(self.handle_tool_call('browser_automation', {
+                        'action': 'navigate', 'url': url
+                    }))
+                return f"Opening the browser{(' to ' + url) if url else ''}."
+
+            # Turn on/off lights/devices
+            if ('turn on' in low or 'turn off' in low) and ('light' in low or 'lights' in low or 'device' in low):
+                action = 'turn_on' if 'turn on' in low else 'turn_off'
+                # crude room extraction
+                m_room = re.search(r"in the ([a-zA-Z0-9 _-]+)", t, re.IGNORECASE)
+                room = m_room.group(1).strip() if m_room else None
+                res = asyncio.run(self.handle_tool_call('iot_ops', {
+                    'action': action,
+                    'room': room or ''
+                }))
+                return f"Okay, {action.replace('_',' ')} the lights{(' in ' + room) if room else ''}."
+
+            # System info
+            if 'system info' in low or 'computer info' in low or 'device info' in low:
+                res = asyncio.run(self.handle_tool_call('sys_ops', { 'action': 'get_info' }))
+                return "Here is the system information." if isinstance(res, dict) else "Done."
+
+            # HTTP get
+            if low.startswith('fetch ') or low.startswith('get ') or 'http' in low:
+                m = re.search(r"(https?://\S+)", t)
+                if m:
+                    url = m.group(1)
+                    res = asyncio.run(self.handle_tool_call('net_ops', { 'url': url }))
+                    return f"Fetched {url}." if isinstance(res, dict) else "Fetched."
+
+            # Calendar create event (very basic)
+            if ('calendar' in low or 'event' in low) and ('create' in low or 'add' in low):
+                m_sum = re.search(r"(?:event|calendar)\s*(?:called|named|for)?\s*([\w \-]{3,100})", t, re.IGNORECASE)
+                summary = m_sum.group(1).strip() if m_sum else 'New Event'
+                res = asyncio.run(self.handle_tool_call('calendar_ops', { 'action': 'create_event', 'summary': summary }))
+                return "Event created." if isinstance(res, dict) else "Done."
+
+            # Window list/focus
+            if 'list windows' in low or 'what windows' in low:
+                res = asyncio.run(self.handle_tool_call('window_ops', { 'action': 'list' }))
+                return "Listing windows." if isinstance(res, dict) else "Done."
+            if 'focus' in low and ('window' in low or 'app' in low):
+                m_app = re.search(r"focus\s+(.*)$", t, re.IGNORECASE)
+                app = (m_app.group(1).strip() if m_app else '')
+                res = asyncio.run(self.handle_tool_call('window_ops', { 'action': 'focus', 'app': app }))
+                return f"Focusing {app}." if app else "Focusing the window."
+
+            # Camera capture
+            if 'camera' in low and ('capture' in low or 'take a picture' in low):
+                save_path = str(Path(self._desktop_path()) / f"ava_capture_{int(time.time())}.png")
+                res = asyncio.run(self.handle_tool_call('camera_ops', { 'action': 'capture', 'save_path': save_path }))
+                return f"Captured an image to {save_path}." if isinstance(res, dict) else "Captured."
+
+            # Generic fallback: detect tool names and actions from corrected tools
+            try:
+                tools = self.get_tool_definitions()
+                for td in tools:
+                    name = str(td.get('name','')).strip()
+                    if not name:
+                        continue
+                    # If the user explicitly mentions the tool name or a dotted alias, try it
+                    if name in low or low.replace(' ', '_').find(name) >= 0:
+                        params = td.get('parameters') or {}
+                        props = (params.get('properties') or {})
+                        args = {}
+                        # Try to infer 'action' from enum by substring match
+                        act = None
+                        if isinstance(props.get('action',{}).get('enum',[]), list):
+                            for a in props['action']['enum']:
+                                if isinstance(a, str) and a in low:
+                                    act = a; break
+                        if act:
+                            args['action'] = act
+                        # Common parameter heuristics
+                        # path/url/text/query/room/entity_id/brightness/temperature
+                        m = re.search(r"(https?://\S+)", t)
+                        if m and 'url' in props:
+                            args['url'] = m.group(1)
+                        m = re.search(r"(?:file|path)\s*[:\-]?\s*(\S+)", t, re.IGNORECASE)
+                        if m and 'path' in props:
+                            args['path'] = m.group(1)
+                        m = re.search(r"(?:text|content)\s*[:\-]?\s*(.+)$", t, re.IGNORECASE)
+                        if m and 'content' in props:
+                            args['content'] = m.group(1)
+                        m = re.search(r"room\s*[:\-]?\s*([\w\s-]+)", t, re.IGNORECASE)
+                        if m and 'room' in props:
+                            args['room'] = m.group(1).strip()
+                        m = re.search(r"brightness\s*[:\-]?\s*(\d+)", t, re.IGNORECASE)
+                        if m and 'brightness' in props:
+                            args['brightness'] = int(m.group(1))
+                        m = re.search(r"temperature\s*[:\-]?\s*(\d+(?:\.\d+)?)", t, re.IGNORECASE)
+                        if m and 'temperature' in props:
+                            args['temperature'] = float(m.group(1))
+                        # Run tool if we have at least an action or common args
+                        if args or 'action' in props:
+                            res = asyncio.run(self.handle_tool_call(name, args))
+                            if isinstance(res, dict):
+                                msg = res.get('message') or res.get('status') or 'Done.'
+                                return msg
+            except Exception:
+                pass
+        except Exception:
+            pass
+        return None
+
+    def _extract_tool_call(self, content: str):
+        """Try to extract a tool call JSON from assistant text. Returns (name, args) or (None,None)."""
+        try:
+            if not content:
+                return (None, None)
+            s = content.strip()
+            # Try fenced JSON
+            m = re.search(r"```json\s*(\{[\s\S]*?\})\s*```", s, re.IGNORECASE)
+            if m:
+                s = m.group(1)
+            # If still not a pure JSON object, try to locate a {"tool":{...}} object substring
+            if not (s.startswith('{') and s.endswith('}')):
+                m2 = re.search(r"(\{\s*\"tool\"\s*:\s*\{[\s\S]*?\}\s*\})", s)
+                if m2:
+                    s = m2.group(1)
+            # Parse JSON object (best effort)
+            j = json.loads(s)
+            if isinstance(j, dict):
+                if 'tool' in j and isinstance(j['tool'], dict):
+                    name = j['tool'].get('name')
+                    args = j['tool'].get('arguments') or {}
+                    if isinstance(name, str):
+                        # Normalize tool name via synonyms
+                        name = self._normalize_tool_name(name)
+                        return (name, args if isinstance(args, dict) else {})
+                # Alternate keys
+                name = j.get('tool_name') or j.get('name')
+                args = j.get('tool_args') or j.get('arguments') or {}
+                if isinstance(name, str):
+                    name = self._normalize_tool_name(name)
+                    return (name, args if isinstance(args, dict) else {})
+        except Exception:
+            pass
+        return (None, None)
+
+    def _normalize_tool_name(self, name: str) -> str:
+        n = (name or '').strip().lower()
+        synonyms = {
+            'file_write':'fs_ops','file_ops':'fs_ops','filegen':'fs_ops','file_gen':'fs_ops','filesystem':'fs_ops',
+            'email':'comm_ops','gmail':'comm_ops','sms':'comm_ops','communications':'comm_ops','comm':'comm_ops',
+            'http':'net_ops','fetch':'net_ops','network':'net_ops','net':'net_ops',
+            'system':'sys_ops','sysinfo':'sys_ops','system_info':'sys_ops',
+            'browser':'browser_automation','web_automation':'browser_automation','web':'browser_automation',
+            'lights':'iot_ops','home':'iot_ops','mqtt':'iot_ops','iot':'iot_ops',
+            'camera':'camera_ops','vision':'vision_ops','ocr':'vision_ops','screen':'screen_ops',
+            'calendar':'calendar_ops','schedule':'calendar_ops',
+            'windows':'window_ops','window':'window_ops',
+            'mouse':'mouse_ops','keyboard':'key_ops','keys':'key_ops',
+            'learning':'learning_db','memory':'memory_system','analysis':'analysis_ops','security':'security_ops',
+            'remote':'remote_ops'
+        }
+        return synonyms.get(n, n)
+
+    async def handle_tool_call(self, function_name, arguments):
+        """Execute AVA tool calls during voice conversation"""
+        print(f"\n🔧 Tool call: {function_name}({arguments})")
+
+        try:
+            # Add default provider for email
+            if function_name == "comm_ops" and arguments.get("action") == "send_email":
+                arguments.setdefault("provider", "gmail")
+
+            # Execute tool through AVA Agent
+            plan = Plan(steps=[Step(tool=function_name, args={
+                **arguments,
+                "confirm": True
+            })])
+
+            results = self.agent.run(plan, force=True)
+
+            # Process results
+            if results and len(results) > 0:
+                result = results[0]
+                status = result.get('status', 'unknown')
+
+                if status == 'ok':
+                    return {
+                        "status": "ok",
+                        "message": result.get('message', 'Operation completed'),
+                        "data": {k: v for k, v in result.items() if k not in ['status', 'message']}
+                    }
+                elif status == 'error':
+                    return {
+                        "status": "error",
+                        "message": result.get('message', 'Operation failed'),
+                        "note": result.get('note', '')
+                    }
+                elif status == 'info':
+                    return {
+                        "status": "info",
+                        "message": result.get('message', ''),
+                        "note": result.get('note', '')
+                    }
+                else:
+                    return result
+            else:
+                return {"error": f"No results returned from {function_name}"}
+
+        except Exception as e:
+            return {
+                "status": "error",
+                "message": f"Tool execution error: {str(e)}",
+                "tool": function_name
+            }
+
+    # ---------------------- Deepgram + Helpers ----------------------
+    def _read_key_file(self, filename: str) -> str:
+        try:
+            with open(filename, 'r', encoding='utf-8') as f:
+                return f.read().strip()
+        except FileNotFoundError:
+            return ''
+
+    def _rms_int16(self, frame: bytes) -> float:
+        if not frame:
+            return 0.0
+        n = len(frame) // 2
+        if n <= 0:
+            return 0.0
+        import struct, math
+        samples = struct.unpack('<' + 'h' * n, frame)
+        acc = 0.0
+        for s in samples:
+            acc += s * s
+        return math.sqrt(acc / n)
+
+    def _cancel_tts(self):
+        try:
+            while not self.audio_queue.empty():
+                _ = self.audio_queue.get_nowait()
+        except Exception:
+            pass
+
+    def _load_config(self, silent: bool = False):
+        try:
+            if self.config_path.exists():
+                st = self.config_path.stat()
+                if st.st_mtime != self._cfg_mtime:
+                    with open(self.config_path, 'r', encoding='utf-8') as f:
+                        data = json.load(f)
+                    if isinstance(data, dict):
+                        self.cfg.update(data)
+                        vad = self.cfg.get('vad') or {}
+                        self.START_THRESH = int(vad.get('start_rms', self.START_THRESH))
+                        self.STOP_THRESH = int(vad.get('stop_rms', self.STOP_THRESH))
+                        self.SPEECH_HOLD_SEC = float(vad.get('hold_sec', self.SPEECH_HOLD_SEC))
+                        # Audio updates
+                        aud = self.cfg.get('audio') or {}
+                        try:
+                            pr = int(aud.get('playback_rate', self.playback_rate) or self.playback_rate)
+                        except Exception:
+                            pr = self.playback_rate
+                        if pr != self.playback_rate:
+                            self.playback_rate = pr
+                            setattr(self, '_reopen_playback', True)
+                        odi = aud.get('output_device')
+                        if odi is not None and odi != self.output_device_index:
+                            try:
+                                self.output_device_index = int(odi)
+                            except Exception:
+                                self.output_device_index = odi
+                            setattr(self, '_reopen_playback', True)
+                        idi = aud.get('input_device')
+                        if idi is not None and idi != self.input_device_index:
+                            try:
+                                self.input_device_index = int(idi)
+                            except Exception:
+                                self.input_device_index = idi
+                            setattr(self, '_reopen_mic', True)
+                        # Deepgram key update
+                        dgk = self.cfg.get('deepgram_api_key')
+                        if dgk and dgk != self.deepgram_key:
+                            self.deepgram_key = dgk
+                            try:
+                                if self.asr_ws:
+                                    self.asr_ws.close()
+                            except Exception:
+                                pass
+                        # Debug flags
+                        self.debug_agent = bool(self.cfg.get('debug_agent', False))
+                        self.debug_tools = bool(self.cfg.get('debug_tools', False))
+                        if self.debug_agent or self.debug_tools:
+                            print(f"[cfg] Debug enabled: agent={self.debug_agent} tools={self.debug_tools}")
+                        if not silent:
+                            print(f"[cfg] Reloaded {self.config_path}")
+                    self._cfg_mtime = st.st_mtime
+        except Exception as e:
+            if not silent:
+                print(f"[cfg] Reload failed: {e}")
+
+    def _ensure_playback_thread(self):
+        try:
+            if not (self.playback_thread and self.playback_thread.is_alive()):
+                self.playback_thread = threading.Thread(target=self._audio_playback_worker, daemon=True)
+                self.playback_thread.start()
+                print("🔊 Audio playback thread started\n")
+        except Exception:
+            pass
+
+    def _deepgram_functions_from_corrected_tools(self):
+        """Convert OpenAI-style CORRECTED_TOOLS into Deepgram function schema.
+        Expected CORRECTED_TOOLS item shape: {"type":"function","function":{name,description,parameters}}
+        """
+        funcs = []
+        try:
+            for t in CORRECTED_TOOLS:
+                if not isinstance(t, dict):
+                    continue
+                fn = t.get("function") if "function" in t else None
+                if not fn:
+                    # fallback if already flat
+                    fn = t
+                name = (fn or {}).get("name")
+                if not name:
+                    continue
+                funcs.append({
+                    "name": name,
+                    "description": fn.get("description", ""),
+                    "parameters": fn.get("parameters", {"type": "object", "properties": {}}),
+                })
+        except Exception:
+            pass
+        return funcs
+
+    def _config_watcher(self):
+        while True:
+            try:
+                self._load_config(silent=True)
+            except Exception:
+                pass
+            # Also hot-reload identity if it changes
+            try:
+                if self.identity_path.exists():
+                    st = self.identity_path.stat()
+                    if st.st_mtime != self._identity_mtime:
+                        self.identity = self._load_identity()
+                        self._identity_mtime = st.st_mtime
+                        print(f"[identity] Reloaded {self.identity_path}")
+            except Exception:
+                pass
+            time.sleep(2.0)
+
+    def _prepare_tts_text(self, text: str) -> str:
+        # When speak_symbols is False, remove punctuation/symbols entirely
+        if not self.cfg.get('speak_symbols', False):
+            t = text.replace('_', ' ').replace('-', ' ')
+            t = re.sub(r"[^\w\s]", "", t, flags=re.UNICODE)
+            t = re.sub(r"\s+", " ", t).strip()
+            return t
+        return text
+
+    async def queue_audio_output(self, pcm_bytes: bytes):
+        try:
+            # Allow larger queue for prebuffered audio (non-blocking)
+            if self.audio_queue.qsize() > 300:
+                try:
+                    _ = self.audio_queue.get_nowait()
+                except queue.Empty:
+                    pass
+            self.audio_queue.put_nowait(pcm_bytes)
+        except Exception as e:
+            print(f"Audio queue error: {e}")
+
+    async def _ask_server_respond(self, text: str) -> str:
+        headers = { 'Content-Type': 'application/json' }
+        # Try preferred route first
+        route = str(self.cfg.get('server_route', 'respond')).lower()
+        base = self.cfg.get('server_url', f"http://127.0.0.1:5051/{route}")
+        def _pack(r: str):
+            if r == 'respond':
+                return base if base.endswith('/respond') else base.rsplit('/',1)[0] + '/respond', json.dumps({
+                    "sessionId": "voice-default",
+                    "messages": [ { "role": "user", "content": text } ],
+                    "run_tools": True,
+                    "allow_write": True,
+                    "persona": "AVA",
+                    "style": "first_person",
+                    "context": {
+                        "identity": self.identity,
+                        "uptime": self._uptime_hms(),
+                        "platform": platform.system()
+                    }
+                }).encode('utf-8')
+            else:
+                return base if base.endswith('/chat') else base.rsplit('/',1)[0] + '/chat', json.dumps({
+                    "sessionId": "voice-default",
+                    "text": text,
+                    "run_tools": True,
+                    "allow_write": True,
+                    "persona": "AVA",
+                    "style": "first_person",
+                    "context": {
+                        "identity": self.identity,
+                        "uptime": self._uptime_hms(),
+                        "platform": platform.system()
+                    }
+                }).encode('utf-8')
+        # Preferred
+        url, body = _pack(route)
+        req = urllib.request.Request(url=url, data=body, headers=headers, method='POST')
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                raw = resp.read()
+                j = json.loads(raw.decode('utf-8', errors='ignore'))
+                return (j.get('output_text') or (j.get('content') or [{}])[0].get('text') or '').strip()
+        except urllib.error.HTTPError as he:
+            # Fallback to alternate route on 5xx/4xx
+            alt = 'chat' if route == 'respond' else 'respond'
+            alt_url, alt_body = _pack(alt)
+            try:
+                req2 = urllib.request.Request(url=alt_url, data=alt_body, headers=headers, method='POST')
+                with urllib.request.urlopen(req2, timeout=30) as resp2:
+                    raw = resp2.read()
+                    j = json.loads(raw.decode('utf-8', errors='ignore'))
+                    return (j.get('output_text') or (j.get('content') or [{}])[0].get('text') or '').strip()
+            except Exception as e2:
+                print(f"[route] Server error fallback: {e2}")
+                return ''
+        except Exception as e:
+            print(f"[route] Server error: {e}")
+            return ''
+
+    # ---------------------- Server supervision (when not using hot runner) ----------------------
+    def _server_up(self, url: str, timeout: float = 2.0) -> bool:
+        try:
+            # Probe base URL via GET (robust against route 5xx)
+            base = url.rsplit('/', 1)[0] if url.endswith('/respond') or url.endswith('/chat') else url
+            req = urllib.request.Request(base, method='GET')
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                code = getattr(resp, 'status', None) or getattr(resp, 'code', None) or 200
+                return 200 <= code < 500
+        except Exception:
+            return False
+
+    def _spawn_server(self) -> subprocess.Popen | None:
+        # Start node server.js in ../ava-server if present
+        try:
+            base = Path(__file__).resolve().parent
+            server_dir = base.parent / "ava-server"
+            if not server_dir.exists():
+                print(f"[server] Directory not found: {server_dir}")
+                return None
+            env = os.environ.copy()
+            proc = subprocess.Popen(["node", "server.js"], cwd=str(server_dir), env=env)
+            print(f"[server] Started server.js (PID {proc.pid})")
+            return proc
+        except Exception as e:
+            print(f"[server] Failed to start: {e}")
+            return None
+
+    def _ensure_server_started(self):
+        try:
+            url = self.cfg.get('server_url', "http://127.0.0.1:5051/respond")
+            if self._server_up(url):
+                print(f"[server] Up: {url}")
+                return
+            print("[server] Down. Attempting to start…")
+            sp = self._spawn_server()
+            # Wait briefly for it to come up
+            for _ in range(10):
+                time.sleep(0.7)
+                if self._server_up(url):
+                    print(f"[server] Up after start: {url}")
+                    return
+            print("[server] Still down after start attempts.")
+        except Exception:
+            pass
+
+    async def _speak_text(self, text: str):
+        if not text:
+            return
+        speak_text = self._prepare_tts_text(text)
+        if not speak_text:
+            return
+        self.tts_active.set()
+        speak_url = f"{DG_SPEAK_BASE}&encoding=linear16&sample_rate={self.playback_rate}"
+        req = urllib.request.Request(
+            url=speak_url,
+            data=json.dumps({"text": speak_text}).encode('utf-8'),
+            headers={
+                'Authorization': f'Token {self.deepgram_key}',
+                'Content-Type': 'application/json',
+                'Accept': 'audio/wav'
+            },
+            method='POST'
+        )
+        ctx = ssl.create_default_context()
+        try:
+            # Prebuffer entire audio for smooth playback
+            audio_buffer = bytearray()
+            with urllib.request.urlopen(req, context=ctx, timeout=60) as resp:
+                # Skip WAV header
+                hdr = resp.read(44)
+                # Download entire audio first
+                while True:
+                    chunk = resp.read(32768)
+                    if not chunk:
+                        break
+                    audio_buffer.extend(chunk)
+
+            # Now play the buffered audio in large chunks
+            chunk_size = 65536  # Larger chunks for smoother playback
+            for i in range(0, len(audio_buffer), chunk_size):
+                if self.user_speaking.is_set():
+                    break
+                chunk = bytes(audio_buffer[i:i+chunk_size])
+                await self.queue_audio_output(chunk)
+                # No sleep - let the playback thread handle timing
+
+        except Exception as e:
+            print(f"TTS error: {e}")
+        finally:
+            self.tts_active.clear()
+            try:
+                self.metrics['tts_utterances'] += 1
+            except Exception:
+                pass
+
+    def _listen_url(self) -> str:
+        model = self.cfg.get('asr_model') or 'nova-2'
+        return (
+            "wss://api.deepgram.com/v1/listen?encoding=linear16"
+            f"&sample_rate={MIC_RATE}&channels=1&model={model}&smart_format=true"
+        )
+
+    async def connect_asr(self):
+        print("\n🎤 Connecting to Deepgram Live (ASR)...")
+        headers = { 'Authorization': f'Token {self.deepgram_key}' }
+        url = self._listen_url()
+        try:
+            self.asr_ws = await websockets.connect(
+                url,
+                extra_headers=headers,
+                ping_interval=20,
+                ping_timeout=20,
+                max_queue=None,
+                close_timeout=10,
+            )
+        except TypeError:
+            self.asr_ws = await websockets.connect(
+                url,
+                additional_headers=headers,
+                ping_interval=20,
+                ping_timeout=20,
+                max_queue=None,
+                close_timeout=10,
+            )
+        print("✅ ASR connected")
+
+    async def close_asr(self):
+        try:
+            if self.asr_ws:
+                await self.asr_ws.close()
+        except:
+            pass
+        self.asr_ws = None
+
+    async def asr_receiver(self):
+        print("👂 Listening for ASR events...\n")
+        try:
+            async for message in self.asr_ws:
+                if isinstance(message, (bytes, bytearray)):
+                    continue
+                try:
+                    event = json.loads(message)
+                except Exception:
+                    continue
+                if self.cfg.get('debug_asr'):
+                    try:
+                        js = json.dumps(event)
+                        preview = (js[:400] + '...') if len(js) > 400 else js
+                        print(f"[ASR] {preview}")
+                    except Exception:
+                        pass
+                alt = None
+                is_final = False
+                try:
+                    # Deepgram ASR has is_final and channel at top level
+                    is_final = bool(event.get('is_final', False))
+                    ch = event.get('channel')
+                    if ch and isinstance(ch, dict):
+                        alts = ch.get('alternatives')
+                        if alts and isinstance(alts, list) and len(alts) > 0:
+                            alt = alts[0]
+                except Exception:
+                    pass
+                transcript = ''
+                if isinstance(alt, dict):
+                    transcript = alt.get('transcript', '')
+                try:
+                    self.metrics['asr_messages'] += 1
+                except Exception:
+                    pass
+                if transcript:
+                    if is_final:
+                        print(f"\n🗣️  You: {transcript}")
+                        try:
+                            self.metrics['asr_finals'] += 1
+                        except Exception:
+                            pass
+                        # Intercept self-awareness queries locally
+                        handled = await self._maybe_handle_local_intent(transcript)
+                        if handled:
+                            continue
+                        reply = await self._ask_server_respond(transcript)
+                        if reply:
+                            print(f"🤖 AVA: {reply}")
+                            await self._speak_text(reply)
+                    else:
+                        # interim ignored
+                        pass
+        except websockets.exceptions.ConnectionClosed as e:
+            print(f"\n🔌 ASR connection closed: {e}")
+            try:
+                self.metrics['reconnects'] += 1
+            except Exception:
+                pass
+        except Exception as e:
+            print(f"\n❌ ASR receiver error: {e}")
+            try:
+                self.metrics['last_error'] = str(e)
+            except Exception:
+                pass
+
+    async def stream_microphone_input(self):
+        """Stream microphone input to Deepgram ASR"""
+        def open_mic():
+            kwargs = dict(format=FORMAT, channels=CHANNELS, rate=MIC_RATE, input=True, frames_per_buffer=CHUNK_SAMPLES)
+            if self.input_device_index is not None:
+                kwargs['input_device_index'] = self.input_device_index
+            return self.audio.open(**kwargs)
+
+        stream = open_mic()
+
+        print("🎤 Microphone active - AVA is always listening!")
+
+        try:
+            while self.running:
+                # Reopen mic on config changes
+                if getattr(self, '_reopen_mic', False):
+                    try:
+                        stream.stop_stream(); stream.close()
+                    except Exception:
+                        pass
+                    stream = open_mic()
+                    setattr(self, '_reopen_mic', False)
+                audio_data = stream.read(CHUNK_SAMPLES, exception_on_overflow=False)
+                # VAD gating during active TTS
+                rms = self._rms_int16(audio_data)
+                if self.cfg.get('debug_rms'):
+                    if int(time.time()*2) % 10 == 0:
+                        print(f"[mic] rms={int(rms)}")
+                now = time.time()
+                if self.tts_active.is_set():
+                    if not self.user_speaking.is_set():
+                        if rms >= self.START_THRESH:
+                            self._loud_frames += 1
+                            if self._loud_frames >= 3:
+                                self.user_speaking.set()
+                                self._last_user_voice_t = now
+                                self._cancel_tts()
+                        else:
+                            self._loud_frames = 0
+                    else:
+                        if rms >= self.STOP_THRESH:
+                            self._last_user_voice_t = now
+                        elif (now - self._last_user_voice_t) > self.SPEECH_HOLD_SEC:
+                            self.user_speaking.clear()
+                    if not self.user_speaking.is_set():
+                        await asyncio.sleep(CHUNK_SAMPLES / MIC_RATE)
+                        continue
+
+                if self.asr_ws is not None:
+                    try:
+                        await self.asr_ws.send(audio_data)
+                    except Exception:
+                        await asyncio.sleep(0.02)
+                await asyncio.sleep(CHUNK_SAMPLES / MIC_RATE)
+
+        finally:
+            stream.stop_stream()
+            stream.close()
+
+    def _audio_playback_worker(self):
+        """Worker thread for continuous audio playback"""
+        # Open persistent playback stream (with dynamic re-open support)
+        def open_playback():
+            try:
+                open_kwargs = dict(format=FORMAT, channels=CHANNELS, rate=self.playback_rate, output=True, frames_per_buffer=4096)
+                if self.output_device_index is not None:
+                    open_kwargs['output_device_index'] = self.output_device_index
+                # Log selected output device
+                try:
+                    if 'output_device_index' in open_kwargs:
+                        info = self.audio.get_device_info_by_index(open_kwargs['output_device_index'])
+                    else:
+                        info = self.audio.get_default_output_device_info()
+                    print(f"[audio] Using output device: {info.get('name')} (idx={info.get('index')}) @ {self.playback_rate} Hz")
+                except Exception:
+                    pass
+                return self.audio.open(**open_kwargs)
+            except Exception:
+                try:
+                    self.playback_rate = 48000
+                    open_kwargs = dict(format=FORMAT, channels=CHANNELS, rate=self.playback_rate, output=True, frames_per_buffer=4096)
+                    if self.output_device_index is not None:
+                        open_kwargs['output_device_index'] = self.output_device_index
+                    print(f"[audio] Fallback playback rate {self.playback_rate} Hz")
+                    try:
+                        if 'output_device_index' in open_kwargs:
+                            info = self.audio.get_device_info_by_index(open_kwargs['output_device_index'])
+                        else:
+                            info = self.audio.get_default_output_device_info()
+                        print(f"[audio] Using output device: {info.get('name')} (idx={info.get('index')}) @ {self.playback_rate} Hz")
+                    except Exception:
+                        pass
+                    return self.audio.open(**open_kwargs)
+                except Exception as e:
+                    print(f"Playback open error: {e}")
+                    # Auto-select a viable output device
+                    try:
+                        dev_count = self.audio.get_device_count()
+                        for idx in range(dev_count):
+                            try:
+                                info = self.audio.get_device_info_by_index(idx)
+                                if int(info.get('maxOutputChannels', 0)) <= 0:
+                                    continue
+                                test_kwargs = dict(format=FORMAT, channels=CHANNELS, rate=self.playback_rate, output=True, frames_per_buffer=2048, output_device_index=idx)
+                                stream = self.audio.open(**test_kwargs)
+                                print(f"[audio] Auto-selected output: {info.get('name')} (idx={idx}) @ {self.playback_rate} Hz")
+                                return stream
+                            except Exception:
+                                continue
+                        print("[audio] No suitable output device found.")
+                    except Exception:
+                        pass
+                    return None
+
+        self.playback_stream = open_playback()
+        if self.playback_stream is None:
+            return
+
+        try:
+            while self.running:
+                try:
+                    # Reopen playback if requested by config changes
+                    if getattr(self, '_reopen_playback', False):
+                        try:
+                            self.playback_stream.stop_stream()
+                            self.playback_stream.close()
+                        except Exception:
+                            pass
+                        self.playback_stream = open_playback()
+                        setattr(self, '_reopen_playback', False)
+                        if self.playback_stream is None:
+                            time.sleep(0.5)
+                            continue
+                    # Get audio chunk from queue with timeout
+                    audio_data = self.audio_queue.get(timeout=0.1)
+
+                    if audio_data is None:  # Poison pill to stop thread
+                        break
+
+                    # Write audio chunk to stream
+                    try:
+                        self.playback_busy.set()
+                        self.playback_stream.write(audio_data)
+                    finally:
+                        self.playback_busy.clear()
+                    # Update global playback RMS EMA for echo gating
+                    try:
+                        pr = self._rms_int16(audio_data)
+                        self._playback_rms_ema = (self._playback_rms_ema * 0.85) + (pr * 0.15)
+                    except Exception:
+                        pass
+
+                except queue.Empty:
+                    continue
+                except Exception as e:
+                    print(f"Playback error: {e}")
+
+        finally:
+            if self.playback_stream:
+                self.playback_stream.stop_stream()
+                self.playback_stream.close()
+
+    # ---------------------- Deepgram Agent Voice (proven path) ----------------------
+    class _WavToPcmStripper:
+        def __init__(self):
+            self._buf = bytearray(); self._need = True
+        def reset(self):
+            self._buf.clear(); self._need = True
+        def feed(self, data: bytes) -> bytes:
+            if not data:
+                return b''
+            if not self._need:
+                return data
+            self._buf.extend(data)
+            b = self._buf
+            if len(b) < 44:
+                return b''
+            if b[:4] != b'RIFF' or b[8:12] != b'WAVE':
+                self._need = False
+                out = bytes(b)
+                self._buf.clear()
+                return out
+            i = 12; n = len(b)
+            while i + 8 <= n:
+                cid = b[i:i+4]; csz = int.from_bytes(b[i+4:i+8], 'little')
+                if cid == b'data':
+                    start = i + 8
+                    self._need = False
+                    out = bytes(b[start:])
+                    self._buf.clear()
+                    return out
+                i += 8 + csz
+            return b''
+
+    def run_agent_voice(self):
+        client = DeepgramClient(api_key=self.deepgram_key)
+        p = pyaudio.PyAudio()
+        out_kwargs = dict(format=pyaudio.paInt16, channels=1, rate=24000, output=True)
+        if self.output_device_index is not None:
+            out_kwargs['output_device_index'] = self.output_device_index
+        # Open speaker with fallbacks and logging
+        try:
+            try:
+                if 'output_device_index' in out_kwargs:
+                    info = p.get_device_info_by_index(out_kwargs['output_device_index'])
+                else:
+                    info = p.get_default_output_device_info()
+                print(f"[audio] Agent using output device: {info.get('name')} (idx={info.get('index')}) @ {out_kwargs['rate']} Hz")
+            except Exception:
+                pass
+            speaker_stream = p.open(**out_kwargs)
+        except Exception:
+            try:
+                out_kwargs['rate'] = 48000
+                if 'output_device_index' in out_kwargs:
+                    info = p.get_device_info_by_index(out_kwargs['output_device_index'])
+                else:
+                    info = p.get_default_output_device_info()
+                print(f"[audio] Agent fallback device: {info.get('name')} (idx={info.get('index')}) @ {out_kwargs['rate']} Hz")
+                speaker_stream = p.open(**out_kwargs)
+            except Exception as e:
+                print(f"Agent speaker open error: {e}")
+                # Try auto-selecting any viable output device
+                speaker_stream = None
+                try:
+                    dev_count = p.get_device_count()
+                    for idx in range(dev_count):
+                        try:
+                            info = p.get_device_info_by_index(idx)
+                            if int(info.get('maxOutputChannels', 0)) <= 0:
+                                continue
+                            test_kwargs = dict(format=pyaudio.paInt16, channels=1, rate=48000, output=True, frames_per_buffer=1920, output_device_index=idx)
+                            speaker_stream = p.open(**test_kwargs)
+                            print(f"[audio] Agent auto-selected output: {info.get('name')} (idx={idx}) @ 48000 Hz")
+                            break
+                        except Exception:
+                            continue
+                except Exception:
+                    pass
+                if speaker_stream is None:
+                    raise RuntimeError("No suitable output device for agent speech")
+        in_kwargs = dict(format=FORMAT, channels=CHANNELS, rate=MIC_RATE, input=True, frames_per_buffer=1024)
+        if self.input_device_index is not None:
+            in_kwargs['input_device_index'] = self.input_device_index
+        mic_stream = p.open(**in_kwargs)
+
+        shutdown = threading.Event()
+        connection_active = threading.Event()
+        conn_ref = {"conn": None}
+        wav_stripper = self._WavToPcmStripper()
+        agent_tts_fallback = threading.Event()
+        non_audio_ctr = {"n": 0}  # Counter for debugging non-audio messages
+
+        # Shared state for echo/interrupt control
+        playback_rms = {"v": 0.0}
+        tts_start_time = {"t": 0.0}
+        last_tts_pcm_time = {"t": 0.0}
+        barge_cfg = self.cfg.get('barge') or {}
+        debounce_frames = int(barge_cfg.get('debounce_frames', 3))
+        dyn_scale = float(barge_cfg.get('dyn_thresh_scale', 0.6))
+        min_tts_ms = int(barge_cfg.get('min_tts_ms', 300))
+        # Stricter barge-in while TTS is playing to avoid echo trigger from speakers
+        strict_dyn_scale = float(barge_cfg.get('strict_dyn_scale', 2.2))
+        strict_debounce_frames = int(barge_cfg.get('strict_debounce_frames', max(6, debounce_frames + 4)))
+
+        # Audio send counter for debugging
+        audio_send_ctr = {"n": 0}
+
+        # Watchdog to clear stuck TTS state if AgentAudioDone is missed
+        def tts_watchdog():
+            while not shutdown.is_set():
+                try:
+                    if self.tts_active.is_set():
+                        now = time.time()
+                        base = max(tts_start_time.get("t", 0.0), last_tts_pcm_time.get("t", 0.0))
+                        if base and (now - base) > 3.0:
+                            self.tts_active.clear()
+                            tts_start_time["t"] = 0.0
+                            last_tts_pcm_time["t"] = 0.0
+                            playback_rms["v"] = 0.0
+                            self.user_speaking.clear()
+                            wav_stripper.reset()
+                            agent_tts_fallback.clear()
+                except Exception:
+                    pass
+                time.sleep(0.5)
+
+        def microphone_thread():
+            nonlocal mic_stream
+            loud_frames = 0
+            while not shutdown.is_set():
+                try:
+                    # Hot-reopen mic if config changed
+                    if getattr(self, '_reopen_mic', False):
+                        try:
+                            mic_stream.stop_stream(); mic_stream.close()
+                        except Exception:
+                            pass
+                        try:
+                            kwargs = dict(format=FORMAT, channels=CHANNELS, rate=MIC_RATE, input=True, frames_per_buffer=1024)
+                            if self.input_device_index is not None:
+                                kwargs['input_device_index'] = self.input_device_index
+                            mic_stream = p.open(**kwargs)
+                            try:
+                                info_in = p.get_device_info_by_index(kwargs['input_device_index']) if 'input_device_index' in kwargs else p.get_default_input_device_info()
+                                print(f"[audio] Reopened mic: {info_in.get('name')} (idx={info_in.get('index')}) @ {MIC_RATE} Hz")
+                            except Exception:
+                                pass
+                        except Exception as _e:
+                            print(f"[audio] Mic reopen failed: {_e}")
+                        setattr(self, '_reopen_mic', False)
+                except Exception:
+                    pass
+                try:
+                    data = mic_stream.read(1024, exception_on_overflow=False)
+                except Exception:
+                    time.sleep(0.01)
+                    continue
+                # Half-duplex echo control with dynamic threshold and debounce
+                rms = self._rms_int16(data)
+                # Optional RMS debug output to verify mic capture
+                try:
+                    if bool(self.cfg.get('debug_rms', False)):
+                        if int(time.time()*2) % 10 == 0:
+                            print(f"[mic] rms={int(rms)}")
+                except Exception:
+                    pass
+                now = time.time()
+                # Echo-aware barge-in policy during playback
+                if self.tts_active.is_set() or self.playback_busy.is_set():
+                    allow_barge = bool(self.cfg.get('allow_barge', False))
+                    if not allow_barge:
+                        time.sleep(0.01)
+                        continue
+                    # Respect a minimum TTS lead-in before we consider barge-in
+                    if (now - tts_start_time["t"]) * 1000.0 < max(300, min_tts_ms):
+                        time.sleep(0.01)
+                        continue
+                    # Use stricter dynamic threshold while TTS is active
+                    dyn_thresh = max(self.START_THRESH * 1.5, max(self._playback_rms_ema, playback_rms["v"]) * strict_dyn_scale)
+                    # Require more consecutive loud frames to confirm barge
+                    needed_frames = strict_debounce_frames
+                    if not self.user_speaking.is_set():
+                        if rms >= dyn_thresh:
+                            loud_frames += 1
+                            if loud_frames >= needed_frames:
+                                self.user_speaking.set()
+                                self._last_user_voice_t = now
+                        else:
+                            loud_frames = 0
+                            time.sleep(0.01)
+                            continue
+                    else:
+                        if rms >= self.STOP_THRESH:
+                            self._last_user_voice_t = now
+                        elif (now - self._last_user_voice_t) > self.SPEECH_HOLD_SEC:
+                            self.user_speaking.clear()
+                            loud_frames = 0
+                            time.sleep(0.01)
+                            continue
+
+                if connection_active.is_set():
+                    try:
+                        c = conn_ref["conn"]
+                        if c is not None:
+                            c.send_media(data)
+                            audio_send_ctr["n"] += 1
+                            # Log every 100 audio chunks sent
+                            if audio_send_ctr["n"] % 100 == 0:
+                                print(f"[audio-tx] Sent {audio_send_ctr['n']} audio chunks to Deepgram Agent")
+                    except Exception as e:
+                        print(f"[audio-tx] Error sending audio: {e}")
+                else:
+                    time.sleep(0.01)
+
+        threading.Thread(target=tts_watchdog, name="tts_watch", daemon=True).start()
+        threading.Thread(target=microphone_thread, name="agent_mic", daemon=True).start()
+
+        # Pre-build settings message ONCE before connection loop to minimize delay
+        ident = self.identity
+        name = ident.get('name', 'AVA')
+        dev = ident.get('developer', 'your developer')
+        purpose = ident.get('purpose', 'your assistant on this laptop')
+        prompt_text = (
+            f"You are {name}, my on-device assistant built by {dev}. "
+            f"You run locally on this laptop and operate as the AVA agent. "
+            f"Purpose: {purpose}. "
+            f"Behavioral contract: You are the voice for the AVA agent runtime. "
+            f"Self-awareness: You can describe your identity, uptime, platform, and install location. "
+            f"Tool calling: When an action is required, produce ONLY a compact JSON object (no prose) of the form: "
+            f"{{\"tool\":{{\"name\":\"<tool_name>\",\"arguments\":{{...}}}}}}. "
+            f"Examples: {{\"tool\":{{\"name\":\"fs_ops\",\"arguments\":{{\"operation\":\"write\",\"path\":\"C:/Users/USER/Desktop/note.txt\",\"content\":\"hi\"}}}}}}. "
+            f"If no tool is needed, respond concisely in first person. "
+            f"Never claim an action is complete unless the tool result confirms it. "
+            f"Speech policy: Do not read punctuation or decorative symbols aloud. "
+            f"Treat characters like *, #, _, ~, backticks, code fences, and emoji as silent unless explicitly asked to read them. "
+            f"If text includes markup or formatting symbols, convey the meaning in natural speech instead of pronouncing symbols."
+        )
+        dg_functions = self._deepgram_functions_from_corrected_tools()
+
+        # Build proper SDK settings objects (NOT raw dict/JSON)
+        # For Google Gemini, model MUST be in endpoint URL, not in provider settings
+        gemini_endpoint_url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse"
+        settings_obj = AgentV1SettingsMessage(
+            audio=AgentV1AudioConfig(
+                input=AgentV1AudioInput(encoding="linear16", sample_rate=MIC_RATE),
+                output=AgentV1AudioOutput(encoding="linear16", sample_rate=24000, container="wav")
+            ),
+            agent=AgentV1Agent(
+                listen=AgentV1Listen(
+                    provider=AgentV1ListenProvider(type="deepgram", model=str(self.cfg.get('asr_model','nova-2')))
+                ),
+                think=AgentV1Think(
+                    provider=AgentV1GoogleThinkProvider(type="google", model="gemini-2.5-flash"),
+                    endpoint=AgentV1Endpoint(
+                        url=gemini_endpoint_url,
+                        headers={"x-goog-api-key": self.gemini_key}
+                    ),
+                    prompt=prompt_text,
+                    functions=dg_functions
+                ),
+                speak=AgentV1SpeakProviderConfig(
+                    provider=AgentV1DeepgramSpeakProvider(type="deepgram", model=str(self.cfg.get('tts_model','aura-2-andromeda-en')))
+                )
+            )
+        )
+        print(f"[agent] Settings object built: ASR={self.cfg.get('asr_model','nova-2')}, TTS={self.cfg.get('tts_model','aura-2-andromeda-en')}, Think=gemini-2.5-flash")
+
+        try:
+            while not shutdown.is_set():
+                try:
+                    with client.agent.v1.connect() as connection:
+                        conn_ref["conn"] = connection  # Store connection immediately
+
+                        suppress_agent_tts = bool(self.cfg.get('suppress_agent_tts', True))
+
+                        def on_message(message: AgentV1SocketClientResponse):
+                            if isinstance(message, bytes):
+                                # Strictly suppress agent audio when globally configured or during per-turn tool execution
+                                if suppress_agent_tts or self._drop_agent_tts.is_set() or (time.time() < getattr(self, '_drop_until_ts', 0.0)):
+                                    # Still track TTS active to gate mic
+                                    self.tts_active.set()
+                                    if tts_start_time["t"] == 0.0:
+                                        tts_start_time["t"] = time.time()
+                                    last_tts_pcm_time["t"] = time.time()
+                                    return
+                                pcm = wav_stripper.feed(message)
+                                if pcm:
+                                    self.tts_active.set()
+                                    try:
+                                        # Update playback RMS EMA for dynamic VAD
+                                        pr = self._rms_int16(pcm)
+                                        playback_rms["v"] = (playback_rms["v"] * 0.85) + (pr * 0.15)
+                                        self._playback_rms_ema = (self._playback_rms_ema * 0.85) + (pr * 0.15)
+                                    except Exception:
+                                        pass
+                                    last_tts_pcm_time["t"] = time.time()
+                                    if self.user_speaking.is_set():
+                                        return
+                                    try:
+                                        speaker_stream.write(pcm)
+                                    except Exception:
+                                        pass
+                            else:
+                                msg_type = getattr(message, "type", "Unknown")
+                                try:
+                                    # Always log messages when debug enabled
+                                    if self.cfg.get('debug_asr') or non_audio_ctr["n"] < 12:
+                                        payload = getattr(message, "__dict__", None)
+                                        s = str(payload) if payload is not None else str(message)
+                                        print(f"NON-AUDIO MSG: {msg_type} :: {s[:500]}")
+                                        non_audio_ctr["n"] += 1
+                                except Exception:
+                                    pass
+                                if msg_type == "ConversationText":
+                                    try:
+                                        role = str(getattr(message, 'role', ''))
+                                        content = str(getattr(message, 'content', ''))
+                                        # Show assistant text as AVA to match heard voice; tools will override with natural result
+                                        if role == 'assistant':
+                                            print(f"AVA: {content}")
+                                        else:
+                                            print(f"You: {content}")
+                                        # Self-awareness and tools routing: on user text, handle local intents first,
+                                        # then try corrected tools via cmpuse Agent; else call AVA server and speak reply
+                                        if role == 'user' and content.strip():
+                                            try:
+                                                import asyncio
+                                                loop = None
+                                                try:
+                                                    loop = asyncio.get_event_loop()
+                                                except Exception:
+                                                    loop = None
+                                                # Handle self-awareness/intents locally first
+                                                handled = False
+                                                if loop and loop.is_running():
+                                                    fut0 = asyncio.run_coroutine_threadsafe(self._maybe_handle_local_intent(content), loop)
+                                                    handled = bool(fut0.result(timeout=10))
+                                                else:
+                                                    handled = asyncio.run(self._maybe_handle_local_intent(content))
+                                                if handled:
+                                                    return
+                                                # Try local tools via corrected tool definitions
+                                                tool_reply = self._try_tool_dispatch(content)
+                                                if tool_reply:
+                                                    # For tool turns: fully mute agent audio, speak local TTS with exact result
+                                                    self._drop_agent_tts.set(); self._drop_until_ts = time.time() + 0.8
+                                                    print(f"AVA: {tool_reply}")
+                                                    self._ensure_playback_thread()
+                                                    if loop and loop.is_running():
+                                                        fut2 = asyncio.run_coroutine_threadsafe(self._speak_text(tool_reply), loop)
+                                                        fut2.result(timeout=60)
+                                                    else:
+                                                        asyncio.run(self._speak_text(tool_reply))
+                                                    self._drop_agent_tts.clear(); self._drop_until_ts = 0.0
+                                                    return
+                                                # Ask AVA server (brain + tools) for reply
+                                                if loop and loop.is_running():
+                                                    fut = asyncio.run_coroutine_threadsafe(self._ask_server_respond(content), loop)
+                                                    reply = fut.result(timeout=30)
+                                                else:
+                                                    reply = asyncio.run(self._ask_server_respond(content))
+                                                if reply:
+                                                    # Emit the reply text to console in all cases for consistency
+                                                    print(f"🤖 AVA: {reply}")
+                                                    # Speak locally only when agent TTS is suppressed; otherwise avoid double audio
+                                                    if bool(self.cfg.get('suppress_agent_tts', True)):
+                                                        if loop and loop.is_running():
+                                                            fut2 = asyncio.run_coroutine_threadsafe(self._speak_text(reply), loop)
+                                                            fut2.result(timeout=60)
+                                                        else:
+                                                            asyncio.run(self._speak_text(reply))
+                                                    else:
+                                                        # No reply from server; fall back to agent TTS for this turn
+                                                        agent_tts_fallback.set()
+                                            except Exception:
+                                                # On server error, fall back to agent TTS
+                                                agent_tts_fallback.set()
+                                                pass
+                                        # When suppressing agent TTS, skip speaking agent assistant text here.
+                                    except Exception:
+                                        pass
+                                elif msg_type == "AgentText":
+                                    # Do not parse or execute tools from AgentText; native FunctionCallRequest is the source of truth
+                                    try:
+                                        txt = str(getattr(message, 'content', ''))
+                                        # Show what the Agent says as AVA for consistency
+                                        if txt:
+                                            print(f"AVA: {txt}")
+                                    except Exception:
+                                        pass
+                                elif msg_type == "FunctionCallRequest":
+                                    # Handle native Deepgram Voice Agent function calls: execute locally and respond
+                                    try:
+                                        funcs_req = getattr(message, 'functions', None)
+                                        if not funcs_req and isinstance(message, dict):
+                                            funcs_req = message.get('functions')
+                                        if not funcs_req:
+                                            return
+                                        conn = conn_ref.get('conn')
+                                        for f in funcs_req:
+                                            try:
+                                                call_id = getattr(f, 'id', None) if hasattr(f, 'id') else (f.get('id') if isinstance(f, dict) else None)
+                                                tname = getattr(f, 'name', None) if hasattr(f, 'name') else (f.get('name') if isinstance(f, dict) else None)
+                                                arg_str = getattr(f, 'arguments', '{}') if hasattr(f, 'arguments') else (f.get('arguments') if isinstance(f, dict) else '{}')
+                                                try:
+                                                    targs = json.loads(arg_str) if isinstance(arg_str, str) else (arg_str or {})
+                                                except Exception:
+                                                    targs = {}
+                                                # Execute tool via CMPUSE
+                                                res = asyncio.run(self.handle_tool_call(tname, targs))
+                                                # Send FunctionCallResponse back to agent; let agent speak naturally
+                                                payload = {"type": "FunctionCallResponse", "name": tname, "content": json.dumps(res, default=str), "id": call_id}
+                                                try:
+                                                    conn.send(json.dumps(payload))
+                                                except Exception:
+                                                    pass
+                                            except Exception:
+                                                pass
+                                        return
+                                    except Exception:
+                                        pass
+                                elif msg_type == "AgentAudioDone":
+                                    # Current TTS clip finished
+                                    self.tts_active.clear()
+                                    tts_start_time["t"] = 0.0
+                                    playback_rms["v"] = 0.0
+                                    self._playback_rms_ema = 0.0
+                                    self.user_speaking.clear()
+                                    wav_stripper.reset()
+                                    agent_tts_fallback.clear()
+
+                        def on_close(close):
+                            connection_active.clear(); conn_ref["conn"] = None
+
+                        connection.on(EventType.MESSAGE, on_message)
+                        connection.on(EventType.CLOSE, on_close)
+
+                        # Send settings FIRST using proper SDK method (before start_listening)
+                        try:
+                            connection.send_settings(settings_obj)
+                            print("[agent] Settings sent via SDK send_settings()")
+                        except Exception as e:
+                            print(f"[agent] Failed to send settings: {e}")
+                            import traceback
+                            traceback.print_exc()
+
+                        # NOW start listening for responses after settings are sent
+                        connection.start_listening()
+
+                        # Activate the connection so mic can start sending audio
+                        connection_active.set()
+                        print("[agent] Deepgram Agent connected and configured")
+                        while connection_active.is_set() and not shutdown.is_set():
+                            time.sleep(0.1)
+                except Exception as e:
+                    print(f"Agent connection error: {e}. Reconnecting in 3s…")
+                    connection_active.clear(); time.sleep(3)
+        finally:
+            try:
+                shutdown.set()
+                mic_stream.stop_stream(); mic_stream.close()
+                speaker_stream.stop_stream(); speaker_stream.close()
+                p.terminate()
+            except Exception:
+                pass
+
+    async def start_conversation(self):
+        """Start the realtime voice conversation"""
+        self.running = True
+
+        # Ensure brain server is available if configured to auto-start
+        if bool(self.cfg.get('auto_start_server', True)):
+            self._ensure_server_started()
+
+        # Ensure audio playback thread only when needed (local TTS mode)
+        try:
+            vmode = str(self.cfg.get('voice_mode', 'agent')).lower()
+            use_local_tts = bool(self.cfg.get('suppress_agent_tts', True))
+        except Exception:
+            vmode = 'agent'; use_local_tts = True
+        if (vmode != 'agent' or use_local_tts):
+            if not (self.playback_thread and self.playback_thread.is_alive()):
+                self.playback_thread = threading.Thread(target=self._audio_playback_worker, daemon=True)
+                self.playback_thread.start()
+                print("🔊 Audio playback thread started\n")
+
+        # Prefer Deepgram Agent voice path; returns when agent thread exits
+        threading.Thread(target=self._config_watcher, daemon=True).start()
+        if str(self.cfg.get('voice_mode','agent')).lower() == 'agent':
+            t = threading.Thread(target=self.run_agent_voice, name="agent_voice", daemon=True)
+            t.start()
+            try:
+                while self.running and t.is_alive():
+                    await asyncio.sleep(0.5)
+            finally:
+                return
+
+        # Start config watcher (hot reload)
+        threading.Thread(target=self._config_watcher, daemon=True).start()
+        await self.connect_asr()
+        microphone_task = asyncio.create_task(self.stream_microphone_input())
+        events_task = asyncio.create_task(self.asr_receiver())
+
+        try:
+            await asyncio.gather(microphone_task, events_task)
+        except KeyboardInterrupt:
+            print("\n\n👋 Shutting down AVA...")
+            self.running = False
+            # Signal playback thread to stop
+            self.audio_queue.put(None)
+
+    async def run(self):
+        """Main run loop"""
+        try:
+            await self.start_conversation()
+        finally:
+            if self.asr_ws:
+                await self.asr_ws.close()
+            self.audio.terminate()
+
+    async def cleanup(self):
+        """Cleanup resources before reconnection"""
+        self.running = False
+
+        # Signal playback thread to stop
+        if self.audio_queue:
+            self.audio_queue.put(None)
+
+        # Wait for playback thread
+        if self.playback_thread and self.playback_thread.is_alive():
+            self.playback_thread.join(timeout=2)
+
+        # Close websocket
+        if self.asr_ws:
+            try:
+                await self.asr_ws.close()
+            except:
+                pass
+
+    # ---------------------- Identity & Self-awareness ----------------------
+    def _load_identity(self) -> dict:
+        try:
+            if self.identity_path.exists():
+                with open(self.identity_path, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+        except Exception:
+            pass
+        # Defaults
+        return {
+            "name": "AVA",
+            "developer": os.getenv('USERNAME') or os.getenv('USER') or 'User',
+            "home": str(Path.home()),
+            "location": str(Path(__file__).resolve().parent),
+            "purpose": "Personal AI assistant that lives on this laptop.",
+        }
+
+    def _uptime_hms(self) -> str:
+        dt = int(time.time() - self.started_at)
+        h = dt // 3600; m = (dt % 3600) // 60; s = dt % 60
+        return f"{h}h {m}m {s}s"
+
+    def _self_status_text(self) -> str:
+        idt = self.identity
+        lines = []
+        lines.append(f"I am {idt.get('name','AVA')}, your assistant developed by {idt.get('developer','you')}.")
+        lines.append(f"I run locally on {platform.system()} {platform.release()} in {idt.get('location','my folder')}.")
+        lines.append(f"Uptime {self._uptime_hms()}. Mic {MIC_RATE} Hz, TTS {PLAYBACK_RATE} Hz.")
+        # Components
+        asr_ok = bool(self.asr_ws and self.asr_ws.open)
+        lines.append(f"ASR {'connected' if asr_ok else 'disconnected'}. TTS ready.")
+        # Metrics
+        m = self.metrics
+        lines.append(f"ASR msgs {m.get('asr_messages',0)}, finals {m.get('asr_finals',0)}, TTS {m.get('tts_utterances',0)}, reconnects {m.get('reconnects',0)}.")
+        le = m.get('last_error','')
+        if le:
+            lines.append(f"Last error: {le}")
+        return " ".join(lines)
+
+    async def _maybe_handle_local_intent(self, transcript: str) -> bool:
+        t = transcript.strip().lower()
+        # Basic intents for self-awareness
+        if any(x in t for x in ["who are you", "what are you", "identify yourself", "what is your name"]):
+            await self._speak_text(self._self_status_text())
+            return True
+        if any(x in t for x in ["status", "diagnose", "self status", "self diagnose", "self diagnosis"]):
+            report = self._self_status_text()
+            await self._speak_text(report)
+            return True
+        if any(x in t for x in ["where do you live", "where are you installed", "your location"]):
+            idt = self.identity
+            await self._speak_text(f"I live in {idt.get('location', 'my folder')} on this laptop.")
+            return True
+        if any(x in t for x in ["who developed you", "who is your developer", "who built you"]):
+            idt = self.identity
+            await self._speak_text(f"You did. You are my developer and owner.")
+            return True
+        return False
+
+
+async def main():
+    """Entry point with auto-restart"""
+    reconnect_count = 0
+
+    while True:
+        try:
+            print("\n" + "=" * 80)
+            if reconnect_count > 0:
+                print(f"🔄 Reconnecting to AVA (attempt #{reconnect_count + 1})...")
+            print("=" * 80 + "\n")
+
+            ava = StandaloneRealtimeAVA()
+            await ava.run()
+
+            # If we get here without exception, it was a clean shutdown
+            break
+
+        except websockets.exceptions.ConnectionClosedOK as e:
+            # Session expired (60 minute limit)
+            print("\n" + "=" * 80)
+            print("⏰ Session expired (60-minute limit reached)")
+            print("🔄 Auto-restarting AVA in 3 seconds...")
+            print("=" * 80)
+            reconnect_count += 1
+
+            # Cleanup
+            try:
+                await ava.cleanup()
+            except:
+                pass
+
+            # Wait before reconnecting
+            await asyncio.sleep(3)
+
+        except websockets.exceptions.ConnectionClosedError as e:
+            # Connection lost unexpectedly
+            print("\n" + "=" * 80)
+            print(f"⚠️  Connection lost: {e}")
+            print("🔄 Auto-restarting AVA in 5 seconds...")
+            print("=" * 80)
+            reconnect_count += 1
+
+            # Cleanup
+            try:
+                await ava.cleanup()
+            except:
+                pass
+
+            # Wait before reconnecting
+            await asyncio.sleep(5)
+
+        except KeyboardInterrupt:
+            print("\n\n👋 Shutting down AVA...")
+            try:
+                await ava.cleanup()
+            except:
+                pass
+            break
+
+        except Exception as e:
+            print(f"\n❌ Unexpected error: {e}")
+            print("🔄 Attempting to restart in 10 seconds...")
+            reconnect_count += 1
+
+            try:
+                await ava.cleanup()
+            except:
+                pass
+
+            await asyncio.sleep(10)
+    print("\n" + "=" * 80)
+    print("AVA Standalone ended")
+    print("=" * 80)
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\n\n👋 Goodbye!")

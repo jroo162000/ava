@@ -1,0 +1,517 @@
+"""
+AVA Standalone with Realtime Voice - Always-on voice assistant using OpenAI Realtime API
+Replaces traditional TTS with bidirectional realtime voice conversations
+"""
+
+import asyncio
+import base64
+import json
+import os
+import sys
+import wave
+import threading
+import queue
+from datetime import datetime
+from pathlib import Path
+
+# Set UTF-8 encoding for Windows console
+if sys.platform == 'win32':
+    try:
+        sys.stdout.reconfigure(encoding='utf-8')
+        sys.stderr.reconfigure(encoding='utf-8')
+    except:
+        os.environ['PYTHONIOENCODING'] = 'utf-8'
+
+import websockets
+import pyaudio
+
+# Add cmp-use to path
+sys.path.insert(0, r"C:\Users\USER 1\cmp-use")
+
+from cmpuse.secrets import load_into_env
+from cmpuse.agent_core import Agent, Plan, Step
+from cmpuse.config import Config
+import cmpuse.tools
+
+# Load secrets and configuration
+load_into_env()
+
+# Enable full access
+os.environ['CMPUSE_ALLOW_SHELL'] = '1'
+os.environ['CMPUSE_FORCE'] = '1'
+os.environ['CMPUSE_CONFIRM'] = '0'
+os.environ['CMPUSE_DRY_RUN'] = '0'
+os.environ['CMPUSE_ALLOW_NETWORK'] = '1'
+os.environ['CMPUSE_PATH_WHITELIST'] = r"C:\\"  # Raw string for Windows path
+
+# Audio configuration for Realtime API
+SAMPLE_RATE = 24000  # 24kHz required by Realtime API
+CHANNELS = 1
+CHUNK_SIZE = 1024
+FORMAT = pyaudio.paInt16
+
+class StandaloneRealtimeAVA:
+    def __init__(self):
+        load_into_env()
+        self.api_key = os.getenv("OPENAI_API_KEY")
+        if not self.api_key:
+            raise ValueError("OPENAI_API_KEY not found in environment")
+
+        self.config = Config.from_env()
+        self.agent = Agent(self.config)
+
+        # Audio setup
+        self.audio = pyaudio.PyAudio()
+        self.websocket = None
+        self.running = False
+
+        # Session state
+        self.session_id = None
+
+        # Audio playback queue and thread
+        self.audio_queue = queue.Queue()
+        self.playback_thread = None
+        self.playback_stream = None
+
+        print("=" * 80)
+        print("AVA STANDALONE - REALTIME VOICE MODE")
+        print("=" * 80)
+        print(f"Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"Model: gpt-4o-realtime-preview")
+        print(f"Voice: sage (warm, natural female voice)")
+        print(f"Intelligence: GPT-5.2 Pro")
+        print(f"Mode: ALWAYS-ON with Realtime Voice")
+        print(f"Tools Available: 20 JARVIS-level capabilities")
+        print("=" * 80)
+        print("Features:")
+        print("  - Always listening (no wake word needed)")
+        print("  - Bidirectional realtime voice conversation")
+        print("  - Sub-second response latency")
+        print("  - Can interrupt AVA mid-sentence")
+        print("  - Full access to all 20 AVA tools")
+        print("  - Smart Voice Activity Detection")
+        print("  - Complete C: drive file system access")
+        print("=" * 80)
+
+    async def connect(self):
+        """Connect to OpenAI Realtime API via WebSocket"""
+        url = "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview"
+
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "OpenAI-Beta": "realtime=v1"
+        }
+
+        print("\n🔌 Connecting to OpenAI Realtime API...")
+
+        try:
+            self.websocket = await websockets.connect(url, additional_headers=headers)
+            print("✅ Connected to Realtime API")
+            await self.configure_session()
+
+        except Exception as e:
+            print(f"❌ Connection failed: {e}")
+            raise
+
+    async def configure_session(self):
+        """Configure the Realtime API session"""
+        config = {
+            "type": "session.update",
+            "session": {
+                "modalities": ["text", "audio"],
+                "instructions": """You are AVA, Jelani's highly advanced personal AI assistant powered by GPT-5.2 Pro.
+
+You are running in STANDALONE ALWAYS-ON MODE with REALTIME VOICE capabilities. This means:
+- You are ALWAYS listening and ready to respond
+- You can hear and speak naturally with sub-second latency
+- You can be interrupted mid-sentence
+- Your voice is 'sage' (warm, natural female voice)
+- Responses stream in real-time
+- No wake word is needed - you're always active
+
+You have FULL ACCESS to 20 JARVIS-level tools that you can call during conversations:
+
+COMMUNICATION & SCHEDULING:
+- calendar_ops: Manage Google Calendar (create/list/update events, find free time)
+- comm_ops: Email & SMS (send/read Gmail, send texts via Twilio)
+
+SMART HOME & IOT:
+- iot_ops: Control smart home devices (lights, thermostats, locks via Home Assistant)
+- camera_ops: Security cameras (capture photos, record video, motion detection)
+- security_ops: Security system monitoring and control
+
+VISION & MEDIA:
+- vision_ops: Computer vision (analyze images, OCR, object detection, face recognition)
+- screen_ops: Screen operations (screenshots, screen recording)
+- audio_ops: Advanced audio (TTS with 9 voices, Whisper transcription)
+
+SYSTEM & AUTOMATION:
+- fs_ops: File system operations (FULL C: DRIVE ACCESS - read, write, copy, move files anywhere)
+- net_ops: Network operations (HTTP requests, web scraping, downloads)
+- sys_ops: System operations (execute commands, manage processes)
+- web_automation: Browser automation with Playwright (launch browser, navigate, click, type)
+- remote_ops: Remote device control via SSH
+
+INTELLIGENCE & LEARNING:
+- memory_system: Long-term memory (store/retrieve conversation context, preferences)
+- learning_db: Adaptive learning (patterns, preferences, usage)
+- analysis_ops: Scientific/technical analysis (data analysis, calculations, visualizations)
+- proactive_ops: Proactive assistance (schedule tasks, reminders, workflows)
+
+INTERFACE CONTROL:
+- window_ops: Window management (focus, minimize, maximize windows)
+- mouse_ops: Mouse control (move, click, drag, scroll)
+- key_ops: Keyboard control (type text, press keys, shortcuts, hotkeys)
+
+When Jelani speaks to you, USE THESE TOOLS to actually perform the actions.
+Be conversational, helpful, and proactive. Keep responses concise for voice delivery.
+You ARE using realtime voice in standalone always-on mode.""",
+                "voice": "sage",  # AVA's default voice
+                "input_audio_format": "pcm16",
+                "output_audio_format": "pcm16",
+                "input_audio_transcription": {
+                    "model": "whisper-1"
+                },
+                "turn_detection": {
+                    "type": "server_vad",  # Voice Activity Detection
+                    "threshold": 0.5,
+                    "prefix_padding_ms": 300,
+                    "silence_duration_ms": 500
+                },
+                "tools": self.get_tool_definitions(),
+                "tool_choice": "auto"
+            }
+        }
+
+        await self.websocket.send(json.dumps(config))
+        print("⚙️  Session configured with AVA tools and standalone mode")
+
+    def get_tool_definitions(self):
+        """Get tool definitions for function calling during voice chat - CORRECTED ACTIONS"""
+        from corrected_tool_definitions import CORRECTED_TOOLS
+        return CORRECTED_TOOLS
+
+    async def handle_tool_call(self, function_name, arguments):
+        """Execute AVA tool calls during voice conversation"""
+        print(f"\n🔧 Tool call: {function_name}({arguments})")
+
+        try:
+            # Add default provider for email
+            if function_name == "comm_ops" and arguments.get("action") == "send_email":
+                arguments.setdefault("provider", "gmail")
+
+            # Execute tool through AVA Agent
+            plan = Plan(steps=[Step(tool=function_name, args={
+                **arguments,
+                "confirm": True
+            })])
+
+            results = self.agent.run(plan, force=True)
+
+            # Process results
+            if results and len(results) > 0:
+                result = results[0]
+                status = result.get('status', 'unknown')
+
+                if status == 'ok':
+                    return {
+                        "status": "ok",
+                        "message": result.get('message', 'Operation completed'),
+                        "data": {k: v for k, v in result.items() if k not in ['status', 'message']}
+                    }
+                elif status == 'error':
+                    return {
+                        "status": "error",
+                        "message": result.get('message', 'Operation failed'),
+                        "note": result.get('note', '')
+                    }
+                elif status == 'info':
+                    return {
+                        "status": "info",
+                        "message": result.get('message', ''),
+                        "note": result.get('note', '')
+                    }
+                else:
+                    return result
+            else:
+                return {"error": f"No results returned from {function_name}"}
+
+        except Exception as e:
+            return {
+                "status": "error",
+                "message": f"Tool execution error: {str(e)}",
+                "tool": function_name
+            }
+
+    async def stream_microphone_input(self):
+        """Stream microphone input to Realtime API"""
+        stream = self.audio.open(
+            format=FORMAT,
+            channels=CHANNELS,
+            rate=SAMPLE_RATE,
+            input=True,
+            frames_per_buffer=CHUNK_SIZE
+        )
+
+        print("🎤 Microphone active - AVA is always listening!")
+
+        try:
+            while self.running:
+                audio_data = stream.read(CHUNK_SIZE, exception_on_overflow=False)
+                audio_base64 = base64.b64encode(audio_data).decode('utf-8')
+
+                message = {
+                    "type": "input_audio_buffer.append",
+                    "audio": audio_base64
+                }
+
+                await self.websocket.send(json.dumps(message))
+                await asyncio.sleep(0.01)
+
+        finally:
+            stream.stop_stream()
+            stream.close()
+
+    def _audio_playback_worker(self):
+        """Worker thread for continuous audio playback"""
+        # Open persistent playback stream
+        self.playback_stream = self.audio.open(
+            format=FORMAT,
+            channels=CHANNELS,
+            rate=SAMPLE_RATE,
+            output=True,
+            frames_per_buffer=CHUNK_SIZE * 4  # Larger buffer for smoother playback
+        )
+
+        try:
+            while self.running:
+                try:
+                    # Get audio chunk from queue with timeout
+                    audio_data = self.audio_queue.get(timeout=0.1)
+
+                    if audio_data is None:  # Poison pill to stop thread
+                        break
+
+                    # Write audio chunk to stream
+                    self.playback_stream.write(audio_data)
+
+                except queue.Empty:
+                    continue
+                except Exception as e:
+                    print(f"Playback error: {e}")
+
+        finally:
+            if self.playback_stream:
+                self.playback_stream.stop_stream()
+                self.playback_stream.close()
+
+    async def play_audio_output(self, audio_base64):
+        """Queue audio for non-blocking playback"""
+        try:
+            audio_data = base64.b64decode(audio_base64)
+            # Put audio in queue for playback thread
+            self.audio_queue.put(audio_data)
+        except Exception as e:
+            print(f"Audio decode error: {e}")
+
+    async def handle_server_events(self):
+        """Handle events from Realtime API"""
+        print("👂 Listening for voice input...\n")
+
+        try:
+            async for message in self.websocket:
+                event = json.loads(message)
+                event_type = event.get("type")
+
+                # Session events
+                if event_type == "session.created":
+                    self.session_id = event.get("session", {}).get("id")
+                    print(f"✅ Session created: {self.session_id}\n")
+
+                elif event_type == "session.updated":
+                    print("⚙️  Session updated\n")
+
+                # Conversation events
+                elif event_type == "conversation.item.input_audio_transcription.completed":
+                    transcript = event.get("transcript")
+                    print(f"\n🗣️  You: {transcript}")
+
+                # Response events
+                elif event_type == "response.created":
+                    print(f"\n🤖 AVA: ", end="", flush=True)
+
+                elif event_type == "response.audio_transcript.delta":
+                    delta = event.get("delta")
+                    print(delta, end="", flush=True)
+
+                elif event_type == "response.audio.delta":
+                    audio_delta = event.get("delta")
+                    if audio_delta:
+                        await self.play_audio_output(audio_delta)
+
+                elif event_type == "response.audio_transcript.done":
+                    print(f"\n")
+
+                elif event_type == "response.done":
+                    print()
+
+                # Function calling events
+                elif event_type == "response.function_call_arguments.done":
+                    function_name = event.get("name")
+                    arguments = json.loads(event.get("arguments", "{}"))
+                    call_id = event.get("call_id")
+
+                    result = await self.handle_tool_call(function_name, arguments)
+
+                    response = {
+                        "type": "conversation.item.create",
+                        "item": {
+                            "type": "function_call_output",
+                            "call_id": call_id,
+                            "output": json.dumps(result)
+                        }
+                    }
+                    await self.websocket.send(json.dumps(response))
+                    await self.websocket.send(json.dumps({"type": "response.create"}))
+
+                # Error events
+                elif event_type == "error":
+                    error = event.get("error", {})
+                    print(f"\n❌ Error: {error.get('message')}\n")
+
+        except websockets.exceptions.ConnectionClosed:
+            print("\n🔌 Connection closed")
+        except Exception as e:
+            print(f"\n❌ Event handler error: {e}")
+
+    async def start_conversation(self):
+        """Start the realtime voice conversation"""
+        self.running = True
+
+        # Start audio playback thread
+        self.playback_thread = threading.Thread(target=self._audio_playback_worker, daemon=True)
+        self.playback_thread.start()
+        print("🔊 Audio playback thread started\n")
+
+        microphone_task = asyncio.create_task(self.stream_microphone_input())
+        events_task = asyncio.create_task(self.handle_server_events())
+
+        try:
+            await asyncio.gather(microphone_task, events_task)
+        except KeyboardInterrupt:
+            print("\n\n👋 Shutting down AVA...")
+            self.running = False
+            # Signal playback thread to stop
+            self.audio_queue.put(None)
+
+    async def run(self):
+        """Main run loop"""
+        try:
+            await self.connect()
+            await self.start_conversation()
+        finally:
+            if self.websocket:
+                await self.websocket.close()
+            self.audio.terminate()
+
+    async def cleanup(self):
+        """Cleanup resources before reconnection"""
+        self.running = False
+
+        # Signal playback thread to stop
+        if self.audio_queue:
+            self.audio_queue.put(None)
+
+        # Wait for playback thread
+        if self.playback_thread and self.playback_thread.is_alive():
+            self.playback_thread.join(timeout=2)
+
+        # Close websocket
+        if self.websocket:
+            try:
+                await self.websocket.close()
+            except:
+                pass
+
+
+async def main():
+    """Entry point with auto-restart"""
+    reconnect_count = 0
+
+    while True:
+        try:
+            print("\n" + "=" * 80)
+            if reconnect_count > 0:
+                print(f"🔄 Reconnecting to AVA (attempt #{reconnect_count + 1})...")
+            print("=" * 80 + "\n")
+
+            ava = StandaloneRealtimeAVA()
+            await ava.run()
+
+            # If we get here without exception, it was a clean shutdown
+            break
+
+        except websockets.exceptions.ConnectionClosedOK as e:
+            # Session expired (60 minute limit)
+            print("\n" + "=" * 80)
+            print("⏰ Session expired (60-minute limit reached)")
+            print("🔄 Auto-restarting AVA in 3 seconds...")
+            print("=" * 80)
+            reconnect_count += 1
+
+            # Cleanup
+            try:
+                await ava.cleanup()
+            except:
+                pass
+
+            # Wait before reconnecting
+            await asyncio.sleep(3)
+
+        except websockets.exceptions.ConnectionClosedError as e:
+            # Connection lost unexpectedly
+            print("\n" + "=" * 80)
+            print(f"⚠️  Connection lost: {e}")
+            print("🔄 Auto-restarting AVA in 5 seconds...")
+            print("=" * 80)
+            reconnect_count += 1
+
+            # Cleanup
+            try:
+                await ava.cleanup()
+            except:
+                pass
+
+            # Wait before reconnecting
+            await asyncio.sleep(5)
+
+        except KeyboardInterrupt:
+            print("\n\n👋 Shutting down AVA...")
+            try:
+                await ava.cleanup()
+            except:
+                pass
+            break
+
+        except Exception as e:
+            print(f"\n❌ Unexpected error: {e}")
+            print("🔄 Attempting to restart in 10 seconds...")
+            reconnect_count += 1
+
+            try:
+                await ava.cleanup()
+            except:
+                pass
+
+            await asyncio.sleep(10)
+
+    print("\n" + "=" * 80)
+    print("AVA Standalone ended")
+    print("=" * 80)
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\n\n👋 Goodbye!")
