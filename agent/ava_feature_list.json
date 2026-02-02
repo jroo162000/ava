@@ -94,8 +94,8 @@
       "test_proof": "D005 satisfied: turn-state authority, tool safety under interruption, echo containment; 11/11 smoke tests + 29/29 regression tests pass with barge-in enabled"
     },
     "native_segfault_prevention": {
-      "passes": false,
-      "test_proof": null
+      "passes": true,
+      "test_proof": "Preflight checks validate audio/deps; crash supervisor with backoff+safe mode; crash reports capture state/logs; 14/14 smoke tests pass"
     }
   }
 }

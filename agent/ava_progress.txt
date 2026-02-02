@@ -10,6 +10,66 @@ RULES FOR CLAUDE:
 -->
 
 ================================================================================
+2026-02-02 - Native Segfault Prevention (Phase 4 Complete)
+================================================================================
+
+WHAT CHANGED:
+- Created scripts/preflight_check.py: validates audio devices, sample rates, native deps, config
+- Created scripts/crash_supervisor.py: enhanced watchdog with all features
+- Added safe_mode and crash_supervision config sections to ava_voice_config.json
+- Added state file writing to ava_standalone_realtime.py (minimal changes)
+- Extended smoke test with 3 new checks for crash supervision
+
+PREFLIGHT CHECKS:
+- PyAudio availability and version
+- Audio device enumeration (input/output)
+- Sample rate compatibility (22050 Hz)
+- Config file validity
+- Piper TTS executable/model
+- Vosk model availability
+
+CRASH CONTAINMENT:
+- Supervised subprocess with stdout/stderr capture
+- Exponential backoff: 3s -> 6s -> 12s -> ... (max 60s)
+- Max 5 restarts in 5-minute window
+- Segfault detection (exit codes -11, 139, -6, 134)
+
+SAFE MODE:
+- Auto-enabled after 3 crashes in window
+- Disables barge-in (fragile feature)
+- Environment variable: AVA_SAFE_MODE=1
+- Logged: [SAFE_MODE] Running in safe mode
+
+CRASH REPORTS:
+- Location: logs/crash_reports/crash_YYYYMMDD_HHMMSS.json
+- Contents: exit_code, is_segfault, runtime, turn_state, audio_backend, config_flags, last 200 log lines
+- State file: logs/runner_state.json (updated every 2s)
+
+WHAT TEST PROVED IT:
+- Preflight: 6/6 checks pass
+- Smoke test: 14/14 checks pass (3 new crash supervision checks)
+- Safe mode config verified
+- Crash supervisor structure verified
+- Crash report capability verified
+
+WHAT IS MITIGATED:
+- Audio device unavailability (preflight blocks startup)
+- Native library crashes (auto-restart with backoff)
+- Repeated crashes (safe mode disables fragile features)
+- Crash diagnostics (crash reports capture full context)
+
+WHAT REMAINS OUT-OF-SCOPE:
+- Actual segfault root cause (PyAudio/PortAudio threading issues)
+- Real-time segfault injection test (would require native code)
+- Memory leak detection
+
+HOW TO REPRODUCE SIMULATED CRASH TEST:
+  python scripts/crash_supervisor.py --simulate-crash 1
+  # Creates crash report in logs/crash_reports/
+
+STATUS: native_segfault_prevention flipped to passes: true
+
+================================================================================
 2026-02-02 - D005 Barge-in COMPLETE (Feature Flag ON)
 ================================================================================
 

@@ -1077,6 +1077,18 @@ class StandaloneRealtimeAVA:
         # Turn state machine for voice stabilization
         self._turn_state = TurnStateMachine(barge_in_enabled=self._barge_in_enabled)
 
+        # Safe mode support (set by crash supervisor)
+        self._safe_mode = os.environ.get('AVA_SAFE_MODE', '0') == '1'
+        if self._safe_mode:
+            print("[SAFE_MODE] Running in safe mode - fragile features disabled")
+            self._barge_in_enabled = False
+            self._turn_state.barge_in_enabled = False
+
+        # State file for crash supervisor (written on turn state changes)
+        self._state_file_path = Path(__file__).parent / 'logs' / 'runner_state.json'
+        self._state_file_path.parent.mkdir(parents=True, exist_ok=True)
+        self._write_runner_state()
+
         # Debug flags (hot‑reloadable via config)
         self.debug_agent = False
         self.debug_tools = False
@@ -2635,6 +2647,26 @@ class StandaloneRealtimeAVA:
             if not silent:
                 print(f"[cfg] Reload failed: {e}")
 
+    def _write_runner_state(self):
+        """Write current state to file for crash supervisor to read."""
+        try:
+            state = {
+                "timestamp": datetime.now().isoformat(),
+                "turn_state": self._turn_state.state if hasattr(self, '_turn_state') else "UNKNOWN",
+                "safe_mode": getattr(self, '_safe_mode', False),
+                "barge_in_enabled": getattr(self, '_barge_in_enabled', False),
+                "running": getattr(self, 'running', False),
+                "audio_backend": {
+                    "playback_rate": getattr(self, 'playback_rate', 22050),
+                    "input_device": getattr(self, 'input_device_index', None),
+                    "output_device": getattr(self, 'output_device_index', None),
+                },
+            }
+            with open(self._state_file_path, 'w') as f:
+                json.dump(state, f, indent=2, default=str)
+        except Exception:
+            pass  # Non-critical
+
     def _ensure_playback_thread(self):
         try:
             if not (self.playback_thread and self.playback_thread.is_alive()):
@@ -2683,6 +2715,11 @@ class StandaloneRealtimeAVA:
                         self.identity = self._load_identity()
                         self._identity_mtime = st.st_mtime
                         print(f"[identity] Reloaded {self.identity_path}")
+            except Exception:
+                pass
+            # Write state file for crash supervisor (every 2s)
+            try:
+                self._write_runner_state()
             except Exception:
                 pass
             time.sleep(2.0)

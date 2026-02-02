@@ -70,5 +70,23 @@
     "cancel_tts_on_interrupt": true,
     "cooldown_after_interrupt_ms": 1000,
     "comment": "D005: Barge-in disabled by default. When enabled, user can interrupt TTS with speech. Requires final transcript to trigger interrupt (not partials)."
+  },
+  "safe_mode": {
+    "enabled": false,
+    "disable_barge_in": true,
+    "disable_realtime_asr": false,
+    "fallback_tts_engine": "piper",
+    "comment": "Safe mode disables fragile features after repeated crashes. Auto-enabled by crash supervisor."
+  },
+  "crash_supervision": {
+    "enabled": true,
+    "max_restarts": 5,
+    "restart_window_sec": 300,
+    "initial_backoff_sec": 3,
+    "max_backoff_sec": 60,
+    "safe_mode_after_crashes": 3,
+    "crash_report_dir": "logs/crash_reports",
+    "state_file": "logs/runner_state.json",
+    "comment": "Supervisor settings for crash containment and recovery."
   }
 }
