@@ -1,10 +1,32 @@
 // Tools Routes - Dynamic tool discovery endpoints
 // Phase 3: All tool definitions come from Python worker
+// Phase 8: Idempotency support for tool execution
 import express from 'express';
 import logger from '../utils/logger.js';
 import toolsService from '../services/tools.js';
 
 const router = express.Router();
+
+// Get idempotency cache statistics
+router.get('/tools/idempotency/stats', async (_req, res) => {
+  try {
+    const stats = toolsService.getIdempotencyCacheStats();
+    res.json({ ok: true, stats });
+  } catch (error) {
+    res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
+// Clear idempotency cache (for testing/admin)
+router.post('/tools/idempotency/clear', async (_req, res) => {
+  try {
+    toolsService.clearIdempotencyCache();
+    logger.info('[tools] Idempotency cache cleared via API');
+    res.json({ ok: true, message: 'Idempotency cache cleared' });
+  } catch (error) {
+    res.status(500).json({ ok: false, error: error.message });
+  }
+});
 
 // List all available tools
 router.get('/tools', async (_req, res) => {
@@ -73,21 +95,27 @@ router.get('/tools/:name', async (req, res) => {
 });
 
 // Execute a tool
+// Phase 8: Supports bypassIdempotency for confirmed retries
 router.post('/tools/:name/execute', async (req, res) => {
   try {
     const { name } = req.params;
-    const { args = {}, dry_run = false } = req.body;
-    
+    const {
+      args = {},
+      dry_run = false,
+      bypassIdempotency = false,
+      source = 'api'
+    } = req.body;
+
     // Check if tool exists
     const tool = await toolsService.getTool(name);
     if (!tool) {
       return res.status(404).json({ ok: false, error: `Tool not found: ${name}` });
     }
-    
+
     // Check if confirmation required but not provided
     if (tool.requires_confirm && !req.body.confirmed) {
-      return res.status(403).json({ 
-        ok: false, 
+      return res.status(403).json({
+        ok: false,
         error: 'Tool requires confirmation',
         requires_confirm: true,
         tool: name,
@@ -95,9 +123,12 @@ router.post('/tools/:name/execute', async (req, res) => {
         hint: 'Add "confirmed": true to request body to proceed'
       });
     }
-    
-    logger.info('Executing tool', { name, args, dry_run });
-    const result = await toolsService.executeTool(name, args, dry_run);
+
+    logger.info('Executing tool', { name, args, dry_run, bypassIdempotency, source });
+    const result = await toolsService.executeTool(name, args, dry_run, {
+      bypassIdempotency,
+      source
+    });
     res.json(result);
   } catch (error) {
     logger.error('Tool execution failed', { name: req.params.name, error: error.message });

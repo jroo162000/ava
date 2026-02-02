@@ -67,8 +67,8 @@
       "test_proof": null
     },
     "idempotency_cache": {
-      "passes": false,
-      "test_proof": null
+      "passes": true,
+      "test_proof": "26 unit tests pass; smoke_test.py PASS; same tool+args within 60s TTL blocked"
     },
     "tool_routing": {
       "passes": true,

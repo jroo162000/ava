@@ -1,13 +1,150 @@
 // Tools Service - Dynamic tool discovery from Python worker
 // Phase 3: Node never manually updates tool defs - Python is the source of truth
 // Phase 7: Security validation before execution
+// Phase 8: Idempotency cache for tool execution boundary
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
+import crypto from 'crypto';
 import logger from '../utils/logger.js';
 import pythonWorker from './pythonWorker.js';
 import securityService from '../utils/security.js';
 import moltbookService from './moltbook.js';
+
+/**
+ * IdempotencyCache - Prevents duplicate tool execution within TTL window
+ *
+ * The execution boundary: All tool requests flow through this cache before execution.
+ * If a repeated command is detected within the TTL, execution is blocked and a
+ * confirmation prompt is returned.
+ */
+class IdempotencyCache {
+  constructor(ttlMs = 60000) {
+    this.cache = new Map(); // key -> { timestamp, toolName, args }
+    this.ttlMs = ttlMs;
+    this.volatileFields = new Set([
+      'timestamp', 'request_id', 'nonce', 'requestId',
+      'ts', 'time', 'date', 'uuid', 'random', 'session_id'
+    ]);
+  }
+
+  /**
+   * Normalize arguments for deterministic key generation
+   * - Sort object keys recursively
+   * - Trim whitespace from strings
+   * - Lowercase tool name and string args where safe
+   * - Remove volatile fields (timestamps, request_id, nonce, etc.)
+   */
+  normalizeArgs(args) {
+    if (args === null || args === undefined) {
+      return null;
+    }
+
+    if (typeof args !== 'object') {
+      // Lowercase strings, trim whitespace
+      if (typeof args === 'string') {
+        return args.trim().toLowerCase();
+      }
+      return args;
+    }
+
+    if (Array.isArray(args)) {
+      return args.map(item => this.normalizeArgs(item));
+    }
+
+    // Object: sort keys, filter volatile, recurse
+    const sortedKeys = Object.keys(args).sort();
+    const normalized = {};
+
+    for (const key of sortedKeys) {
+      // Skip volatile fields
+      if (this.volatileFields.has(key.toLowerCase())) {
+        continue;
+      }
+      normalized[key] = this.normalizeArgs(args[key]);
+    }
+
+    return normalized;
+  }
+
+  /**
+   * Generate deterministic cache key from tool name and normalized args
+   */
+  generateKey(toolName, args) {
+    const normalizedName = toolName.toLowerCase().trim();
+    const normalizedArgs = this.normalizeArgs(args);
+    const payload = JSON.stringify({ tool: normalizedName, args: normalizedArgs });
+    return crypto.createHash('sha256').update(payload).digest('hex').slice(0, 16);
+  }
+
+  /**
+   * Check if this tool+args combination was recently executed
+   * Returns: { blocked: boolean, entry?: object }
+   */
+  check(toolName, args) {
+    const now = Date.now();
+    const key = this.generateKey(toolName, args);
+    const entry = this.cache.get(key);
+
+    if (entry && (now - entry.timestamp) < this.ttlMs) {
+      return {
+        blocked: true,
+        entry,
+        key,
+        ageMs: now - entry.timestamp
+      };
+    }
+
+    return { blocked: false, key };
+  }
+
+  /**
+   * Record that a tool was executed
+   */
+  record(toolName, args, key = null) {
+    const cacheKey = key || this.generateKey(toolName, args);
+    this.cache.set(cacheKey, {
+      timestamp: Date.now(),
+      toolName,
+      args: this.normalizeArgs(args)
+    });
+
+    // Cleanup old entries periodically
+    this.cleanup();
+  }
+
+  /**
+   * Remove expired entries from cache
+   */
+  cleanup() {
+    const now = Date.now();
+    for (const [key, entry] of this.cache.entries()) {
+      if (now - entry.timestamp > this.ttlMs * 2) {
+        this.cache.delete(key);
+      }
+    }
+  }
+
+  /**
+   * Clear the entire cache (useful for testing)
+   */
+  clear() {
+    this.cache.clear();
+  }
+
+  /**
+   * Get cache statistics
+   */
+  stats() {
+    return {
+      size: this.cache.size,
+      ttlMs: this.ttlMs
+    };
+  }
+}
+
+// Global idempotency cache instance
+const idempotencyCache = new IdempotencyCache(60000); // 60 second TTL
 
 class ToolsService {
   constructor() {
@@ -387,82 +524,183 @@ class ToolsService {
   /**
    * Execute a tool via Python worker
    * Phase 7: Security validation before execution
+   * Phase 8: Idempotency check - blocks duplicate commands within TTL
+   *
+   * Options:
+   * - bypassIdempotency: boolean - Skip idempotency check (for confirmed retries)
    */
-  async executeTool(name, args, dryRun = false) {
+  async executeTool(name, args, dryRun = false, options = {}) {
+    const requestId = crypto.randomUUID();
+    const startTime = Date.now();
+
     try {
       // Get tool info for risk level
       const tool = await this.getTool(name);
       if (!tool) {
+        logger.info('[tools] Tool execution', {
+          requestId,
+          phase: 'decision',
+          tool: name,
+          args,
+          decision: 'blocked_policy',
+          reason: 'Tool not found'
+        });
         return { ok: false, error: `Tool not found: ${name}` };
+      }
+
+      // Phase 8: Idempotency check (skip if bypass flag set or dry_run)
+      if (!dryRun && !options.bypassIdempotency) {
+        const idempotencyCheck = idempotencyCache.check(name, args);
+
+        if (idempotencyCheck.blocked) {
+          const logEntry = {
+            timestamp: new Date().toISOString(),
+            requestId,
+            phase: 'decision',
+            tool: name,
+            args,
+            source: options.source || 'unknown',
+            decision: 'blocked_idempotency',
+            reason: `Duplicate command detected (${idempotencyCheck.ageMs}ms ago)`,
+            cacheKey: idempotencyCheck.key,
+            executionTimeMs: Date.now() - startTime,
+            result: 'blocked'
+          };
+
+          logger.info('[tools] Idempotency blocked', logEntry);
+
+          return {
+            ok: false,
+            error: 'I already did that recently. Do you want me to do it again?',
+            status: 'blocked',
+            reason: 'idempotency_blocked',
+            cacheKey: idempotencyCheck.key,
+            ageMs: idempotencyCheck.ageMs,
+            hint: 'Pass bypassIdempotency: true to retry'
+          };
+        }
       }
 
       // Phase 7: Security validation
       const securityCheck = securityService.validateToolExecution(
-        name, 
-        args || {}, 
+        name,
+        args || {},
         tool.risk_level
       );
 
       if (!securityCheck.allowed) {
-        logger.warn('[tools] Security check failed', { 
-          tool: name, 
-          issues: securityCheck.issues 
+        logger.warn('[tools] Security check failed', {
+          requestId,
+          tool: name,
+          issues: securityCheck.issues,
+          decision: 'blocked_policy'
         });
-        
+
         // Return specific error for each issue type
         const firstIssue = securityCheck.issues[0];
         if (firstIssue.type === 'confirmation_required') {
-          return { 
-            ok: false, 
+          return {
+            ok: false,
             error: firstIssue.message,
             status: 'denied',
             reason: 'confirmation_required'
           };
         }
         if (firstIssue.type === 'path_security') {
-          return { 
-            ok: false, 
+          return {
+            ok: false,
             error: firstIssue.message,
             status: 'denied',
             reason: 'path_blocked'
           };
         }
         if (firstIssue.type === 'dangerous_command') {
-          return { 
-            ok: false, 
+          return {
+            ok: false,
             error: firstIssue.message,
             status: 'denied',
             reason: 'dangerous_command'
           };
         }
-        
-        return { 
-          ok: false, 
+
+        return {
+          ok: false,
           error: securityCheck.issues.map(i => i.message).join('; '),
           status: 'denied',
           reason: 'security_violation'
         };
       }
 
+      // Log execution decision (approved)
+      logger.info('[tools] Tool execution approved', {
+        timestamp: new Date().toISOString(),
+        requestId,
+        phase: 'execution',
+        tool: name,
+        args,
+        source: options.source || 'unknown',
+        decision: 'approved'
+      });
+
+      let response;
+
       // Handle builtin tools in Node.js
       if (tool.source === 'builtin') {
-        return this.executeBuiltinTool(name, args, dryRun);
+        response = await this.executeBuiltinTool(name, args, dryRun);
+      } else {
+        // Execute Python tools via Python worker
+        response = await pythonWorker.sendCommand('execute_tool', {
+          name,
+          args,
+          dry_run: dryRun
+        }, 30000);
       }
 
-      // Execute Python tools via Python worker
-      const response = await pythonWorker.sendCommand('execute_tool', {
-        name,
-        args,
-        dry_run: dryRun
-      }, 30000);
-      
+      // Record successful execution in idempotency cache (only if not dry_run)
+      if (!dryRun && response?.ok !== false) {
+        idempotencyCache.record(name, args);
+      }
+
+      // Log execution result
+      logger.info('[tools] Tool execution completed', {
+        timestamp: new Date().toISOString(),
+        requestId,
+        phase: 'result',
+        tool: name,
+        decision: 'executed',
+        executionTimeMs: Date.now() - startTime,
+        result: response?.ok ? 'success' : 'failure'
+      });
+
       return response;
     } catch (e) {
-      logger.error('[tools] Tool execution failed', { name, error: e.message });
+      logger.error('[tools] Tool execution failed', {
+        requestId,
+        name,
+        error: e.message,
+        executionTimeMs: Date.now() - startTime
+      });
       return { ok: false, error: e.message };
     }
   }
+
+  /**
+   * Get idempotency cache statistics (for debugging/monitoring)
+   */
+  getIdempotencyCacheStats() {
+    return idempotencyCache.stats();
+  }
+
+  /**
+   * Clear idempotency cache (for testing)
+   */
+  clearIdempotencyCache() {
+    idempotencyCache.clear();
+  }
 }
+
+// Export IdempotencyCache for testing
+export { IdempotencyCache };
 
 const toolsService = new ToolsService();
 

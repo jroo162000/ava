@@ -25,6 +25,11 @@ PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
 CANONICAL_RUNNER = "ava_standalone_realtime.py"
 CONFIG_FILE = "ava_voice_config.json"
 
+# Node boundary layer path (ava-server in ava repo)
+# The canonical tool execution boundary is in the Node layer
+AVA_REPO_ROOT = os.path.join(os.path.dirname(PROJECT_ROOT), "ava")
+NODE_TOOLS_SERVICE = os.path.join(AVA_REPO_ROOT, "ava-server", "src", "services", "tools.js")
+
 results = []
 
 def check(name, passed, detail=""):
@@ -98,29 +103,66 @@ def check_final_only_gating():
 
 
 def check_idempotency():
-    """Verify idempotency cache exists for tool execution."""
-    runner_path = os.path.join(PROJECT_ROOT, CANONICAL_RUNNER)
-    if not os.path.exists(runner_path):
-        return check("Idempotency cache", False, f"{CANONICAL_RUNNER} not found")
+    """
+    Verify idempotency cache exists for tool execution.
 
-    with open(runner_path, 'r', encoding='utf-8') as f:
-        code = f.read()
+    Phase 8 Architecture: The canonical tool execution boundary is in the Node layer.
+    All tool execution flows through ava-server/src/services/tools.js which implements
+    the IdempotencyCache class.
 
-    # Look for idempotency patterns:
-    patterns = [
-        r'idempotency',
-        r'idempotent',
-        r'already.?executed',
-        r'duplicate.?command',
-        r'command.?cache',
-        r'seen.?commands',
-        r'request.?id',
-    ]
+    This check verifies:
+    1. Node boundary has IdempotencyCache class
+    2. executeTool method uses the cache
+    3. Proper blocked response message exists
+    """
+    # Primary check: Node boundary layer (the canonical execution boundary)
+    if os.path.exists(NODE_TOOLS_SERVICE):
+        with open(NODE_TOOLS_SERVICE, 'r', encoding='utf-8') as f:
+            node_code = f.read()
 
-    has_idempotency = any(re.search(p, code, re.IGNORECASE) for p in patterns)
+        # Required patterns for Node idempotency implementation
+        required_patterns = [
+            (r'class\s+IdempotencyCache', 'IdempotencyCache class'),
+            (r'idempotencyCache\.check', 'cache check call'),
+            (r'idempotencyCache\.record', 'cache record call'),
+            (r'idempotency_blocked', 'blocked reason'),
+            (r'already did that recently', 'user-facing blocked message'),
+        ]
 
-    return check("Idempotency cache", has_idempotency,
-                "No idempotency pattern found - repeated commands may execute twice")
+        missing = []
+        for pattern, name in required_patterns:
+            if not re.search(pattern, node_code, re.IGNORECASE):
+                missing.append(name)
+
+        if not missing:
+            return check("Idempotency cache (Node boundary)", True)
+        else:
+            return check("Idempotency cache (Node boundary)", False,
+                        f"Missing in tools.js: {', '.join(missing)}")
+    else:
+        # Fallback: check Python runner (legacy check)
+        runner_path = os.path.join(PROJECT_ROOT, CANONICAL_RUNNER)
+        if not os.path.exists(runner_path):
+            return check("Idempotency cache", False,
+                        f"Neither Node boundary ({NODE_TOOLS_SERVICE}) nor Python runner found")
+
+        with open(runner_path, 'r', encoding='utf-8') as f:
+            code = f.read()
+
+        # Look for idempotency patterns in Python (legacy):
+        patterns = [
+            r'idempotency',
+            r'idempotent',
+            r'already.?executed',
+            r'duplicate.?command',
+            r'command.?cache',
+            r'seen.?commands',
+        ]
+
+        has_idempotency = any(re.search(p, code, re.IGNORECASE) for p in patterns)
+
+        return check("Idempotency cache (legacy Python)", has_idempotency,
+                    "No idempotency pattern found in Python runner - check Node boundary")
 
 
 def check_no_loop_indicators():

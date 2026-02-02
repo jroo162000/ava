@@ -10,6 +10,35 @@ RULES FOR CLAUDE:
 -->
 
 ================================================================================
+2026-02-02 - Idempotency Cache Implemented
+================================================================================
+
+WHAT CHANGED:
+- Added IdempotencyCache class to ava-server/src/services/tools.js
+- Modified executeTool() to check cache before execution
+- Added /tools/idempotency/stats and /tools/idempotency/clear endpoints
+- Created 26 unit tests in ava-server/tests/idempotency.test.js
+- Updated smoke_test.py to detect Node boundary idempotency
+
+IMPLEMENTATION:
+- Key = SHA-256(normalized tool_name + args)
+- TTL: 60 seconds (configurable)
+- Normalization: sort keys, trim whitespace, lowercase, remove volatile fields
+- Blocked message: "I already did that recently. Do you want me to do it again?"
+- Log reason: idempotency_blocked
+
+WHAT TEST PROVED IT:
+- Unit tests: 26/26 passed
+- Smoke test: 4/4 passed (idempotency now PASS)
+- Tested: same tool+args within TTL blocked, after TTL allowed
+
+WHAT'S NEXT:
+- Smoke test passes - unblocked
+- Continue with remaining features:
+  - final_only_transcript_gating (phase_2_stability)
+  - node_gateway_boundary (phase_3_tool_execution)
+
+================================================================================
 2026-02-02 - Canonical Smoke Test Created
 ================================================================================
 
