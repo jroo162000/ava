@@ -2099,14 +2099,25 @@ class StandaloneRealtimeAVA:
         return synonyms.get(n, n)
 
     async def handle_tool_call(self, function_name, arguments):
-        """Execute AVA tool calls during voice conversation with self-healing"""
-        print(f"\n🔧 Tool call: {function_name}({arguments})")
-        
+        """Execute AVA tool calls through the Node boundary layer.
+
+        ARCHITECTURE: Python components NEVER execute tools directly.
+        All tool execution flows through the Node /tools/:name/execute endpoint
+        which handles:
+        - Idempotency (prevents duplicate commands within TTL)
+        - Security validation
+        - Logging with full audit trail
+        - Rate limiting
+
+        This method sends intent + metadata to Node; it does NOT execute tools.
+        """
+        print(f"\n[tool-boundary] Tool intent: {function_name}({arguments})")
+
         # Record attempt for accuracy monitoring
         if self.accuracy_monitor_enabled and self.accuracy_monitor:
             try:
                 self.accuracy_monitor.record_transcription(
-                    f"Tool: {function_name}", 
+                    f"Tool: {function_name}",
                     context=json.dumps(arguments)
                 )
             except Exception:
@@ -2117,63 +2128,81 @@ class StandaloneRealtimeAVA:
             if function_name == "comm_ops" and arguments.get("action") == "send_email":
                 arguments.setdefault("provider", "gmail")
 
-            # Execute tool through AVA Agent
-            plan = Plan(steps=[Step(tool=function_name, args={
-                **arguments,
-                "confirm": True
-            })])
+            # BOUNDARY ENFORCEMENT: Route through Node server
+            if not getattr(self, 'server_client', None):
+                return {
+                    "status": "error",
+                    "message": "Node boundary not available - server_client is None",
+                    "tool": function_name
+                }
 
-            results = self.agent.run(plan, force=True)
+            # Execute tool through Node boundary (single execution point)
+            result = self.server_client.execute_tool(
+                tool_name=function_name,
+                args=arguments,
+                confirmed=True,
+                source='voice_standalone'
+            )
 
-            # Process results
-            if results and len(results) > 0:
-                result = results[0]
-                status = result.get('status', 'unknown')
+            # Handle boundary response
+            if result is None:
+                return {
+                    "status": "error",
+                    "message": "No response from Node boundary",
+                    "tool": function_name
+                }
 
-                if status == 'ok':
-                    # Record success in session
-                    if self.session_manager_enabled and self.voice_session:
-                        self.voice_session.context.last_tool_used = function_name
-                    return {
-                        "status": "ok",
-                        "message": result.get('message', 'Operation completed'),
-                        "data": {k: v for k, v in result.items() if k not in ['status', 'message']}
-                    }
-                elif status == 'error':
-                    # NEW: Self-healing attempt
-                    error_msg = result.get('message', '')
-                    if self._should_attempt_heal(function_name, error_msg):
-                        heal_result = await self._attempt_self_heal(function_name, arguments, error_msg)
-                        if heal_result:
-                            return heal_result
-                    
-                    return {
-                        "status": "error",
-                        "message": error_msg,
-                        "note": result.get('note', '')
-                    }
-                elif status == 'info':
-                    return {
-                        "status": "info",
-                        "message": result.get('message', ''),
-                        "note": result.get('note', '')
-                    }
-                else:
-                    return result
-            else:
-                return {"error": f"No results returned from {function_name}"}
+            # Check for idempotency block
+            if result.get('reason') == 'idempotency_blocked':
+                return {
+                    "status": "blocked",
+                    "message": result.get('error', 'Command already executed recently'),
+                    "hint": "Say 'do it again' to retry"
+                }
+
+            # Process successful execution
+            if result.get('ok'):
+                # Record success in session
+                if self.session_manager_enabled and self.voice_session:
+                    self.voice_session.context.last_tool_used = function_name
+
+                # Extract result data
+                inner_result = result.get('result', result)
+                status = inner_result.get('status', 'ok') if isinstance(inner_result, dict) else 'ok'
+
+                return {
+                    "status": status,
+                    "message": inner_result.get('message', 'Operation completed') if isinstance(inner_result, dict) else str(inner_result),
+                    "data": {k: v for k, v in inner_result.items() if k not in ['status', 'message']} if isinstance(inner_result, dict) else {}
+                }
+
+            # Handle errors from boundary
+            error_msg = result.get('error', 'Unknown error from boundary')
+
+            # Self-healing attempt for recoverable errors
+            if self._should_attempt_heal(function_name, error_msg):
+                heal_result = await self._attempt_self_heal(function_name, arguments, error_msg)
+                if heal_result:
+                    return heal_result
+
+            return {
+                "status": "error",
+                "message": error_msg,
+                "reason": result.get('reason', 'unknown'),
+                "tool": function_name
+            }
 
         except Exception as e:
             error_str = str(e)
-            # NEW: Self-healing on exception
+            # Self-healing on exception
             if self._should_attempt_heal(function_name, error_str):
                 heal_result = await self._attempt_self_heal(function_name, arguments, error_str)
                 if heal_result:
                     return heal_result
-            
+
             return {
                 "status": "error",
-                "message": f"Tool execution error: {error_str}",
+                "message": f"Tool boundary error: {error_str}",
                 "tool": function_name
             }
 
@@ -2190,32 +2219,52 @@ class StandaloneRealtimeAVA:
         return any(x in error_msg.lower() for x in healable)
 
     async def _attempt_self_heal(self, function_name: str, arguments: dict, error_msg: str) -> dict:
-        """Attempt to self-heal a tool failure"""
+        """Attempt to self-heal a tool failure through the Node boundary.
+
+        ARCHITECTURE: Even self-healing retries go through the Node boundary.
+        We use bypass_idempotency=True since these are intentional retries.
+        """
         try:
             print(f"[self-heal] Attempting to heal {function_name} failure: {error_msg[:100]}")
-            
+
+            if not getattr(self, 'server_client', None):
+                print("[self-heal] Node boundary not available")
+                return None
+
             # Strategy 1: Retry with modified arguments for common issues
             if 'camera' in function_name.lower() and 'index' in error_msg.lower():
                 # Try camera index 1 if 0 failed
                 new_args = {**arguments, 'camera_index': 1}
-                print(f"[self-heal] Retrying camera with index 1")
-                plan = Plan(steps=[Step(tool=function_name, args={**new_args, "confirm": True})])
-                results = self.agent.run(plan, force=True)
-                if results and results[0].get('status') == 'ok':
-                    return {"status": "ok", "message": "Camera operation succeeded after retry", "data": results[0]}
-            
+                print(f"[self-heal] Retrying camera with index 1 via Node boundary")
+                result = self.server_client.execute_tool(
+                    tool_name=function_name,
+                    args=new_args,
+                    confirmed=True,
+                    bypass_idempotency=True,  # Intentional retry
+                    source='voice_self_heal'
+                )
+                if result and result.get('ok'):
+                    inner = result.get('result', {})
+                    return {"status": "ok", "message": "Camera operation succeeded after retry", "data": inner}
+
             # Strategy 2: Retry with simplified args
             if len(arguments) > 2:
                 minimal_args = {'action': arguments.get('action', 'list')}
                 if 'path' in arguments:
                     minimal_args['path'] = arguments['path']
-                print(f"[self-heal] Retrying with minimal args: {minimal_args}")
-                plan = Plan(steps=[Step(tool=function_name, args={**minimal_args, "confirm": True})])
-                results = self.agent.run(plan, force=True)
-                if results and results[0].get('status') == 'ok':
-                    return {"status": "ok", "message": "Operation succeeded with simplified parameters", "data": results[0]}
-            
-            # Strategy 3: Check if tool exists via self-diagnosis
+                print(f"[self-heal] Retrying with minimal args via Node boundary: {minimal_args}")
+                result = self.server_client.execute_tool(
+                    tool_name=function_name,
+                    args=minimal_args,
+                    confirmed=True,
+                    bypass_idempotency=True,  # Intentional retry
+                    source='voice_self_heal'
+                )
+                if result and result.get('ok'):
+                    inner = result.get('result', {})
+                    return {"status": "ok", "message": "Operation succeeded with simplified parameters", "data": inner}
+
+            # Strategy 3: Check if tool exists via self-diagnosis (read-only, no tool execution)
             if SELF_MOD_AVAILABLE and hasattr(self, 'self_mod_enabled') and self.self_mod_enabled:
                 try:
                     from ava_self_modification import diagnose_error
@@ -2224,7 +2273,7 @@ class StandaloneRealtimeAVA:
                         print(f"[self-heal] Self-modification suggests: {diag.get('suggestion')}")
                 except Exception:
                     pass
-            
+
             return None  # Healing failed
         except Exception as e:
             print(f"[self-heal] Healing attempt failed: {e}")

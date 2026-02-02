@@ -55,3 +55,49 @@ class AvaServerClient:
       payload['confirm_token'] = confirm_token
     return self._post('/self/doctor', payload)
 
+  def execute_tool(self, tool_name: str, args: dict, confirmed: bool = True,
+                   bypass_idempotency: bool = False, source: str = 'python_client'):
+    """
+    Execute a tool through the Node boundary layer.
+
+    This is the ONLY sanctioned way for Python code to execute tools.
+    All tool execution flows through the Node /tools/:name/execute endpoint
+    which handles idempotency, security validation, and logging.
+
+    Args:
+      tool_name: Name of the tool to execute
+      args: Tool arguments dictionary
+      confirmed: Whether to confirm high-risk tools (default True)
+      bypass_idempotency: Skip idempotency check for intentional retries
+      source: Identifier for logging (default 'python_client')
+
+    Returns:
+      dict: Tool execution result from Node boundary
+    """
+    payload = {
+      'args': args,
+      'confirmed': confirmed,
+      'bypassIdempotency': bypass_idempotency,
+      'source': source
+    }
+    # Use longer timeout for tool execution (30 seconds)
+    url = f"{self.base}/tools/{tool_name}/execute"
+    try:
+      data = json.dumps(payload).encode('utf-8')
+      req = urllib.request.Request(url=url, data=data, headers=self._headers(), method='POST')
+      with urllib.request.urlopen(req, timeout=30.0) as resp:
+        raw = resp.read()
+        return json.loads(raw.decode('utf-8', errors='ignore'))
+    except urllib.error.HTTPError as e:
+      try:
+        body = e.read().decode('utf-8', errors='ignore')
+        return json.loads(body)
+      except Exception:
+        return {'ok': False, 'error': f'HTTP {e.code}: {str(e)}'}
+    except Exception as e:
+      return {'ok': False, 'error': str(e)}
+
+  def list_tools(self):
+    """Get list of available tools from Node boundary."""
+    return self._get('/tools')
+

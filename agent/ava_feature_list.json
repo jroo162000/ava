@@ -67,8 +67,8 @@
 
   "phase_3_tool_execution": {
     "node_gateway_boundary": {
-      "passes": false,
-      "test_proof": null
+      "passes": true,
+      "test_proof": "Python sends text+metadata only; Node /tools/:name/execute is single gateway; no direct cmpuse Agent execution in production code"
     },
     "idempotency_cache": {
       "passes": true,

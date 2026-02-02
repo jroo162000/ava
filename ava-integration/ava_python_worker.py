@@ -341,15 +341,38 @@ def get_tool_definitions() -> List[Dict[str, Any]]:
     return tools
 
 
+# ==========================================================================
+# TOOL EXECUTION BOUNDARY ARCHITECTURE
+# ==========================================================================
+#
+# The EXECUTION BOUNDARY is the Node layer (ava-server/src/services/tools.js).
+# All tool execution DECISIONS are made in Node, which handles:
+#   - Idempotency checking
+#   - Security validation
+#   - Audit logging
+#
+# The Python worker provides tool RUNTIME for Python-based tools.
+# Node calls execute_tool AFTER making the execution decision.
+#
+# IMPORTANT: Python components (voice runner, bridge, etc.) must NEVER call
+# execute_tool directly - they must route through Node /tools/:name/execute.
+# The execute_tool command here is an internal implementation detail called
+# ONLY by the Node boundary layer after it has validated the request.
+# ==========================================================================
+
 def execute_tool(name: str, args: Dict[str, Any], dry_run: bool = False) -> Dict[str, Any]:
-    """Execute a tool by name with given arguments"""
+    """Execute a tool by name with given arguments.
+
+    INTERNAL: This is called by Node boundary layer AFTER validation.
+    Python components must NOT call this directly - use Node /tools/:name/execute.
+    """
     if not CMPUSE_AVAILABLE:
         return {'status': 'error', 'message': f'cmp-use not available: {CMPUSE_ERROR}'}
-    
+
     tool = tool_registry.get_tool(name)
     if not tool:
         return {'status': 'error', 'message': f'Tool not found: {name}'}
-    
+
     try:
         result = tool.run(args, dry_run)
         return result
@@ -390,6 +413,8 @@ def handle_command(cmd_data: dict) -> dict:
             return {"ok": True, "tool": tool_def}
         
         elif cmd == "execute_tool":
+            # INTERNAL: Called by Node boundary layer after validation
+            # Python components must NOT call this directly
             name = cmd_data.get("name", "")
             args = cmd_data.get("args", {})
             dry_run = cmd_data.get("dry_run", False)

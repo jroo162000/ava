@@ -10,6 +10,33 @@ RULES FOR CLAUDE:
 -->
 
 ================================================================================
+2026-02-02 - Node Tool Execution Boundary Enforced
+================================================================================
+
+WHAT CHANGED:
+- Refactored ava_standalone_realtime.py handle_tool_call() to use Node boundary
+- Refactored ava_bridge.py /tool endpoint to proxy to Node /tools/:name/execute
+- Added execute_tool() method to ava_server_client.py
+- Removed direct cmpuse Agent tool execution from Python
+- Created TOOL_BOUNDARY_ARCHITECTURE.md documenting the pattern
+
+ARCHITECTURE:
+- Python components are now INTENT PRODUCERS only (text + metadata)
+- Node boundary is the SINGLE EXECUTION GATEWAY
+- Idempotency check happens at Node boundary (already implemented)
+- Python worker provides tool runtime but only called by Node after validation
+
+WHAT TEST PROVED IT:
+- Smoke test: 4/4 PASS (unchanged)
+- Repo scan: no alternate tool-dispatch paths in production code
+- All tool execution flows through Node /tools/:name/execute
+
+WHAT'S NEXT:
+- Smoke test green - steady progress mode
+- Continue with remaining features:
+  - final_only_transcript_gating (phase_2_stability)
+
+================================================================================
 2026-02-02 - Repo Curation: Archive Duplicate Runners
 ================================================================================
 

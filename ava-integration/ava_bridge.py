@@ -300,11 +300,28 @@ def set_clipboard(req: ClipboardRequest, authorization: Optional[str] = Header(N
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# ========== CMPUSE Tool Execution ==========
+# ========== Tool Execution (DEPRECATED - Use Node Boundary) ==========
+#
+# ARCHITECTURE CHANGE: Tool execution is now handled ONLY by the Node boundary layer.
+# The /tool endpoint now proxies to Node /tools/:name/execute instead of executing directly.
+# This ensures idempotency, security validation, and audit logging are applied consistently.
+#
+
+# Node boundary URL (ava-server)
+NODE_BOUNDARY_URL = os.environ.get("AVA_SERVER_URL", "http://127.0.0.1:5051")
 
 @app.post("/tool")
 def execute_tool(req: ToolRequest, authorization: Optional[str] = Header(None), x_ava_token: Optional[str] = Header(None)):
-    """Execute a CMPUSE tool directly (always return structured JSON; no 500)."""
+    """Proxy tool execution to Node boundary layer.
+
+    ARCHITECTURE: Python components NEVER execute tools directly.
+    This endpoint proxies to Node /tools/:name/execute which handles:
+    - Idempotency (prevents duplicate commands within TTL)
+    - Security validation
+    - Logging with full audit trail
+
+    This is a DEPRECATED endpoint - prefer calling Node directly.
+    """
     auth_check(authorization, x_ava_token)
 
     tool_name = (req.tool or '').strip()
@@ -314,70 +331,53 @@ def execute_tool(req: ToolRequest, authorization: Optional[str] = Header(None), 
         return {"ok": False, "error": "tool name is required", "status": "error"}
 
     try:
-        # Add cmpuse to path if not already
-        cmpuse_path = Path.home() / "cmp-use"
-        if str(cmpuse_path) not in sys.path:
-            sys.path.insert(0, str(cmpuse_path))
+        import urllib.request
+        import urllib.error
 
-        # Load secrets/API keys
-        from cmpuse.secrets import load_into_env
-        load_into_env()
+        # Proxy to Node boundary
+        node_url = f"{NODE_BOUNDARY_URL.rstrip('/')}/tools/{tool_name}/execute"
+        payload = json.dumps({
+            "args": args,
+            "confirmed": True,
+            "source": "bridge_proxy"
+        }).encode('utf-8')
 
-        # Import tools to register them
-        import cmpuse.tools  # noqa: F401
+        headers = {'Content-Type': 'application/json'}
+        if authorization:
+            headers['Authorization'] = authorization
 
-        # Import and execute the tool
-        from cmpuse.agent_core import Agent, Plan, Step
-        from cmpuse.config import Config
+        print(f"[bridge] Proxying tool to Node boundary: {tool_name} -> {node_url}")
 
-        # Create agent instance
-        config = Config.from_env()
-        agent = Agent(config)
-        print(f"[bridge] Executing tool: {tool_name} with args: {args}")
+        req_obj = urllib.request.Request(url=node_url, data=payload, headers=headers, method='POST')
+        with urllib.request.urlopen(req_obj, timeout=30.0) as resp:
+            result = json.loads(resp.read().decode('utf-8', errors='ignore'))
 
-        # Build and execute plan
-        plan = Plan(steps=[Step(tool=tool_name, args={**args, "confirm": True})])
-        results = agent.run(plan, force=True)
+        # Pass through Node response
+        return result
 
-        if results and len(results) > 0:
-            result = results[0]
-            return {
-                "ok": True,
-                "tool": tool_name,
-                "status": result.get("status", "unknown"),
-                "message": result.get("message", ""),
-                "data": {k: v for k, v in result.items() if k not in ["status", "message"]}
-            }
-        else:
-            return {"ok": False, "tool": tool_name, "status": "error", "error": "No result returned"}
-
-    except ImportError as e:
-        import traceback
-        traceback.print_exc()
-        return {"ok": False, "tool": tool_name, "status": "error", "error": f"CMPUSE not available: {e}"}
+    except urllib.error.HTTPError as e:
+        try:
+            body = e.read().decode('utf-8', errors='ignore')
+            return json.loads(body)
+        except Exception:
+            return {"ok": False, "tool": tool_name, "status": "error", "error": f"Node boundary HTTP {e.code}"}
+    except urllib.error.URLError as e:
+        return {"ok": False, "tool": tool_name, "status": "error", "error": f"Node boundary unavailable: {e.reason}"}
     except Exception as e:
         import traceback
         traceback.print_exc()
-        # Always return structured JSON instead of 500
         return {"ok": False, "tool": tool_name, "status": "error", "error": str(e)}
 
 
 # ========== WebSocket Event Stream for Computer Use ==========
+# ARCHITECTURE: WebSocket now proxies to Node boundary for tool execution
 @app.websocket("/computer_use/ws")
 async def computer_use_ws(ws: WebSocket):
     await ws.accept()
     await ws.send_json({"event": "ready", "ts": int(time.time()*1000)})
     try:
-        # Prepare environment (tools registration)
-        cmpuse_path = Path.home() / "cmp-use"
-        if str(cmpuse_path) not in sys.path:
-            sys.path.insert(0, str(cmpuse_path))
-        from cmpuse.secrets import load_into_env
-        load_into_env()
-        import cmpuse.tools  # noqa: F401
-        from cmpuse.agent_core import Agent, Plan, Step
-        from cmpuse.config import Config
-        agent = Agent(Config.from_env())
+        import urllib.request
+        import urllib.error
 
         while True:
             msg = await ws.receive_json()
@@ -386,9 +386,24 @@ async def computer_use_ws(ws: WebSocket):
             args = msg.get('args') or {}
             await ws.send_json({"event": "started", "tool": tool, "args": args, "ts": int(time.time()*1000)})
             try:
-                plan = Plan(steps=[Step(tool=tool, args={**args, 'confirm': True})])
-                results = agent.run(plan, force=True)
-                res = results[0] if results else {"status": "error", "message": "no_result"}
+                # Proxy to Node boundary instead of executing directly
+                node_url = f"{NODE_BOUNDARY_URL.rstrip('/')}/tools/{tool}/execute"
+                payload = json.dumps({
+                    "args": {**args, 'confirm': True},
+                    "confirmed": True,
+                    "source": "bridge_ws_proxy"
+                }).encode('utf-8')
+
+                req_obj = urllib.request.Request(
+                    url=node_url,
+                    data=payload,
+                    headers={'Content-Type': 'application/json'},
+                    method='POST'
+                )
+                with urllib.request.urlopen(req_obj, timeout=30.0) as resp:
+                    result = json.loads(resp.read().decode('utf-8', errors='ignore'))
+
+                res = result.get('result', result) if result.get('ok') else {"status": "error", "message": result.get('error', 'unknown')}
                 await ws.send_json({"event": "result", "tool": tool, "result": res, "ts": int(time.time()*1000)})
             except Exception as e:
                 await ws.send_json({"event": "error", "tool": tool, "error": str(e), "ts": int(time.time()*1000)})
