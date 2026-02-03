@@ -790,6 +790,59 @@ def check_voice_provider_construction():
                     f"{type(e).__name__}: {e}")
 
 
+def check_validation_mode_config():
+    """
+    Verify validation mode configuration exists and has required fields.
+    Also verify the runner has validation mode enforcement code.
+    """
+    config_path = os.path.join(PROJECT_ROOT, CONFIG_FILE)
+    runner_path = os.path.join(PROJECT_ROOT, CANONICAL_RUNNER)
+
+    if not os.path.exists(config_path):
+        return check("Validation mode config", False, f"{CONFIG_FILE} not found")
+
+    try:
+        with open(config_path, 'r') as f:
+            config = json.load(f)
+
+        val_cfg = config.get('validation_mode', {})
+
+        # Check required fields
+        required = ['enabled', 'wake_words', 'min_words_without_wake', 'blocked_tools']
+        missing = [f for f in required if f not in val_cfg]
+
+        if missing:
+            return check("Validation mode config", False,
+                        f"Missing fields: {', '.join(missing)}")
+
+        # Check runner has validation mode enforcement
+        if not os.path.exists(runner_path):
+            return check("Validation mode config", False,
+                        f"{CANONICAL_RUNNER} not found")
+
+        with open(runner_path, 'r', encoding='utf-8') as f:
+            code = f.read()
+
+        enforcement_patterns = [
+            r'_validation_mode',
+            r'VALIDATION_MODE',
+            r'wake_words',
+            r'validation-mode.*Ignoring',
+            r'validation-mode.*BLOCKED',
+        ]
+
+        found = sum(1 for p in enforcement_patterns if re.search(p, code))
+
+        if found >= 4:
+            return check("Validation mode config", True)
+        else:
+            return check("Validation mode config", False,
+                        f"Runner missing validation mode enforcement ({found}/5 patterns)")
+
+    except Exception as e:
+        return check("Validation mode config", False, f"Error: {e}")
+
+
 def main():
     print("=" * 70)
     print("AVA CANONICAL SMOKE TEST + VOICE INVARIANT PREFLIGHT")
@@ -823,6 +876,9 @@ def main():
 
     print("\n[VOICE PROVIDER CHECKS]")
     check_voice_provider_construction()
+
+    print("\n[VALIDATION MODE CHECKS]")
+    check_validation_mode_config()
 
     print("-" * 70)
     passed = sum(1 for _, p in results if p)

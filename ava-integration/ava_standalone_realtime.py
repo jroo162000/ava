@@ -1085,6 +1085,31 @@ class StandaloneRealtimeAVA:
             self._barge_in_enabled = False
             self._turn_state.barge_in_enabled = False
 
+        # Validation mode support (for human testing without autonomy chaos)
+        self._validation_mode = os.environ.get('VALIDATION_MODE', '0') == '1'
+        val_cfg = self.cfg.get('validation_mode', {})
+        if val_cfg.get('enabled', False):
+            self._validation_mode = True
+        if self._validation_mode:
+            print("[VALIDATION_MODE] Running in validation mode - wake word required")
+            # Force half-duplex (no barge-in)
+            if val_cfg.get('force_half_duplex', True):
+                self._barge_in_enabled = False
+                self._turn_state.barge_in_enabled = False
+            # Load wake words
+            self._wake_words = [w.lower() for w in val_cfg.get('wake_words', ['ava', 'eva', 'hey ava'])]
+            self._min_words_without_wake = val_cfg.get('min_words_without_wake', 3)
+            self._blocked_tools = set(val_cfg.get('blocked_tools', ['camera_ops']))
+            self._require_wake_for_tools = val_cfg.get('require_wake_for_tools', True)
+            print(f"  Wake words: {self._wake_words}")
+            print(f"  Min words without wake: {self._min_words_without_wake}")
+            print(f"  Blocked tools: {self._blocked_tools}")
+        else:
+            self._wake_words = []
+            self._min_words_without_wake = 0
+            self._blocked_tools = set()
+            self._require_wake_for_tools = False
+
         # State file for crash supervisor (written on turn state changes)
         self._state_file_path = Path(__file__).parent / 'logs' / 'runner_state.json'
         self._state_file_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1265,10 +1290,13 @@ class StandaloneRealtimeAVA:
             except Exception as e:
                 print(f"[hotkeys] init failed: {e}")
 
-        # Passive learning system
+        # Passive learning system (disabled in validation mode)
         self.passive_learning = None
         self.passive_learning_enabled = False
-        if PASSIVE_LEARNING_AVAILABLE:
+        val_cfg = self.cfg.get('validation_mode', {})
+        if self._validation_mode and val_cfg.get('disable_passive_learning', True):
+            print("[passive-learning] Passive learning DISABLED (validation mode)")
+        elif PASSIVE_LEARNING_AVAILABLE:
             try:
                 self.passive_learning = get_passive_learning()
                 start_passive_learning()
@@ -1357,10 +1385,13 @@ class StandaloneRealtimeAVA:
         else:
             print("[intent] Intent router NOT available")
 
-        # NEW: Proactive mode
+        # NEW: Proactive mode (disabled in validation mode)
         self.proactive_manager = None
         self.proactive_enabled = False
-        if PASSIVE_LEARNING_AVAILABLE:
+        val_cfg = self.cfg.get('validation_mode', {})
+        if self._validation_mode and val_cfg.get('disable_proactive', True):
+            print("[proactive] Proactive assistance DISABLED (validation mode)")
+        elif PASSIVE_LEARNING_AVAILABLE:
             try:
                 from ava_passive_learning import ProactiveManager
                 self.proactive_manager = ProactiveManager()
@@ -1438,6 +1469,19 @@ class StandaloneRealtimeAVA:
             if self._tts_ended_at and (time.time() - self._tts_ended_at) < grace_period:
                 print(f"[echo-gate] Ignoring ASR final in grace period: {txt[:30]}...")
                 return
+
+            # VALIDATION MODE: Filter transcripts by wake word and minimum words
+            if self._validation_mode:
+                txt_lower = txt.lower().strip()
+                has_wake_word = any(txt_lower.startswith(w) or f" {w}" in txt_lower for w in self._wake_words)
+                word_count = len(txt.split())
+
+                if not has_wake_word:
+                    if word_count < self._min_words_without_wake:
+                        print(f"[validation-mode] Ignoring short transcript without wake word: '{txt}' ({word_count} words)")
+                        return
+                    # Even longer transcripts need wake word for tool actions
+                    print(f"[validation-mode] No wake word detected, will skip tool execution: '{txt[:30]}...'")
 
             # TURN STATE: Final transcript from unified voice session
             print(f"[FINAL -> DECIDE] '{txt[:40]}...'")
@@ -2345,6 +2389,27 @@ class StandaloneRealtimeAVA:
 
         This method sends intent + metadata to Node; it does NOT execute tools.
         """
+        # VALIDATION MODE: Block certain tools without wake word
+        if self._validation_mode:
+            if function_name in self._blocked_tools:
+                print(f"[validation-mode] BLOCKED tool '{function_name}' - not allowed in validation mode")
+                return {
+                    "status": "blocked",
+                    "message": f"Tool '{function_name}' is blocked in validation mode",
+                    "tool": function_name
+                }
+            # If require_wake_for_tools, check last transcript had wake word
+            if self._require_wake_for_tools:
+                last_txt = getattr(self, '_last_user_transcript', '').lower()
+                has_wake = any(last_txt.startswith(w) or f" {w}" in last_txt for w in self._wake_words)
+                if not has_wake:
+                    print(f"[validation-mode] Tool '{function_name}' requires wake word - skipping")
+                    return {
+                        "status": "blocked",
+                        "message": f"Tool '{function_name}' requires wake word in validation mode",
+                        "tool": function_name
+                    }
+
         print(f"\n[tool-boundary] Tool intent: {function_name}({arguments})")
 
         # Record attempt for accuracy monitoring
@@ -3168,6 +3233,10 @@ class StandaloneRealtimeAVA:
             return
         speak_text = self._prepare_tts_text(text)
         if not speak_text:
+            return
+        # SPEAK->SPEAK PREVENTION: Drop new speak calls if already speaking
+        if self.tts_active.is_set():
+            print(f"[speak-guard] Dropping speak call - already speaking: '{speak_text[:30]}...'")
             return
         # HALF-DUPLEX: Mute mic while speaking (set tts_active flag)
         # Mic loop checks this flag and suppresses audio input during TTS

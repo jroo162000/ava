@@ -92,5 +92,16 @@
     "crash_report_dir": "logs/crash_reports",
     "state_file": "logs/runner_state.json",
     "comment": "Supervisor settings for crash containment and recovery."
+  },
+  "validation_mode": {
+    "enabled": false,
+    "wake_words": ["ava", "eva", "hey ava", "hey eva", "ok ava"],
+    "min_words_without_wake": 3,
+    "blocked_tools": ["camera_ops", "proactive_suggest"],
+    "force_half_duplex": true,
+    "disable_proactive": true,
+    "disable_passive_learning": true,
+    "require_wake_for_tools": true,
+    "comment": "Validation mode for human testing - requires wake word, disables autonomy."
   }
 }
