@@ -747,6 +747,49 @@ os._exit(1)
     return check("Crash report simulation", True)
 
 
+def check_voice_provider_construction():
+    """
+    Verify LocalHybridProvider can be constructed and started.
+
+    This catches import wiring errors where the provider imports
+    from the wrong module (e.g., .hybrid_asr vs ava_hybrid_asr).
+    """
+    try:
+        # Add project root to path for voice module resolution
+        import sys
+        if PROJECT_ROOT not in sys.path:
+            sys.path.insert(0, PROJECT_ROOT)
+
+        # Import the same way the canonical runner does
+        from voice.bus import EventBus
+        from voice.providers.local_hybrid import LocalHybridProvider, _HYBRID_AVAILABLE
+
+        if not _HYBRID_AVAILABLE:
+            return check("Voice provider construction", False,
+                        "_HYBRID_AVAILABLE is False - HybridASREngine import failed")
+
+        # Construct provider with bus (same pattern as runner)
+        bus = EventBus()
+        provider = LocalHybridProvider(bus, whisper_model='small')
+
+        # Verify it can start (this loads Vosk/Whisper)
+        # Note: We don't actually start because it prints Unicode chars
+        # that may fail on non-UTF8 consoles. Construction is enough.
+
+        return check("Voice provider construction", True)
+
+    except TypeError as e:
+        # This catches the original bug: missing 'bus' argument
+        return check("Voice provider construction", False,
+                    f"TypeError: {e}")
+    except ImportError as e:
+        return check("Voice provider construction", False,
+                    f"ImportError: {e}")
+    except Exception as e:
+        return check("Voice provider construction", False,
+                    f"{type(e).__name__}: {e}")
+
+
 def main():
     print("=" * 70)
     print("AVA CANONICAL SMOKE TEST + VOICE INVARIANT PREFLIGHT")
@@ -777,6 +820,9 @@ def main():
     check_safe_mode_config()
     check_crash_supervisor_exists()
     check_crash_report_simulation()
+
+    print("\n[VOICE PROVIDER CHECKS]")
+    check_voice_provider_construction()
 
     print("-" * 70)
     passed = sum(1 for _, p in results if p)

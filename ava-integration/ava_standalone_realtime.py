@@ -35,8 +35,9 @@ try:
     from voice.tts.edge_stream import EdgeStreamTTS as _EdgeStreamTTS
     from voice.tts.piper_bin import PiperBinTTS as _PiperBinTTS
     _VOICE_SCAFFOLD_AVAILABLE = True
-except Exception:
+except Exception as e:
     _VOICE_SCAFFOLD_AVAILABLE = False
+    print(f"[warning] Unified voice scaffold not available: {type(e).__name__}: {e}")
 import random
 
 # Set UTF-8 encoding for Windows console
