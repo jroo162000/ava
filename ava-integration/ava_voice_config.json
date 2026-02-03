@@ -4,7 +4,11 @@
   "audio": {
     "playback_rate": 22050,
     "output_device": null,
-    "input_device": null
+    "input_device": 17,
+    "input_device_name": "Microphone (3- iTalk-02)",
+    "input_backend": "wasapi",
+    "input_sample_rate": 44100,
+    "input_channels": 1
   },
   "vad": {
     "start_rms": 300,
