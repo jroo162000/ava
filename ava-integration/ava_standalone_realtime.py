@@ -202,6 +202,10 @@ os.environ['CMPUSE_DRY_RUN'] = '0'
 os.environ['CMPUSE_ALLOW_NETWORK'] = '1'
 os.environ['CMPUSE_PATH_WHITELIST'] = "C:\\"
 
+# Disable autonomy when voice mode is active (D002: voice = intent producer only)
+os.environ['DISABLE_AUTONOMY'] = '1'
+print("[autonomy] disabled (voice mode) — DISABLE_AUTONOMY=1 set")
+
 # Audio configuration
 MIC_RATE = 16000           # Mic capture rate - MUST be 16kHz for Deepgram Agent
 PLAYBACK_RATE = 24000      # TTS playback target
@@ -264,9 +268,9 @@ class TurnStateMachine:
     Logs all state transitions in format: [turn-state] PREV -> NEW
     Validates that only one turn is active at any time.
 
-    D005 Barge-in Support:
-    When barge_in_enabled=True, allows SPEAK -> LISTEN transition for interrupts.
-    This is gated by D005 prerequisites (final-only, idempotency, echo protection).
+    HARD LOCK: While in SPEAK state, NO transitions are allowed except SPEAK -> IDLE
+    via force_idle(). This prevents SPEAK->LISTEN/FINAL/DECIDE errors entirely.
+    Barge-in is disabled until stability is proven (reintroduce behind feature flag).
     """
 
     def __init__(self, barge_in_enabled: bool = False):
@@ -274,8 +278,9 @@ class TurnStateMachine:
         self._lock = threading.Lock()
         self._turn_id = 0
         self._turn_start_time = 0.0
-        self._barge_in_enabled = barge_in_enabled
-        self._interrupted = False  # Track if current turn was interrupted
+        # D005: Barge-in HARD DISABLED for stability. Do not re-enable via config.
+        self._barge_in_enabled = False
+        self._interrupted = False
         self._interrupt_count = 0
 
     @property
@@ -285,23 +290,33 @@ class TurnStateMachine:
 
     @property
     def barge_in_enabled(self) -> bool:
-        with self._lock:
-            return self._barge_in_enabled
+        return False  # HARD DISABLED
 
     @barge_in_enabled.setter
     def barge_in_enabled(self, value: bool):
+        # Ignore all attempts to enable barge-in — hard locked for stability
+        if value:
+            print(f"[D005] Barge-in enable IGNORED — hard locked for turn-state stability")
+
+    def is_speaking(self) -> bool:
+        """Check if currently in SPEAK state (TTS active)."""
         with self._lock:
-            self._barge_in_enabled = value
-            print(f"[D005] Barge-in {'ENABLED' if value else 'DISABLED'}")
+            return self._state == TurnState.SPEAK
 
     def transition(self, new_state: str, reason: str = "") -> bool:
         """Transition to a new state with logging.
 
         Returns True if transition was valid, False if blocked.
+        HARD LOCK: While in SPEAK, silently drops all transitions except via force_idle().
         """
         with self._lock:
             old_state = self._state
-            timestamp = time.strftime("%H:%M:%S")
+
+            # HARD LOCK: SPEAK state rejects ALL transitions (only force_idle exits SPEAK)
+            if old_state == TurnState.SPEAK:
+                # Silently drop — these are expected during TTS (VAD/ASR still firing)
+                print(f"[speak-lock] Dropped {old_state} -> {new_state} ({reason}) — TTS active")
+                return False
 
             # Validate transition
             if not self._is_valid_transition(old_state, new_state):
@@ -312,7 +327,7 @@ class TurnStateMachine:
             if old_state == TurnState.IDLE and new_state == TurnState.LISTEN:
                 self._turn_id += 1
                 self._turn_start_time = time.time()
-                self._interrupted = False  # New turn, reset interrupt flag
+                self._interrupted = False
 
             self._state = new_state
             reason_str = f" ({reason})" if reason else ""
@@ -323,16 +338,14 @@ class TurnStateMachine:
     def _is_valid_transition(self, old: str, new: str) -> bool:
         """Check if a state transition is valid.
 
-        D005: When barge_in_enabled, SPEAK -> LISTEN is allowed via interrupt_speaking().
-        Direct SPEAK -> LISTEN is still invalid to prevent accidental transitions.
-        Use interrupt_speaking() for proper barge-in handling.
+        SPEAK -> anything is handled by the hard lock above, not here.
         """
         valid_transitions = {
             TurnState.IDLE: [TurnState.LISTEN],
-            TurnState.LISTEN: [TurnState.FINAL, TurnState.IDLE],  # Can cancel back to IDLE
-            TurnState.FINAL: [TurnState.DECIDE, TurnState.IDLE],  # Can cancel back to IDLE
-            TurnState.DECIDE: [TurnState.SPEAK, TurnState.IDLE],  # Can skip speech
-            TurnState.SPEAK: [TurnState.IDLE],  # Normal: SPEAK -> IDLE only
+            TurnState.LISTEN: [TurnState.FINAL, TurnState.IDLE],
+            TurnState.FINAL: [TurnState.DECIDE, TurnState.IDLE],
+            TurnState.DECIDE: [TurnState.SPEAK, TurnState.IDLE],
+            TurnState.SPEAK: [TurnState.IDLE],  # Only via force_idle()
         }
         return new in valid_transitions.get(old, [])
 
@@ -342,37 +355,13 @@ class TurnStateMachine:
             return self._state != TurnState.IDLE
 
     def interrupt_speaking(self, reason: str = "barge-in") -> bool:
-        """D005 Barge-in: Interrupt SPEAKING state and transition to LISTEN.
+        """D005 Barge-in: HARD DISABLED for turn-state stability.
 
-        This is the ONLY valid way to go from SPEAK -> LISTEN.
-        Requires barge_in_enabled=True.
-
-        Returns True if interrupt succeeded, False if blocked.
+        Always returns False. To reintroduce, gate behind a tested feature flag
+        after proving no SPEAK->LISTEN errors for N sessions.
         """
-        with self._lock:
-            if not self._barge_in_enabled:
-                print(f"[D005] Barge-in blocked: feature disabled")
-                return False
-
-            if self._state != TurnState.SPEAK:
-                print(f"[D005] Barge-in blocked: not in SPEAK state (current: {self._state})")
-                return False
-
-            # Valid barge-in: SPEAK -> IDLE -> LISTEN
-            old_state = self._state
-            self._state = TurnState.IDLE
-            print(f"[turn-state] {old_state} -> {TurnState.IDLE} (barge-in interrupt: {reason})")
-
-            # Immediately transition to LISTEN for new input
-            self._state = TurnState.LISTEN
-            self._turn_id += 1
-            self._turn_start_time = time.time()
-            self._interrupted = True
-            self._interrupt_count += 1
-            print(f"[turn-state] {TurnState.IDLE} -> {TurnState.LISTEN} (barge-in resume)")
-            print(f"[D005] Barge-in successful: interrupt #{self._interrupt_count}")
-
-            return True
+        print(f"[D005] Barge-in HARD DISABLED — interrupt rejected ({reason})")
+        return False
 
     def force_idle(self, reason: str = "forced reset"):
         """Force state back to IDLE (for error recovery)."""
@@ -573,7 +562,10 @@ class LocalVoiceEngine:
         """Generate speech using Edge TTS and play it"""
         if not text or not EDGE_TTS_AVAILABLE:
             return
-        
+        # CHOKEPOINT FILTER: Block internal agent-loop status from local TTS path
+        if hasattr(self.parent, '_is_step_status_message') and self.parent._is_step_status_message(text):
+            print(f"[tts-filter] Blocked agent-loop status (local): {text[:60]}...")
+            return
         try:
             print(f"[local-tts] Synthesizing: {text[:50]}...")
             communicate = edge_tts.Communicate(text, self.edge_voice)
@@ -677,9 +669,9 @@ class LocalVoiceEngine:
             samples = struct.unpack('<' + 'h' * n_samples, audio_bytes)
             audio_np = np.array(samples, dtype=np.float32) / 32768.0
             
-            # Check audio energy - skip if too quiet (likely noise/silence)
+            # Check audio energy - skip if too quiet (raised for Whisper stability)
             rms = np.sqrt(np.mean(audio_np ** 2))
-            if rms < 0.01:  # Very low energy, likely silence
+            if rms < 0.01:
                 return ""
             
             # Transcribe
@@ -750,25 +742,55 @@ class LocalVoiceEngine:
         
         p = pyaudio.PyAudio()
         
-        # Open microphone
-        chunk_frames = 320  # ~20ms @ 16kHz
-        in_kwargs = dict(format=pyaudio.paInt16, channels=1, rate=16000, input=True, frames_per_buffer=chunk_frames)
-        if self.parent.input_device_index is not None:
-            in_kwargs['input_device_index'] = self.parent.input_device_index
-        
-        try:
-            mic_stream = p.open(**in_kwargs)
-        except Exception as e:
-            print(f"[local] Mic open error: {e}")
+        # Open microphone with rate cascade (try config rate, then 48000/44100/16000)
+        aud_cfg = self.parent.cfg.get('audio') or {}
+        config_sr = int(aud_cfg.get('input_sample_rate', 16000))
+        _local_rates = list(dict.fromkeys([config_sr, 48000, 44100, 16000]))
+        _local_mic_rate = 16000
+        mic_stream = None
+        target_idx = self.parent.input_device_index
+        if target_idx is not None:
+            for rate in _local_rates:
+                try:
+                    cf = max(int(rate * 0.02), 160)
+                    kw = dict(format=pyaudio.paInt16, channels=1, rate=rate,
+                              input=True, frames_per_buffer=cf, input_device_index=target_idx)
+                    mic_stream = p.open(**kw)
+                    _local_mic_rate = rate
+                    info = p.get_device_info_by_index(target_idx)
+                    print(f"[local] Opened input: {info.get('name')} (idx={target_idx}) @ {rate} Hz")
+                    break
+                except Exception as e:
+                    print(f"[local] Device {target_idx} @ {rate} Hz failed: {e}")
+        if mic_stream is None:
+            for rate in _local_rates:
+                try:
+                    cf = max(int(rate * 0.02), 160)
+                    kw = dict(format=pyaudio.paInt16, channels=1, rate=rate, input=True, frames_per_buffer=cf)
+                    mic_stream = p.open(**kw)
+                    _local_mic_rate = rate
+                    info = p.get_default_input_device_info()
+                    print(f"[local] Fallback input: {info.get('name')} (idx={info.get('index')}) @ {rate} Hz")
+                    break
+                except Exception as e:
+                    print(f"[local] Default @ {rate} Hz failed: {e}")
+        if mic_stream is None:
+            print(f"[local] Mic open error: all rates {_local_rates} failed on all devices")
             return
-        
+        chunk_frames = max(int(_local_mic_rate * 0.02), 160)
+        _local_need_resample = (_local_mic_rate != 16000)
+        if _local_need_resample:
+            print(f"[local] Will resample mic: {_local_mic_rate} Hz -> 16000 Hz")
+
         print("[local] 🎤 Microphone active - listening...")
-        
+
         try:
             while not self.shutdown.is_set() and self.parent.running:
                 try:
                     # Read audio chunk
                     audio_data = mic_stream.read(chunk_frames, exception_on_overflow=False)
+                    if _local_need_resample:
+                        audio_data = _resample_audio(audio_data, _local_mic_rate, 16000)
                     rms = self._rms(audio_data)
                     now = time.time()
                     
@@ -783,7 +805,12 @@ class LocalVoiceEngine:
                             self.hybrid_asr.feed_audio(audio_data)
                             transcript = ""
                             if (not self.hybrid_asr.is_speaking()) and self.hybrid_asr.has_enough_audio():
-                                transcript = self.hybrid_asr.get_final_result(timeout=6.0) or ""
+                                # Pass TTS/echo state so Whisper skips during playback
+                                _tts_up = self.parent.tts_active.is_set()
+                                _echo_up = (time.time() - getattr(self.parent, '_tts_last_active', 0)) < self.parent.cfg.get('echo_cancellation', {}).get('grace_period_sec', 3.0)
+                                transcript = self.hybrid_asr.get_final_result(
+                                    timeout=3.0, tts_active=_tts_up, echo_gate_active=_echo_up
+                                ) or ""
                             if transcript:
                                 # Check if AVA is being addressed (wake word detection)
                                 is_addressed = self._is_addressed(transcript)
@@ -874,13 +901,22 @@ class LocalVoiceEngine:
                     buffer_duration = len(self._audio_buffer) / (16000 * 2)  # seconds
                     silence_elapsed = now - self._last_speech_time if self._last_speech_time > 0 else 0
                     
-                    if buffer_duration > 0.5 and silence_elapsed > self._silence_duration:
+                    if buffer_duration > 0.8 and silence_elapsed > self._silence_duration:
+                        # GUARD: Do not dispatch Whisper during TTS or echo-gate period
+                        _tts_up = self.parent.tts_active.is_set()
+                        _echo_up = (time.time() - getattr(self.parent, '_tts_last_active', 0)) < self.parent.cfg.get('echo_cancellation', {}).get('grace_period_sec', 3.0)
+                        if _tts_up or _echo_up:
+                            with self._buffer_lock:
+                                self._audio_buffer.clear()
+                            self._last_speech_time = 0
+                            continue
+
                         with self._buffer_lock:
                             audio_to_process = bytes(self._audio_buffer)
                             self._audio_buffer.clear()
-                        
+
                         self._last_speech_time = 0
-                        
+
                         # Transcribe
                         transcript = self.transcribe_audio(audio_to_process)
                         if transcript:
@@ -1006,6 +1042,18 @@ class VoiceEngineState:
 
 
 class StandaloneRealtimeAVA:
+    # Command verbs that signal "do something" — tools require at least one
+    COMMAND_VERBS = {
+        'open', 'search', 'create', 'type', 'send', 'close', 'start', 'stop',
+        'run', 'delete', 'move', 'rename', 'copy', 'paste', 'click', 'scroll',
+        'navigate', 'install', 'download', 'upload', 'write', 'edit', 'save',
+        'launch', 'kill', 'terminate', 'shutdown', 'restart', 'pause', 'resume',
+        'turn', 'set', 'change', 'switch', 'enable', 'disable', 'execute',
+        'find', 'show', 'play', 'record', 'capture', 'screenshot', 'take',
+        'make', 'build', 'deploy', 'push', 'pull', 'commit', 'format',
+        'remember', 'forget',
+    }
+
     def __init__(self):
         load_into_env()
 
@@ -1085,30 +1133,12 @@ class StandaloneRealtimeAVA:
             self._barge_in_enabled = False
             self._turn_state.barge_in_enabled = False
 
-        # Validation mode support (for human testing without autonomy chaos)
+        # Validation mode defaults (actual initialization happens after config load)
         self._validation_mode = os.environ.get('VALIDATION_MODE', '0') == '1'
-        val_cfg = self.cfg.get('validation_mode', {})
-        if val_cfg.get('enabled', False):
-            self._validation_mode = True
-        if self._validation_mode:
-            print("[VALIDATION_MODE] Running in validation mode - wake word required")
-            # Force half-duplex (no barge-in)
-            if val_cfg.get('force_half_duplex', True):
-                self._barge_in_enabled = False
-                self._turn_state.barge_in_enabled = False
-            # Load wake words
-            self._wake_words = [w.lower() for w in val_cfg.get('wake_words', ['ava', 'eva', 'hey ava'])]
-            self._min_words_without_wake = val_cfg.get('min_words_without_wake', 3)
-            self._blocked_tools = set(val_cfg.get('blocked_tools', ['camera_ops']))
-            self._require_wake_for_tools = val_cfg.get('require_wake_for_tools', True)
-            print(f"  Wake words: {self._wake_words}")
-            print(f"  Min words without wake: {self._min_words_without_wake}")
-            print(f"  Blocked tools: {self._blocked_tools}")
-        else:
-            self._wake_words = []
-            self._min_words_without_wake = 0
-            self._blocked_tools = set()
-            self._require_wake_for_tools = False
+        self._wake_words = []
+        self._min_words_without_wake = 0
+        self._blocked_tools = set()
+        self._require_wake_for_tools = False
 
         # State file for crash supervisor (written on turn state changes)
         self._state_file_path = Path(__file__).parent / 'logs' / 'runner_state.json'
@@ -1169,6 +1199,26 @@ class StandaloneRealtimeAVA:
         self._cfg_mtime = 0.0
         self._identity_mtime = 0.0
         self._load_config(silent=True)
+
+        # Validation mode initialization (AFTER config is loaded)
+        val_cfg = self.cfg.get('validation_mode', {})
+        if val_cfg.get('enabled', False):
+            self._validation_mode = True
+        if self._validation_mode:
+            print("[VALIDATION_MODE] Running in validation mode - wake word required")
+            # Force half-duplex (no barge-in)
+            if val_cfg.get('force_half_duplex', True):
+                self._barge_in_enabled = False
+                self._turn_state.barge_in_enabled = False
+            # Load wake words
+            self._wake_words = [w.lower() for w in val_cfg.get('wake_words', ['ava', 'eva', 'hey ava'])]
+            self._min_words_without_wake = val_cfg.get('min_words_without_wake', 3)
+            self._blocked_tools = set(val_cfg.get('blocked_tools', ['camera_ops']))
+            self._require_wake_for_tools = val_cfg.get('require_wake_for_tools', True)
+            print(f"  Wake words: {self._wake_words}")
+            print(f"  Min words without wake: {self._min_words_without_wake}")
+            print(f"  Blocked tools: {self._blocked_tools}")
+
         try:
             if self.identity_path.exists():
                 self._identity_mtime = self.identity_path.stat().st_mtime
@@ -1403,6 +1453,14 @@ class StandaloneRealtimeAVA:
                 print(f"[proactive] Error initializing: {e}")
         else:
             print("[proactive] Proactive assistance NOT available")
+
+        # --- DEFINITIVE VALIDATION MODE SUMMARY (after all systems initialized) ---
+        print(f"[VALIDATION_MODE] Active={self._validation_mode} "
+              f"wake_required={bool(self._wake_words)} "
+              f"require_wake_for_tools={self._require_wake_for_tools} "
+              f"barge_in={self._barge_in_enabled} "
+              f"proactive={'disabled' if not self.proactive_enabled else 'enabled'} "
+              f"passive_learning={'disabled' if not self.passive_learning_enabled else 'enabled'}")
 
         # Pending confirmation state for destructive actions
         self._pending_confirmation = None
@@ -1688,44 +1746,63 @@ class StandaloneRealtimeAVA:
 
         # Mic capture -> session.push_audio
         p = pyaudio.PyAudio()
-        chunk_frames = 320  # ~20ms @ 16kHz
-        in_kwargs = dict(format=pyaudio.paInt16, channels=1, rate=16000, input=True, frames_per_buffer=chunk_frames)
-        if self.input_device_index is not None:
-            in_kwargs['input_device_index'] = self.input_device_index
+        aud_cfg = self.cfg.get('audio') or {}
+        config_sample_rate = int(aud_cfg.get('input_sample_rate', 16000))
+        # Rate cascade: config rate first, then standard rates (deduplicated, ordered)
+        _rates_to_try = list(dict.fromkeys([config_sample_rate, 48000, 44100, 16000]))
+        print(f"[audio] Config: device={self.input_device_index}, rate={config_sample_rate}, cascade={_rates_to_try}")
 
-        def _open_mic_with_fallback() -> tuple:
-            try:
-                ms = p.open(**in_kwargs)
-                try:
-                    info = p.get_device_info_by_index(in_kwargs.get('input_device_index')) if 'input_device_index' in in_kwargs else p.get_default_input_device_info()
-                    print(f"[audio] Using input device: {info.get('name')} (idx={info.get('index')}) @ 16000 Hz")
-                except Exception:
-                    pass
-                return ms, in_kwargs.get('input_device_index')
-            except Exception as e:
-                print(f"[audio] Mic open error: {e}")
-                # Try any device with input channels > 0
-                try:
-                    dev_count = p.get_device_count()
-                    for idx in range(dev_count):
+        def _open_mic_with_fallback():
+            """Returns (stream, device_index, actual_rate) or (None, None, None)."""
+            target_idx = self.input_device_index
+            # Try configured device with rate cascade
+            if target_idx is not None:
+                for rate in _rates_to_try:
+                    try:
+                        cf = max(int(rate * 0.02), 160)  # ~20ms at this rate
+                        kw = dict(format=pyaudio.paInt16, channels=1, rate=rate,
+                                  input=True, frames_per_buffer=cf, input_device_index=target_idx)
+                        ms = p.open(**kw)
                         try:
-                            info = p.get_device_info_by_index(idx)
-                            if int(info.get('maxInputChannels', 0)) <= 0:
-                                continue
-                            test_kwargs = dict(format=pyaudio.paInt16, channels=1, rate=16000, input=True, frames_per_buffer=chunk_frames, input_device_index=idx)
-                            ms2 = p.open(**test_kwargs)
-                            print(f"[audio] Fallback input: {info.get('name')} (idx={idx}) @ 16000 Hz")
-                            return ms2, idx
+                            info = p.get_device_info_by_index(target_idx)
+                            print(f"[audio] Opened input: {info.get('name')} (idx={target_idx}) @ {rate} Hz")
+                        except Exception:
+                            print(f"[audio] Opened input: device idx={target_idx} @ {rate} Hz")
+                        return ms, target_idx, rate
+                    except Exception as e:
+                        print(f"[audio] Device {target_idx} @ {rate} Hz FAILED: {e}")
+                print(f"[audio] WARNING: All rates failed for configured device {target_idx}, trying other devices")
+            # Fallback: try other devices with rate cascade (NO silent fallback)
+            try:
+                dev_count = p.get_device_count()
+                for idx in range(dev_count):
+                    if idx == target_idx:
+                        continue
+                    info = p.get_device_info_by_index(idx)
+                    if int(info.get('maxInputChannels', 0)) <= 0:
+                        continue
+                    for rate in _rates_to_try:
+                        try:
+                            cf = max(int(rate * 0.02), 160)
+                            kw = dict(format=pyaudio.paInt16, channels=1, rate=rate,
+                                      input=True, frames_per_buffer=cf, input_device_index=idx)
+                            ms = p.open(**kw)
+                            print(f"[audio] Fallback input: {info.get('name')} (idx={idx}) @ {rate} Hz")
+                            return ms, idx, rate
                         except Exception:
                             continue
-                except Exception:
-                    pass
-                return None, None
+            except Exception:
+                pass
+            return None, None, None
 
-        mic_stream, sel_idx = _open_mic_with_fallback()
+        mic_stream, sel_idx, actual_mic_rate = _open_mic_with_fallback()
         if mic_stream is None:
             print("[voice-unified] No suitable input device found.")
             return
+        chunk_frames = max(int(actual_mic_rate * 0.02), 160)  # ~20ms at actual rate
+        _need_mic_resample = (actual_mic_rate != 16000)
+        if _need_mic_resample:
+            print(f"[audio] Will resample mic audio: {actual_mic_rate} Hz -> 16000 Hz for ASR")
 
         def _mic_loop():
             speaking_frames = 0
@@ -1736,6 +1813,8 @@ class StandaloneRealtimeAVA:
                 while self.running:
                     try:
                         data = mic_stream.read(chunk_frames, exception_on_overflow=False)
+                        if _need_mic_resample:
+                            data = _resample_audio(data, actual_mic_rate, 16000)
                     except Exception:
                         time.sleep(0.01)
                         continue
@@ -2093,6 +2172,10 @@ class StandaloneRealtimeAVA:
         """
         t = (text or '').strip()
         low = t.lower()
+        # POLICY GATE: Tools require explicit command verb (+ wake word in validation mode)
+        if not self._should_allow_tools(t):
+            print(f"[tool-gate] Blocked — no command verb (or missing wake word): '{t[:40]}'")
+            return None
         # Voice control for on-screen automation
         try:
             if 'pause automation' in low or (low.startswith('pause') and 'automation' in low):
@@ -2389,7 +2472,16 @@ class StandaloneRealtimeAVA:
 
         This method sends intent + metadata to Node; it does NOT execute tools.
         """
-        # VALIDATION MODE: Block certain tools without wake word
+        # POLICY GATE: Tools require explicit command verb (+ wake word in validation mode)
+        last_txt = getattr(self, '_last_user_transcript', '') or ''
+        if not self._should_allow_tools(last_txt):
+            print(f"[tool-gate] BLOCKED tool '{function_name}' — transcript lacks command verb or wake word: '{last_txt[:40]}'")
+            return {
+                "status": "blocked",
+                "message": f"Tool '{function_name}' requires explicit command phrase",
+                "tool": function_name
+            }
+        # VALIDATION MODE: Block certain tools entirely
         if self._validation_mode:
             if function_name in self._blocked_tools:
                 print(f"[validation-mode] BLOCKED tool '{function_name}' - not allowed in validation mode")
@@ -2400,8 +2492,8 @@ class StandaloneRealtimeAVA:
                 }
             # If require_wake_for_tools, check last transcript had wake word
             if self._require_wake_for_tools:
-                last_txt = getattr(self, '_last_user_transcript', '').lower()
-                has_wake = any(last_txt.startswith(w) or f" {w}" in last_txt for w in self._wake_words)
+                last_txt_lower = last_txt.lower()
+                has_wake = any(last_txt_lower.startswith(w) or f" {w}" in last_txt_lower for w in self._wake_words)
                 if not has_wake:
                     print(f"[validation-mode] Tool '{function_name}' requires wake word - skipping")
                     return {
@@ -2693,14 +2785,10 @@ class StandaloneRealtimeAVA:
                         if self.debug_agent or self.debug_tools:
                             print(f"[cfg] Debug enabled: agent={self.debug_agent} tools={self.debug_tools}")
 
-                        # D005 Barge-in settings (hot-reloadable)
+                        # D005 Barge-in: HARD DISABLED for turn-state stability
+                        # Config value is ignored — barge-in stays off until proven stable
                         barge_cfg = self.cfg.get('barge_in', {})
-                        new_barge_enabled = bool(barge_cfg.get('enabled', False))
-                        if new_barge_enabled != self._barge_in_enabled:
-                            self._barge_in_enabled = new_barge_enabled
-                            self._turn_state.barge_in_enabled = new_barge_enabled
-                            if not silent:
-                                print(f"[D005] Barge-in {'ENABLED' if new_barge_enabled else 'DISABLED'}")
+                        self._barge_in_enabled = False
                         self._barge_in_min_speech_ms = int(barge_cfg.get('min_speech_ms', 500))
                         self._barge_in_require_final = bool(barge_cfg.get('require_final_to_interrupt', True))
                         self._barge_in_cancel_tts = bool(barge_cfg.get('cancel_tts_on_interrupt', True))
@@ -2816,6 +2904,10 @@ class StandaloneRealtimeAVA:
 
     async def _ask_server_respond(self, text: str) -> str:
         headers = { 'Content-Type': 'application/json' }
+        # POLICY GATE: Only enable server-side tools when transcript has command verb
+        tools_allowed = self._should_allow_tools(text)
+        if not tools_allowed:
+            print(f"[tool-gate] Server run_tools=False — no command verb in: '{text[:40]}'")
         # Try preferred route first
         route = str(self.cfg.get('server_route', 'respond')).lower()
         base = self.cfg.get('server_url', f"http://127.0.0.1:5051/{route}")
@@ -2831,8 +2923,8 @@ class StandaloneRealtimeAVA:
                     "sessionId": "voice-default",
                     "messages": [ { "role": "user", "content": text } ],
                     "freshSession": True,  # Voice: don't include old session history
-                    "run_tools": True,
-                    "allow_write": True,
+                    "run_tools": tools_allowed,
+                    "allow_write": tools_allowed,
                     "persona": "AVA",
                     "style": "first_person",
                     "context": self._build_context(pctx)
@@ -2848,8 +2940,8 @@ class StandaloneRealtimeAVA:
                     "sessionId": "voice-default",
                     "text": text,
                     "freshSession": True,  # Voice: don't include old session history
-                    "run_tools": True,
-                    "allow_write": True,
+                    "run_tools": tools_allowed,
+                    "allow_write": tools_allowed,
                     "persona": "AVA",
                     "style": "first_person",
                     "context": self._build_context(pctx)
@@ -2895,14 +2987,18 @@ class StandaloneRealtimeAVA:
             return ''
 
     def _is_step_status_message(self, text: str) -> bool:
-        """Detect if response is a step execution status message instead of natural language"""
+        """Detect if response is an internal agent-loop status message instead of natural language.
+
+        These messages must NEVER reach TTS. They are internal scaffolding from the
+        agent loop (step counters, tool traces, waiting states, idempotency messages).
+        """
         if not text:
             return False
-        
+
         # Strip common punctuation for pattern matching
         text_clean = text.strip().rstrip('.!?').strip()
         text_lower = text_clean.lower()
-        
+
         # Exact match blacklists - phrases that should NEVER be spoken
         exact_blacklist = {
             'done', 'ready', 'ok', 'okay', 'success', 'complete', 'completed',
@@ -2910,16 +3006,39 @@ class StandaloneRealtimeAVA:
             'acknowledged', 'noted', 'confirmed', 'roger', 'copy',
             'on it', 'will do', 'got it', 'understood',
         }
-        
+
         # Check exact matches (case insensitive)
         if text_lower in exact_blacklist:
             return True
-        
+
         # Check for very short responses (likely status codes)
         if len(text_clean) <= 3:
             return True
-        
-        # Pattern-based detection - EXPANDED to catch more variations
+
+        # Substring blacklist - if ANY of these appear anywhere in the response, block it
+        blocked_substrings = [
+            'partially completed',
+            'waiting for user input',
+            'waiting_user',
+            'idempotency',
+            'tool execution',
+            'agent loop',
+            'agent_loop',
+            'max steps reached',
+            'max_steps_reached',
+            'step limit',
+            'execution trace',
+            'tool trace',
+            'internal tool',
+            'tool call result',
+            'function_call',
+            'tool_code',
+        ]
+        for sub in blocked_substrings:
+            if sub in text_lower:
+                return True
+
+        # Pattern-based detection
         step_patterns = [
             r'Reached step \d+ of \d+',
             r'currently running without any further actions',
@@ -2945,8 +3064,12 @@ class StandaloneRealtimeAVA:
             r'Plan (complete|completed|finished)',
             r'\d+ steps (complete|completed|finished)',
             r'step \d+ in progress',
+            r'has been partially completed',
+            r'partially completed',
+            r'waiting for user',
+            r'waiting for input',
         ]
-        
+
         # Check for repetitive word patterns (e.g., "step step step" or "done done")
         words = text_clean.split()
         if len(words) >= 2:
@@ -2954,11 +3077,11 @@ class StandaloneRealtimeAVA:
             for i in range(len(words) - 1):
                 if words[i].lower() == words[i+1].lower() and len(words[i]) > 2:
                     return True
-        
+
         for pattern in step_patterns:
             if re.search(pattern, text, re.IGNORECASE):
                 return True
-        
+
         return False
 
     def _get_natural_response(self, original_query: str, bad_response: str) -> str:
@@ -3230,6 +3353,10 @@ class StandaloneRealtimeAVA:
 
     async def _speak_text(self, text: str):
         if not text:
+            return
+        # CHOKEPOINT FILTER: Block internal agent-loop status from ALL voice paths
+        if self._is_step_status_message(text):
+            print(f"[tts-filter] Blocked agent-loop status: {text[:60]}...")
             return
         speak_text = self._prepare_tts_text(text)
         if not speak_text:
@@ -3514,13 +3641,56 @@ class StandaloneRealtimeAVA:
 
     async def stream_microphone_input(self):
         """Stream microphone input to Deepgram ASR"""
+        aud_cfg = self.cfg.get('audio') or {}
+        _dg_config_sr = int(aud_cfg.get('input_sample_rate', MIC_RATE))
+        _dg_rates = list(dict.fromkeys([_dg_config_sr, 48000, 44100, 16000]))
+        _dg_mic_rate = MIC_RATE
+        _dg_chunk = CHUNK_SAMPLES
+
         def open_mic():
-            kwargs = dict(format=FORMAT, channels=CHANNELS, rate=MIC_RATE, input=True, frames_per_buffer=CHUNK_SAMPLES)
-            if self.input_device_index is not None:
-                kwargs['input_device_index'] = self.input_device_index
-            return self.audio.open(**kwargs)
+            nonlocal _dg_mic_rate, _dg_chunk
+            target_idx = self.input_device_index
+            # Try configured device with rate cascade
+            if target_idx is not None:
+                for rate in _dg_rates:
+                    try:
+                        cf = max(int(rate * 0.02), 160)
+                        kw = dict(format=FORMAT, channels=CHANNELS, rate=rate,
+                                  input=True, frames_per_buffer=cf, input_device_index=target_idx)
+                        s = self.audio.open(**kw)
+                        _dg_mic_rate = rate
+                        _dg_chunk = cf
+                        try:
+                            info = self.audio.get_device_info_by_index(target_idx)
+                            print(f"[audio] DG mic opened: {info.get('name')} (idx={target_idx}) @ {rate} Hz")
+                        except Exception:
+                            print(f"[audio] DG mic opened: idx={target_idx} @ {rate} Hz")
+                        return s
+                    except Exception as e:
+                        print(f"[audio] DG mic device {target_idx} @ {rate} Hz failed: {e}")
+            # Fallback with rate cascade
+            for rate in _dg_rates:
+                try:
+                    cf = max(int(rate * 0.02), 160)
+                    kw = dict(format=FORMAT, channels=CHANNELS, rate=rate,
+                              input=True, frames_per_buffer=cf)
+                    s = self.audio.open(**kw)
+                    _dg_mic_rate = rate
+                    _dg_chunk = cf
+                    try:
+                        info = self.audio.get_default_input_device_info()
+                        print(f"[audio] DG mic fallback: {info.get('name')} @ {rate} Hz")
+                    except Exception:
+                        print(f"[audio] DG mic fallback @ {rate} Hz")
+                    return s
+                except Exception:
+                    continue
+            raise RuntimeError(f"No mic available (tried rates {_dg_rates})")
 
         stream = open_mic()
+        _dg_need_resample = (_dg_mic_rate != MIC_RATE)
+        if _dg_need_resample:
+            print(f"[audio] DG mic will resample: {_dg_mic_rate} Hz -> {MIC_RATE} Hz")
 
         print("🎤 Microphone active - AVA is always listening!")
 
@@ -3533,8 +3703,11 @@ class StandaloneRealtimeAVA:
                     except Exception:
                         pass
                     stream = open_mic()
+                    _dg_need_resample = (_dg_mic_rate != MIC_RATE)
                     setattr(self, '_reopen_mic', False)
-                audio_data = stream.read(CHUNK_SAMPLES, exception_on_overflow=False)
+                audio_data = stream.read(_dg_chunk, exception_on_overflow=False)
+                if _dg_need_resample:
+                    audio_data = _resample_audio(audio_data, _dg_mic_rate, MIC_RATE)
                 # VAD gating during active TTS
                 rms = self._rms_int16(audio_data)
                 if self.cfg.get('debug_rms'):
@@ -3874,10 +4047,44 @@ class StandaloneRealtimeAVA:
                     pass
                 if speaker_stream is None:
                     raise RuntimeError("No suitable output device for agent speech")
-        in_kwargs = dict(format=FORMAT, channels=CHANNELS, rate=MIC_RATE, input=True, frames_per_buffer=1024)
-        if self.input_device_index is not None:
-            in_kwargs['input_device_index'] = self.input_device_index
-        mic_stream = p.open(**in_kwargs)
+        # Agent mic open with rate cascade
+        _agent_aud_cfg = self.cfg.get('audio') or {}
+        _agent_config_sr = int(_agent_aud_cfg.get('input_sample_rate', MIC_RATE))
+        _agent_rates = list(dict.fromkeys([_agent_config_sr, 48000, 44100, 16000]))
+        _agent_mic_rate = MIC_RATE
+        _agent_mic_chunk = 1024
+        mic_stream = None
+        _agent_target = self.input_device_index
+        if _agent_target is not None:
+            for _ar in _agent_rates:
+                try:
+                    _acf = max(int(_ar * 0.02), 160)
+                    _akw = dict(format=FORMAT, channels=CHANNELS, rate=_ar, input=True, frames_per_buffer=_acf, input_device_index=_agent_target)
+                    mic_stream = p.open(**_akw)
+                    _agent_mic_rate = _ar
+                    _agent_mic_chunk = _acf
+                    info = p.get_device_info_by_index(_agent_target)
+                    print(f"[audio] Agent mic opened: {info.get('name')} (idx={_agent_target}) @ {_ar} Hz")
+                    break
+                except Exception as e:
+                    print(f"[audio] Agent mic device {_agent_target} @ {_ar} Hz failed: {e}")
+        if mic_stream is None:
+            for _ar in _agent_rates:
+                try:
+                    _acf = max(int(_ar * 0.02), 160)
+                    _akw = dict(format=FORMAT, channels=CHANNELS, rate=_ar, input=True, frames_per_buffer=_acf)
+                    mic_stream = p.open(**_akw)
+                    _agent_mic_rate = _ar
+                    _agent_mic_chunk = _acf
+                    print(f"[audio] Agent mic fallback @ {_ar} Hz")
+                    break
+                except Exception:
+                    continue
+        if mic_stream is None:
+            raise RuntimeError(f"No mic available for agent voice (tried rates {_agent_rates})")
+        _agent_need_resample = (_agent_mic_rate != MIC_RATE)
+        if _agent_need_resample:
+            print(f"[audio] Agent mic will resample: {_agent_mic_rate} Hz -> {MIC_RATE} Hz")
 
         shutdown = threading.Event()
         connection_active = threading.Event()
@@ -4001,22 +4208,34 @@ class StandaloneRealtimeAVA:
                         except Exception:
                             pass
                         try:
-                            kwargs = dict(format=FORMAT, channels=CHANNELS, rate=MIC_RATE, input=True, frames_per_buffer=1024)
-                            if self.input_device_index is not None:
-                                kwargs['input_device_index'] = self.input_device_index
-                            mic_stream = p.open(**kwargs)
-                            try:
-                                info_in = p.get_device_info_by_index(kwargs['input_device_index']) if 'input_device_index' in kwargs else p.get_default_input_device_info()
-                                print(f"[audio] Reopened mic: {info_in.get('name')} (idx={info_in.get('index')}) @ {MIC_RATE} Hz")
-                            except Exception:
-                                pass
+                            _reopened = False
+                            _rtgt = self.input_device_index
+                            for _rr in _agent_rates:
+                                try:
+                                    _rcf = max(int(_rr * 0.02), 160)
+                                    _rkw = dict(format=FORMAT, channels=CHANNELS, rate=_rr, input=True, frames_per_buffer=_rcf)
+                                    if _rtgt is not None:
+                                        _rkw['input_device_index'] = _rtgt
+                                    mic_stream = p.open(**_rkw)
+                                    _agent_mic_rate = _rr
+                                    _agent_mic_chunk = _rcf
+                                    _agent_need_resample = (_rr != MIC_RATE)
+                                    print(f"[audio] Reopened agent mic @ {_rr} Hz (resample={_agent_need_resample})")
+                                    _reopened = True
+                                    break
+                                except Exception:
+                                    continue
+                            if not _reopened:
+                                print(f"[audio] Agent mic reopen failed for all rates")
                         except Exception as _e:
                             print(f"[audio] Mic reopen failed: {_e}")
                         setattr(self, '_reopen_mic', False)
                 except Exception:
                     pass
                 try:
-                    data = mic_stream.read(480, exception_on_overflow=False)
+                    data = mic_stream.read(_agent_mic_chunk, exception_on_overflow=False)
+                    if _agent_need_resample:
+                        data = _resample_audio(data, _agent_mic_rate, MIC_RATE)
                 except Exception:
                     time.sleep(0.01)
                     continue
@@ -4864,6 +5083,115 @@ class StandaloneRealtimeAVA:
             return f"{transcript} [SYSTEM GUIDANCE:{guidance}]"
         return transcript
 
+    def _has_command_verb(self, text: str) -> bool:
+        """Check if text contains an explicit command verb from COMMAND_VERBS."""
+        if not text:
+            return False
+        words = text.strip().lower().split()
+        return bool(set(words) & self.COMMAND_VERBS)
+
+    def _should_allow_tools(self, transcript: str) -> bool:
+        """Policy gate: decide whether tools are allowed for this transcript.
+
+        - Validation mode ON: requires wake word AND command verb
+        - Validation mode OFF: requires command verb at minimum
+        Returns True if tools should be enabled, False to block them.
+        """
+        if not transcript:
+            return False
+        lower = transcript.strip().lower()
+
+        # Always require a command verb
+        if not self._has_command_verb(lower):
+            return False
+
+        # In validation mode, also require wake word
+        if self._validation_mode and self._require_wake_for_tools:
+            wake_words = getattr(self, '_wake_words', ['ava', 'eva'])
+            has_wake = any(lower.startswith(w) or f" {w}" in lower for w in wake_words)
+            if not has_wake:
+                return False
+
+        return True
+
+    def _is_chat_only(self, text: str) -> str | None:
+        """Detect conversational transcripts that should NEVER start an agent loop.
+
+        Returns a direct reply string if the transcript is chat-only,
+        or None if it should go to the server / agent loop.
+
+        Rules:
+        - Greetings -> instant local reply
+        - Short questions (<=6 words) without a command verb -> instant local reply
+        - Anything with an explicit command verb -> None (let agent handle it)
+        """
+        if not text:
+            return None
+        lower = text.strip().lower()
+        words = lower.split()
+        word_count = len(words)
+
+        # Check if any word is a command verb (uses class constant)
+        has_command = bool(set(words) & self.COMMAND_VERBS)
+        if has_command:
+            return None  # Let agent loop handle it
+
+        # Greetings - instant local reply
+        greeting_patterns = [
+            'hello', 'hi', 'hey', 'howdy', 'greetings', 'good morning',
+            'good afternoon', 'good evening', 'good night', "what's up",
+            'whats up', 'sup', 'yo', 'hiya', 'heya',
+        ]
+        for g in greeting_patterns:
+            if lower == g or lower.startswith(g + ' ') or lower.endswith(' ' + g):
+                import random
+                replies = [
+                    "Hey! What can I do for you?",
+                    "Hi there! How can I help?",
+                    "Hey! I'm listening.",
+                    "Hello! What do you need?",
+                ]
+                return random.choice(replies)
+
+        # Greeting with name (e.g. "hello ava", "hey eva")
+        wake_words = getattr(self, '_wake_words', ['ava', 'eva'])
+        for g in ['hello', 'hi', 'hey', 'howdy', 'good morning', 'good afternoon', 'good evening']:
+            for w in wake_words:
+                if lower in (f"{g} {w}", f"{g} {w}a", f"hey {w}", f"hi {w}"):
+                    import random
+                    replies = [
+                        "Hey! What can I do for you?",
+                        "Hi! I'm here. What do you need?",
+                        "Hello! How can I help?",
+                    ]
+                    return random.choice(replies)
+
+        # Short phrases (<=6 words) without command verbs -> conversational
+        if word_count <= 6 and not has_command:
+            # "how are you" / "what time is it" / "thank you" / "never mind"
+            if any(p in lower for p in ['how are you', 'how do you do', 'how goes it']):
+                return "I'm doing well! How can I help?"
+            if any(p in lower for p in ['thank', 'thanks']):
+                return "You're welcome!"
+            if any(p in lower for p in ['never mind', 'nevermind', 'forget it', 'cancel']):
+                return "Okay, no problem."
+            if any(p in lower for p in ['what time', 'what is the time', 'current time']):
+                from datetime import datetime
+                now = datetime.now().strftime("%-I:%M %p" if os.name != 'nt' else "%#I:%M %p")
+                return f"It's {now}."
+            if any(p in lower for p in ['what day', 'what is the date', 'what date', "today's date"]):
+                from datetime import datetime
+                today = datetime.now().strftime("%A, %B %d")
+                return f"Today is {today}."
+            if any(p in lower for p in ['who are you', 'what are you', "what's your name", 'your name']):
+                return "I'm AVA, your autonomous virtual assistant."
+            if any(p in lower for p in ['goodbye', 'bye', 'see you', 'later', 'good night']):
+                return "See you later!"
+            if lower in ('yes', 'no', 'yeah', 'yep', 'nope', 'nah', 'okay', 'ok', 'sure'):
+                return None  # Affirmations might be confirmations for pending actions
+
+        return None  # Not chat-only, let server handle it
+
     async def _maybe_handle_local_intent(self, transcript: str) -> bool:
         """Handle key voice intents locally to keep server-truth consistent"""
         try:
@@ -4871,6 +5199,13 @@ class StandaloneRealtimeAVA:
             if not text:
                 return False
             lower = text.lower()
+
+            # CHAT-FIRST ROUTING: Greetings and simple questions never start agent loops
+            chat_reply = self._is_chat_only(text)
+            if chat_reply:
+                print(f"[chat-first] Direct reply (no agent loop): '{chat_reply}'")
+                await self._speak_text(chat_reply)
+                return True
 
             # Voice approval for apply: require nonce, e.g., "APPLY 4821"
             now = time.time()
