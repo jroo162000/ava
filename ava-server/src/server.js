@@ -133,23 +133,28 @@ server.listen(PORT, HOST, () => {
     console.log(`   ⚠️  Warnings:    ${securityAudit.insecureFiles.length} plaintext key file(s)`);
   }
   console.log('');
-  // Initialize weekly maintenance scheduler
-  try {
-    doctorService.scheduleWeeklyReport();
-  } catch (e) {
-    logger.warn('Failed to start maintenance scheduler', { error: e.message });
-  }
-  // Start digest auto-flush scheduler
-  try {
-    digestScheduler.startDigestScheduler();
-  } catch (e) {
-    logger.warn('Failed to start digest scheduler', { error: e.message });
-  }
-  // Start Moltbook learning scheduler (curiosity-governed)
-  try {
-    moltbookScheduler.startMoltbookScheduler();
-  } catch (e) {
-    logger.warn('Failed to start Moltbook scheduler', { error: e.message });
+  // Guard: skip all schedulers when voice mode is active
+  if (process.env.DISABLE_AUTONOMY === '1') {
+    logger.info('[autonomy] disabled (voice mode) — all schedulers skipped (doctor, digest, moltbook)');
+  } else {
+    // Initialize weekly maintenance scheduler
+    try {
+      doctorService.scheduleWeeklyReport();
+    } catch (e) {
+      logger.warn('Failed to start maintenance scheduler', { error: e.message });
+    }
+    // Start digest auto-flush scheduler
+    try {
+      digestScheduler.startDigestScheduler();
+    } catch (e) {
+      logger.warn('Failed to start digest scheduler', { error: e.message });
+    }
+    // Start Moltbook learning scheduler (curiosity-governed)
+    try {
+      moltbookScheduler.startMoltbookScheduler();
+    } catch (e) {
+      logger.warn('Failed to start Moltbook scheduler', { error: e.message });
+    }
   }
 });
 

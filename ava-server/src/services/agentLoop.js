@@ -55,6 +55,7 @@ function createAgentState(goal, options = {}) {
     status: AgentStatus.RUNNING,
     step_count: 0,
     step_limit: Math.min(options.stepLimit || DEFAULT_STEP_LIMIT, MAX_STEP_LIMIT),
+    runTools: options.runTools !== false,  // default true; false skips tool execution
     last_action: null,
     last_result: null,
     errors: [],
@@ -68,6 +69,7 @@ function createAgentState(goal, options = {}) {
     },
     toolset: [],
     history: [],
+    memoryFilter: options.memoryFilter || null,
     created_at: new Date().toISOString(),
     updated_at: new Date().toISOString(),
     final_result: null
@@ -102,17 +104,20 @@ async function observe(state) {
       state.last_action,
       state.last_result
     );
-    
+
+    // VALIDATION MODE: restrict memory to facts only — no workflows/agent actions
+    const memoryTypes = state.memoryFilter === 'facts_only'
+      ? [MemoryType.FACT, MemoryType.PREFERENCE, MemoryType.CONSTRAINT]
+      : [MemoryType.PREFERENCE, MemoryType.WORKFLOW, MemoryType.CONSTRAINT,
+         MemoryType.FACT, MemoryType.WARNING, MemoryType.AGENT_ACTION];
+
+    if (state.memoryFilter === 'facts_only') {
+      logger.info('[agent] Memory filter: facts_only (validation mode — no workflows/warnings/agent_actions)');
+    }
+
     const memories = await memoryService.retrieveRelevant(retrievalQuery, 8, {
       minPriority: 2,
-      types: [
-        MemoryType.PREFERENCE,
-        MemoryType.WORKFLOW,
-        MemoryType.CONSTRAINT,
-        MemoryType.FACT,
-        MemoryType.WARNING,
-        MemoryType.AGENT_ACTION
-      ]
+      types: memoryTypes
     });
     
     state.current_context.memories = memories || [];
@@ -326,7 +331,14 @@ async function act(state, decision) {
       case DecisionType.TOOL_CALL:
         action.tool = decision.tool;
         action.args = decision.args || {};
-        
+
+        // Honor runTools=false: skip tool execution, return conversational-only
+        if (!state.runTools) {
+          logger.info('[agent] runTools=false, skipping tool execution', { tool: decision.tool });
+          result = { status: 'skipped', message: 'Tool execution disabled for this request (run_tools=false)' };
+          break;
+        }
+
         const tool = await toolsService.getTool(decision.tool);
         if (!tool) {
           result = { status: 'error', message: `Tool not found: ${decision.tool}` };

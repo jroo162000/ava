@@ -127,50 +127,13 @@ function isStepStatusMessage(text) {
   return stepPatterns.some(pattern => pattern.test(text));
 }
 
-/**
- * Get natural language response for voice mode
- */
-function getNaturalResponse(originalQuery, badResponse) {
-  const low = (originalQuery || '').toLowerCase();
-  
-  if (['hi', 'hello', 'hey'].some(x => low.includes(x))) {
-    return "Hey there! How can I help you today?";
-  }
-  if (['huh', 'what', 'pardon', 'repeat'].some(x => low.includes(x))) {
-    return "I'm not sure I understood. Could you say that again?";
-  }
-  if (low.includes('name')) {
-    return "I'm AVA, your autonomous virtual assistant.";
-  }
-  if (['mouse', 'cursor', 'click'].some(x => low.includes(x))) {
-    return "I can help control your mouse. Where would you like me to move it?";
-  }
-  if (['type', 'write', 'enter'].some(x => low.includes(x))) {
-    return "I can type text for you. What should I enter?";
-  }
-  if (['screenshot', 'screen shot', 'capture'].some(x => low.includes(x))) {
-    return "I'll capture a screenshot for you.";
-  }
-  if (['system', 'computer', 'info', 'specs'].some(x => low.includes(x))) {
-    return "Let me check your system information.";
-  }
-  
-  // Generic fallback
-  const fallbacks = [
-    "I'm here to help. What would you like me to do?",
-    "What can I assist you with?",
-    "I'm ready to help. What's next?",
-    "How can I help you today?",
-  ];
-  return fallbacks[Math.floor(Math.random() * fallbacks.length)];
-}
-
 const router = express.Router();
 
 // Realtime compatibility: route text/messages to Agent Loop with memory/tools
 router.post('/respond', async (req, res) => {
   try {
-    const { text, messages, sessionId = 'voice-default', freshSession = false } = req.body || {};
+    const { text, messages, sessionId = 'voice-default', freshSession = false,
+            run_tools, memory_filter } = req.body || {};
     const userText = (typeof text === 'string' && text.trim())
       ? text.trim()
       : Array.isArray(messages) && messages.length > 0
@@ -183,13 +146,19 @@ router.post('/respond', async (req, res) => {
 
     try { conversationLogger.logUserMessage(userText, { sessionId, endpoint: '/respond', freshSession }); } catch {}
 
-    const state = await (await import('../services/agentLoop.js')).default.runAgentLoop(userText, {});
+    const loopOptions = {};
+    if (memory_filter) loopOptions.memoryFilter = memory_filter;
+    if (run_tools === false) {
+      loopOptions.stepLimit = 1;   // No multi-step agent loop for non-tool requests
+      loopOptions.runTools = false;
+    }
+    const state = await (await import('../services/agentLoop.js')).default.runAgentLoop(userText, loopOptions);
     let finalText = state.final_result || 'Done.';
-    
-    // VOICE FILTER: Convert step status messages to natural responses
+
+    // VOICE FILTER: Block step status messages (return empty string, not canned text)
     if (isStepStatusMessage(finalText)) {
-      console.log(`[respond] Filtering step status: ${finalText.slice(0, 50)}...`);
-      finalText = getNaturalResponse(userText, finalText);
+      console.log(`[respond] Blocked step status: ${finalText.slice(0, 60)}...`);
+      finalText = '';
     }
     
     try { conversationLogger.logAssistantMessage(finalText, { sessionId, responseType: 'agent' }); } catch {}
@@ -1826,7 +1795,7 @@ router.post('/logs/conversation/session/end', (req, res) => {
 // Compatibility endpoint for realtime runner: route text to agent loop
 router.post('/respond', async (req, res) => {
   try {
-    const { text, messages } = req.body || {};
+    const { text, messages, memory_filter, run_tools } = req.body || {};
     const goal = (typeof text === 'string' && text.trim())
       ? text.trim()
       : Array.isArray(messages)
@@ -1837,13 +1806,19 @@ router.post('/respond', async (req, res) => {
       return res.status(400).json({ ok: false, error: 'Missing text/messages' });
     }
 
-    const state = await agentLoop.runAgentLoop(goal, {});
+    const loopOpts = {};
+    if (memory_filter) loopOpts.memoryFilter = memory_filter;
+    if (run_tools === false) {
+      loopOpts.stepLimit = 1;   // No multi-step agent loop for non-tool requests
+      loopOpts.runTools = false;
+    }
+    const state = await agentLoop.runAgentLoop(goal, loopOpts);
     let finalText = state.final_result || 'Done.';
-    
-    // VOICE FILTER: Convert step status messages to natural responses
+
+    // VOICE FILTER: Block step status messages (return empty string, not canned text)
     if (isStepStatusMessage(finalText)) {
-      console.log(`[respond] Filtering step status: ${finalText.slice(0, 50)}...`);
-      finalText = getNaturalResponse(goal, finalText);
+      console.log(`[respond] Blocked step status: ${finalText.slice(0, 60)}...`);
+      finalText = '';
     }
     
     res.json({ ok: true, output_text: String(finalText || '').slice(0, 4000), agent: {

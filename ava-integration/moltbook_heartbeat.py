@@ -128,6 +128,9 @@ def check_notifications(api_key):
 
 def run_heartbeat():
     """Run the Moltbook heartbeat check."""
+    if os.environ.get('DISABLE_AUTONOMY') == '1':
+        print("[autonomy] disabled (voice mode) — moltbook heartbeat skipped")
+        return {"status": "disabled_voice_mode"}
     print(f"\n[moltbook] Heartbeat starting at {datetime.now().isoformat()}")
 
     creds = load_credentials()

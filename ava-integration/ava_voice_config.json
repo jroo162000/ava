@@ -68,7 +68,7 @@
     "comment": "Partials display only, finals trigger DECIDE. Mic muted during SPEAK state."
   },
   "barge_in": {
-    "enabled": true,
+    "enabled": false,
     "min_speech_ms": 500,
     "require_final_to_interrupt": true,
     "cancel_tts_on_interrupt": true,
@@ -94,7 +94,7 @@
     "comment": "Supervisor settings for crash containment and recovery."
   },
   "validation_mode": {
-    "enabled": false,
+    "enabled": true,
     "wake_words": ["ava", "eva", "hey ava", "hey eva", "ok ava"],
     "min_words_without_wake": 3,
     "blocked_tools": ["camera_ops", "proactive_suggest"],
