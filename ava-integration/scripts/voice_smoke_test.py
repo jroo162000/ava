@@ -483,6 +483,51 @@ else:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# TEST 8: Memory filter in validation mode — no workflows contaminating intent
+# ══════════════════════════════════════════════════════════════════════════════
+
+print("\n[TEST 8] Memory filter — validation mode restricts to facts only")
+
+# Python side: sends memory_filter when validation mode is on
+check("Python sends memory_filter='facts_only' in validation mode",
+      '"memory_filter"' in runner_src and '"facts_only"' in runner_src)
+check("Python gates memory_filter on _validation_mode",
+      "self._validation_mode" in runner_src and "memory_filter" in runner_src
+      and runner_src.count("_validation_mode") >= 2  # used in multiple places including memory gate
+      )
+
+# Node agentLoop side: respects memoryFilter option
+agentloop_path = os.path.join(PROJECT_ROOT, "..", "ava", "ava-server", "src", "services", "agentLoop.js")
+if not os.path.exists(agentloop_path):
+    agentloop_path = os.path.join(PROJECT_ROOT, "ava-server", "src", "services", "agentLoop.js")
+if os.path.exists(agentloop_path):
+    with open(agentloop_path, "r", encoding="utf-8") as f:
+        agentloop_src = f.read()
+    check("agentLoop stores memoryFilter in state",
+          "memoryFilter" in agentloop_src and "options.memoryFilter" in agentloop_src)
+    check("agentLoop restricts memory types on facts_only",
+          "facts_only" in agentloop_src)
+    check("agentLoop excludes WORKFLOW in facts_only mode",
+          "WORKFLOW" in agentloop_src)
+    check("agentLoop logs memory filter activation",
+          "facts_only (validation mode" in agentloop_src or "facts_only" in agentloop_src)
+else:
+    check("agentLoop.js found", False, f"Not at {agentloop_path}")
+
+# Node api.js side: forwards memory_filter to runAgentLoop
+api_path = os.path.join(PROJECT_ROOT, "..", "ava", "ava-server", "src", "routes", "api.js")
+if not os.path.exists(api_path):
+    api_path = os.path.join(PROJECT_ROOT, "ava-server", "src", "routes", "api.js")
+if os.path.exists(api_path):
+    with open(api_path, "r", encoding="utf-8") as f:
+        api_src = f.read()
+    check("/respond route extracts memory_filter from request",
+          "memory_filter" in api_src and "memoryFilter" in api_src)
+else:
+    check("api.js found", False, f"Not at {api_path}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # RESULTS
 # ══════════════════════════════════════════════════════════════════════════════
 

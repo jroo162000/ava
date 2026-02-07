@@ -68,6 +68,7 @@ function createAgentState(goal, options = {}) {
     },
     toolset: [],
     history: [],
+    memoryFilter: options.memoryFilter || null,
     created_at: new Date().toISOString(),
     updated_at: new Date().toISOString(),
     final_result: null
@@ -102,17 +103,20 @@ async function observe(state) {
       state.last_action,
       state.last_result
     );
-    
+
+    // VALIDATION MODE: restrict memory to facts only — no workflows/agent actions
+    const memoryTypes = state.memoryFilter === 'facts_only'
+      ? [MemoryType.FACT, MemoryType.PREFERENCE, MemoryType.CONSTRAINT]
+      : [MemoryType.PREFERENCE, MemoryType.WORKFLOW, MemoryType.CONSTRAINT,
+         MemoryType.FACT, MemoryType.WARNING, MemoryType.AGENT_ACTION];
+
+    if (state.memoryFilter === 'facts_only') {
+      logger.info('[agent] Memory filter: facts_only (validation mode — no workflows/warnings/agent_actions)');
+    }
+
     const memories = await memoryService.retrieveRelevant(retrievalQuery, 8, {
       minPriority: 2,
-      types: [
-        MemoryType.PREFERENCE,
-        MemoryType.WORKFLOW,
-        MemoryType.CONSTRAINT,
-        MemoryType.FACT,
-        MemoryType.WARNING,
-        MemoryType.AGENT_ACTION
-      ]
+      types: memoryTypes
     });
     
     state.current_context.memories = memories || [];

@@ -2952,7 +2952,7 @@ class StandaloneRealtimeAVA:
                         pctx = get_personality_context()
                     except Exception:
                         pctx = ""
-                return base if base.endswith('/respond') else base.rsplit('/',1)[0] + '/respond', json.dumps({
+                payload = {
                     "sessionId": "voice-default",
                     "messages": [ { "role": "user", "content": text } ],
                     "freshSession": True,  # Voice: don't include old session history
@@ -2961,7 +2961,11 @@ class StandaloneRealtimeAVA:
                     "persona": "AVA",
                     "style": "first_person",
                     "context": self._build_context(pctx)
-                }).encode('utf-8')
+                }
+                # VALIDATION MODE: restrict memory to facts only — no workflows/agent actions
+                if self._validation_mode:
+                    payload["memory_filter"] = "facts_only"
+                return base if base.endswith('/respond') else base.rsplit('/',1)[0] + '/respond', json.dumps(payload).encode('utf-8')
             else:
                 pctx = ""
                 if PERSONALITY_AVAILABLE:
@@ -2969,7 +2973,7 @@ class StandaloneRealtimeAVA:
                         pctx = get_personality_context()
                     except Exception:
                         pctx = ""
-                return base if base.endswith('/chat') else base.rsplit('/',1)[0] + '/chat', json.dumps({
+                payload = {
                     "sessionId": "voice-default",
                     "text": text,
                     "freshSession": True,  # Voice: don't include old session history
@@ -2978,7 +2982,12 @@ class StandaloneRealtimeAVA:
                     "persona": "AVA",
                     "style": "first_person",
                     "context": self._build_context(pctx)
-                }).encode('utf-8')
+                }
+                # VALIDATION MODE: restrict memory to facts only — no workflows/agent actions
+                if self._validation_mode:
+                    payload["memory_filter"] = "facts_only"
+                    payload["includeMemory"] = False  # /chat path: disable memory entirely
+                return base if base.endswith('/chat') else base.rsplit('/',1)[0] + '/chat', json.dumps(payload).encode('utf-8')
         # Preferred
         url, body = _pack(route)
         req = urllib.request.Request(url=url, data=body, headers=headers, method='POST')

@@ -10,6 +10,42 @@ RULES FOR CLAUDE:
 -->
 
 ================================================================================
+2026-02-06 - Memory Filter: Validation Mode Restricts to Facts Only
+================================================================================
+
+WHAT CHANGED:
+- Python _ask_server_respond(): sends memory_filter="facts_only" when _validation_mode is True
+  - /respond path: payload includes memory_filter for agentLoop
+  - /chat path: also sets includeMemory=False to disable memory entirely
+- Node agentLoop.js: createAgentState() stores memoryFilter from options
+  - observe(): when memoryFilter==='facts_only', restricts retrieveRelevant types to
+    [FACT, PREFERENCE, CONSTRAINT] only — excludes WORKFLOW, WARNING, AGENT_ACTION
+  - Logs: [agent] Memory filter: facts_only (validation mode)
+- Node api.js: both /respond routes extract memory_filter from request body
+  and pass as memoryFilter to runAgentLoop options
+
+FILES MODIFIED:
+- ava_standalone_realtime.py: _ask_server_respond() payload + validation_mode gate
+- ava-server/src/services/agentLoop.js: createAgentState, observe() memory type filter
+- ava-server/src/routes/api.js: both /respond routes forward memory_filter
+- scripts/voice_smoke_test.py: Test 8 (7 checks)
+
+WHAT TEST PROVED IT:
+- Smoke test: 18/18 PASS
+- Voice smoke test: 76/76 PASS (was 69, +7 new Test 8 checks)
+  - Python sends memory_filter='facts_only' in validation mode
+  - Python gates on _validation_mode
+  - agentLoop stores memoryFilter in state
+  - agentLoop restricts types on facts_only
+  - agentLoop excludes WORKFLOW
+  - /respond route extracts memory_filter
+
+ACCEPTANCE:
+- Memory retrieval for "ha ava" returns 0 workflows/warnings/agent_actions
+- Only FACT, PREFERENCE, CONSTRAINT memories allowed in validation mode
+- Normal mode (VALIDATION_MODE=0) unaffected — full memory retrieval
+
+================================================================================
 2026-02-06 - Wake-Word-Only Gate (Stop Agent Loop on Bare "ava")
 ================================================================================
 

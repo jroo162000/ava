@@ -170,7 +170,8 @@ const router = express.Router();
 // Realtime compatibility: route text/messages to Agent Loop with memory/tools
 router.post('/respond', async (req, res) => {
   try {
-    const { text, messages, sessionId = 'voice-default', freshSession = false } = req.body || {};
+    const { text, messages, sessionId = 'voice-default', freshSession = false,
+            run_tools, memory_filter } = req.body || {};
     const userText = (typeof text === 'string' && text.trim())
       ? text.trim()
       : Array.isArray(messages) && messages.length > 0
@@ -183,7 +184,9 @@ router.post('/respond', async (req, res) => {
 
     try { conversationLogger.logUserMessage(userText, { sessionId, endpoint: '/respond', freshSession }); } catch {}
 
-    const state = await (await import('../services/agentLoop.js')).default.runAgentLoop(userText, {});
+    const loopOptions = {};
+    if (memory_filter) loopOptions.memoryFilter = memory_filter;
+    const state = await (await import('../services/agentLoop.js')).default.runAgentLoop(userText, loopOptions);
     let finalText = state.final_result || 'Done.';
     
     // VOICE FILTER: Convert step status messages to natural responses
@@ -1826,7 +1829,7 @@ router.post('/logs/conversation/session/end', (req, res) => {
 // Compatibility endpoint for realtime runner: route text to agent loop
 router.post('/respond', async (req, res) => {
   try {
-    const { text, messages } = req.body || {};
+    const { text, messages, memory_filter } = req.body || {};
     const goal = (typeof text === 'string' && text.trim())
       ? text.trim()
       : Array.isArray(messages)
@@ -1837,7 +1840,9 @@ router.post('/respond', async (req, res) => {
       return res.status(400).json({ ok: false, error: 'Missing text/messages' });
     }
 
-    const state = await agentLoop.runAgentLoop(goal, {});
+    const loopOpts = {};
+    if (memory_filter) loopOpts.memoryFilter = memory_filter;
+    const state = await agentLoop.runAgentLoop(goal, loopOpts);
     let finalText = state.final_result || 'Done.';
     
     // VOICE FILTER: Convert step status messages to natural responses
