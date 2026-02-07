@@ -427,6 +427,62 @@ else:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# TEST 7: Wake-word-only gate — no agent loop on bare wake word
+# ══════════════════════════════════════════════════════════════════════════════
+
+print("\n[TEST 7] Wake-word-only gate — bare 'ava' never starts agent loop")
+
+# Static checks
+check("MIN_CONTENT_WORDS constant exists",
+      "MIN_CONTENT_WORDS" in runner_src)
+check("[wake-only] log tag in source",
+      "[wake-only]" in runner_src)
+check("Wake-only ack replies in source",
+      "Yeah?" in runner_src and "I'm here." in runner_src and "Go ahead." in runner_src)
+
+# Logic test: extract _is_chat_only via a minimal fake class
+import textwrap as _tw
+_chat_only_start = runner_src.find("    def _is_chat_only(self, text: str)")
+_chat_only_end = runner_src.find("\n    async def _maybe_handle_local_intent", _chat_only_start)
+if _chat_only_start > 0 and _chat_only_end > _chat_only_start:
+    _method_src = _tw.dedent(runner_src[_chat_only_start:_chat_only_end])
+
+    class _FakeAVA:
+        _wake_words = ['ava', 'eva', 'hey ava', 'hey eva', 'ok ava', 'okay ava', 'hi ava', 'hello ava']
+        COMMAND_VERBS = {
+            'open', 'close', 'search', 'find', 'create', 'delete', 'move', 'rename',
+            'copy', 'paste', 'type', 'send', 'start', 'stop', 'run', 'click', 'show',
+            'play', 'record', 'capture', 'save', 'load', 'download', 'upload', 'install',
+            'uninstall', 'update', 'check', 'set', 'get', 'list', 'add', 'remove',
+            'enable', 'disable', 'toggle', 'switch', 'browse', 'navigate', 'go',
+        }
+        MIN_CONTENT_WORDS = 2
+
+    _ns = {}
+    exec("import random, os\nfrom datetime import datetime\n" + _method_src, _ns)
+    _FakeAVA._is_chat_only = _ns['_is_chat_only']
+    _obj = _FakeAVA()
+
+    # Wake-word-only phrases: MUST return ack (not None)
+    wake_only_phrases = ['ava', 'ha ava', 'hey ava', 'hi ava', 'ava um', 'ava hello']
+    for phrase in wake_only_phrases:
+        result = _obj._is_chat_only(phrase)
+        check(f"Wake-only '{phrase}' -> ack (no agent loop)",
+              result is not None,
+              f"Got None — would start agent loop!" if result is None else "")
+
+    # Command phrases with wake word: MUST return None (go to agent loop)
+    cmd_phrases = ['ava open chrome', 'ava search for news', 'ava type hello']
+    for phrase in cmd_phrases:
+        result = _obj._is_chat_only(phrase)
+        check(f"Command '{phrase}' -> agent loop",
+              result is None,
+              f"Got '{result}' — blocked from agent loop!" if result is not None else "")
+else:
+    check("_is_chat_only method found for logic tests", False)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # RESULTS
 # ══════════════════════════════════════════════════════════════════════════════
 

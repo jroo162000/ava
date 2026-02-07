@@ -10,6 +10,45 @@ RULES FOR CLAUDE:
 -->
 
 ================================================================================
+2026-02-06 - Wake-Word-Only Gate (Stop Agent Loop on Bare "ava")
+================================================================================
+
+WHAT CHANGED:
+- Added wake-word-only gate to _is_chat_only() in canonical runner
+  - After stripping wake word + filler tokens (ha, um, uh, hey, hi, etc.),
+    if fewer than MIN_CONTENT_WORDS (2) remain, returns short ack instead of None
+  - Ack replies: "Yeah?", "I'm here.", "Go ahead.", "Listening.", "What's up?"
+  - Logs: [wake-only] Wake word detected, no command content: '...' -> ack only
+- Added MIN_CONTENT_WORDS = 2 class constant
+- Gate runs BEFORE greeting patterns and command verb checks
+- Commands with verbs still flow to agent loop: "ava open chrome" -> agent loop
+- No /respond call, no memory retrieval, no tool execution for bare wake words
+
+FILES MODIFIED:
+- ava_standalone_realtime.py:
+  - _is_chat_only(): wake-word-only gate at top, MIN_CONTENT_WORDS constant
+- scripts/voice_smoke_test.py:
+  - Added Test 7: Wake-word-only gate (12 checks)
+
+WHAT TEST PROVED IT:
+- Smoke test: 18/18 PASS
+- Voice smoke test: 69/69 PASS (was 57, +12 new Test 7 checks)
+  - Wake-only 'ava' -> ack (no agent loop) ✓
+  - Wake-only 'ha ava' -> ack (no agent loop) ✓
+  - Wake-only 'hey ava' -> ack (no agent loop) ✓
+  - Wake-only 'hi ava' -> ack (no agent loop) ✓
+  - Wake-only 'ava um' -> ack (no agent loop) ✓
+  - Wake-only 'ava hello' -> ack (no agent loop) ✓
+  - Command 'ava open chrome' -> agent loop ✓
+  - Command 'ava search for news' -> agent loop ✓
+  - Command 'ava type hello' -> agent loop ✓
+
+ACCEPTANCE:
+- Saying only "ava" (or "hey ava") never triggers agent loop
+- Never says "completed tasks" for bare wake words
+- Short ack returned locally (~instant, no server round-trip)
+
+================================================================================
 2026-02-06 - Turn-Scoped TTS Token (Voice-Only Response Gate)
 ================================================================================
 

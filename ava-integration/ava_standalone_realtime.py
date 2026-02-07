@@ -5154,6 +5154,9 @@ class StandaloneRealtimeAVA:
 
         return True
 
+    # Minimum real words (after stripping wake word) to enter agent loop
+    MIN_CONTENT_WORDS = 2
+
     def _is_chat_only(self, text: str) -> str | None:
         """Detect conversational transcripts that should NEVER start an agent loop.
 
@@ -5161,6 +5164,7 @@ class StandaloneRealtimeAVA:
         or None if it should go to the server / agent loop.
 
         Rules:
+        - Wake word only (no command content) -> short ack, no agent loop
         - Greetings -> instant local reply
         - Short questions (<=6 words) without a command verb -> instant local reply
         - Anything with an explicit command verb -> None (let agent handle it)
@@ -5175,6 +5179,26 @@ class StandaloneRealtimeAVA:
         has_command = bool(set(words) & self.COMMAND_VERBS)
         if has_command:
             return None  # Let agent loop handle it
+
+        # WAKE-WORD-ONLY GATE: If wake word present but insufficient content after it,
+        # return a short ack — never start the agent loop.
+        wake_words = getattr(self, '_wake_words', ['ava', 'eva'])
+        # Strip all wake-word tokens from the transcript to find remaining content
+        content_after_wake = lower
+        # Remove multi-word wake prefixes first (longest first)
+        wake_prefixes = sorted(wake_words, key=len, reverse=True)
+        for wp in wake_prefixes:
+            if content_after_wake.startswith(wp):
+                content_after_wake = content_after_wake[len(wp):].strip()
+                break
+        # Also strip filler/noise tokens that ASR sometimes prepends
+        filler_tokens = {'ha', 'huh', 'um', 'uh', 'ah', 'oh', 'hmm', 'hey', 'hi', 'hello', 'yo', 'ok', 'okay'}
+        remaining_words = [w for w in content_after_wake.split() if w not in filler_tokens and w not in wake_words]
+        if any(w in lower for w in wake_words) and len(remaining_words) < self.MIN_CONTENT_WORDS:
+            import random
+            ack_replies = ["Yeah?", "I'm here.", "Go ahead.", "Listening.", "What's up?"]
+            print(f"[wake-only] Wake word detected, no command content: '{text}' -> ack only")
+            return random.choice(ack_replies)
 
         # Greetings - instant local reply
         greeting_patterns = [
