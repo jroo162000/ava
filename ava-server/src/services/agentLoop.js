@@ -55,6 +55,7 @@ function createAgentState(goal, options = {}) {
     status: AgentStatus.RUNNING,
     step_count: 0,
     step_limit: Math.min(options.stepLimit || DEFAULT_STEP_LIMIT, MAX_STEP_LIMIT),
+    runTools: options.runTools !== false,  // default true; false skips tool execution
     last_action: null,
     last_result: null,
     errors: [],
@@ -330,7 +331,14 @@ async function act(state, decision) {
       case DecisionType.TOOL_CALL:
         action.tool = decision.tool;
         action.args = decision.args || {};
-        
+
+        // Honor runTools=false: skip tool execution, return conversational-only
+        if (!state.runTools) {
+          logger.info('[agent] runTools=false, skipping tool execution', { tool: decision.tool });
+          result = { status: 'skipped', message: 'Tool execution disabled for this request (run_tools=false)' };
+          break;
+        }
+
         const tool = await toolsService.getTool(decision.tool);
         if (!tool) {
           result = { status: 'error', message: `Tool not found: ${decision.tool}` };

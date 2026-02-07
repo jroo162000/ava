@@ -245,6 +245,11 @@ async function runDoctor({ mode = 'propose', reason = '' } = {}) {
 }
 
 function scheduleWeeklyReport() {
+  // Guard: skip scheduler when voice mode is active
+  if (process.env.DISABLE_AUTONOMY === '1') {
+    logger.info('[autonomy] disabled (voice mode) — doctor weekly scheduler will not start');
+    return;
+  }
   ensureDirs();
   const state = readJsonSafe(STATE_PATH, { lastReportAt: 0 });
 

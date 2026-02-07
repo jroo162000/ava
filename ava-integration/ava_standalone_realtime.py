@@ -27,6 +27,7 @@ import platform
 import subprocess
 import random
 import uuid
+import hashlib
 VOICE_UNIFIED = os.getenv("VOICE_UNIFIED", "0") == "1"  # legacy override only
 try:
     # Unified voice scaffolding
@@ -591,6 +592,9 @@ class LocalVoiceEngine:
         if hasattr(self.parent, '_is_step_status_message') and self.parent._is_step_status_message(text):
             print(f"[tts-filter] Blocked agent-loop status (local): {text[:60]}...")
             return
+        # TTS SOURCE OF TRUTH: sha1 proves no hidden rewrite between /respond and TTS
+        _sha1 = hashlib.sha1(text.encode()).hexdigest()[:12]
+        print(f"[tts-in] TTS_SOURCE=local turn_id={turn_id} sha1={_sha1} preview='{text[:60]}...'")
         try:
             print(f"[local-tts] Synthesizing: {text[:50]}...")
             communicate = edge_tts.Communicate(text, self.edge_voice)
@@ -883,12 +887,14 @@ class LocalVoiceEngine:
                                             # TURN STATE: Entering SPEAK phase
                                             if hasattr(self.parent, '_turn_state'):
                                                 self.parent._turn_state.transition(TurnState.SPEAK, "TTS starting")
-                                            loop.run_until_complete(
-                                                self.synthesize_speech(reply, turn_id=tts_token)
-                                            )
-                                            # TURN STATE: Back to IDLE
-                                            if hasattr(self.parent, '_turn_state'):
-                                                self.parent._turn_state.force_idle("TTS complete")
+                                            try:
+                                                loop.run_until_complete(
+                                                    self.synthesize_speech(reply, turn_id=tts_token)
+                                                )
+                                            finally:
+                                                # TURN STATE: Back to IDLE (guaranteed cleanup)
+                                                if hasattr(self.parent, '_turn_state'):
+                                                    self.parent._turn_state.force_idle("TTS complete")
 
                                             # Track for correction detection
                                             self.parent._last_user_transcript = transcript
@@ -992,12 +998,14 @@ class LocalVoiceEngine:
                                         # TURN STATE: Entering SPEAK phase
                                         if hasattr(self.parent, '_turn_state'):
                                             self.parent._turn_state.transition(TurnState.SPEAK, "TTS starting")
-                                        loop.run_until_complete(
-                                            self.synthesize_speech(reply, turn_id=tts_token)
-                                        )
-                                        # TURN STATE: Back to IDLE
-                                        if hasattr(self.parent, '_turn_state'):
-                                            self.parent._turn_state.force_idle("TTS complete")
+                                        try:
+                                            loop.run_until_complete(
+                                                self.synthesize_speech(reply, turn_id=tts_token)
+                                            )
+                                        finally:
+                                            # TURN STATE: Back to IDLE (guaranteed cleanup)
+                                            if hasattr(self.parent, '_turn_state'):
+                                                self.parent._turn_state.force_idle("TTS complete")
 
                                         # Track for correction detection
                                         self.parent._last_user_transcript = transcript
@@ -1618,13 +1626,16 @@ class StandaloneRealtimeAVA:
                             active_token = self._turn_state.tts_token
                             if tts_token != active_token:
                                 print(f"[tts.blocked_background] Rejected (unified): turn_id={tts_token} active={active_token}")
+                                # No TTS will fire, so no tts.end event — force cleanup
+                                self._turn_state.force_idle("TTS blocked (unified)")
                             else:
                                 self._voice_session.speak(reply)
                             if utt_id:
                                 self._utt_committed.add(utt_id)
                         except Exception:
-                            pass
-                        # Note: TURN STATE -> IDLE handled by voice session's tts.end event
+                            # TTS failed — force cleanup to prevent leaked SPEAK state
+                            self._turn_state.force_idle("TTS error (unified)")
+                        # Note: On success, TURN STATE -> IDLE handled by voice session's tts.end event
                         # Record interaction for passive learning
                         try:
                             self._last_user_transcript = txt
@@ -2999,10 +3010,11 @@ class StandaloneRealtimeAVA:
                 
                 # NEW: Filter out step execution status messages
                 if self._is_step_status_message(response_text):
-                    print(f"[filter] Detected step status message, requesting natural response")
-                    # Get natural response instead of step status
-                    return self._get_natural_response(text, response_text)
-                
+                    print(f"[filter] Blocked step status from /respond: {response_text[:60]}...")
+                    return ''
+
+                _sha1 = hashlib.sha1(response_text.encode()).hexdigest()[:12]
+                print(f"[respond-out] sha1={_sha1} len={len(response_text)} preview='{response_text[:60]}...'")
                 return response_text
         except urllib.error.HTTPError as he:
             # Fallback to alternate route on 5xx/4xx
@@ -3015,11 +3027,13 @@ class StandaloneRealtimeAVA:
                     j = json.loads(raw.decode('utf-8', errors='ignore'))
                     response_text = (j.get('output_text') or j.get('text') or (j.get('content') or [{}])[0].get('text') or '').strip()
                     
-                    # NEW: Filter out step execution status messages
+                    # Filter out step execution status messages
                     if self._is_step_status_message(response_text):
-                        print(f"[filter] Detected step status message, requesting natural response")
-                        return self._get_natural_response(text, response_text)
-                    
+                        print(f"[filter] Blocked step status from /respond (fallback): {response_text[:60]}...")
+                        return ''
+
+                    _sha1 = hashlib.sha1(response_text.encode()).hexdigest()[:12]
+                    print(f"[respond-out] sha1={_sha1} len={len(response_text)} preview='{response_text[:60]}...'")
                     return response_text
             except Exception as e2:
                 print(f"[route] Server error fallback: {e2}")
@@ -3125,62 +3139,6 @@ class StandaloneRealtimeAVA:
                 return True
 
         return False
-
-    def _get_natural_response(self, original_query: str, bad_response: str) -> str:
-        """Get a natural language response when the server returns a step status message"""
-        try:
-            # Simple fallback responses based on query type
-            low = original_query.lower()
-            
-            if any(x in low for x in ['hi', 'hello', 'hey']):
-                return "Hey there! How can I help you today?"
-            
-            if any(x in low for x in ['huh', 'what', 'pardon', 'repeat']):
-                return "I'm not sure I understood. Could you say that again?"
-            
-            if any(x in low for x in ['name']):
-                return "I'm AVA, your autonomous virtual assistant."
-            
-            if any(x in low for x in ['mouse', 'cursor', 'click']):
-                return "I can help control your mouse. Where would you like me to move it?"
-            
-            if any(x in low for x in ['type', 'write', 'enter']):
-                return "I can type text for you. What should I enter?"
-            
-            if any(x in low for x in ['screenshot', 'screen shot', 'capture']):
-                return "I'll capture a screenshot for you."
-            
-            if any(x in low for x in ['system', 'computer', 'info', 'specs']):
-                return "Let me check your system information."
-            
-            if any(x in low for x in ['weather', 'temperature']):
-                return "I can check the weather for you. What location?"
-            
-            if any(x in low for x in ['time', 'date', 'day']):
-                return "Let me check that for you."
-            
-            if any(x in low for x in ['open', 'launch', 'start']):
-                return "I'll open that for you."
-            
-            if any(x in low for x in ['close', 'exit', 'quit']):
-                return "I'll close that application for you."
-            
-            if any(x in low for x in ['search', 'google', 'look up', 'find']):
-                return "I'll search for that information."
-            
-            # Generic fallback - vary the response
-            import random
-            fallbacks = [
-                "I'm here to help. What would you like me to do?",
-                "What can I assist you with?",
-                "I'm ready to help. What's next?",
-                "How can I help you today?",
-            ]
-            return random.choice(fallbacks)
-            
-        except Exception as e:
-            print(f"[natural_response] Error: {e}")
-            return "I'm processing your request. What else can I help with?"
 
     def _build_context(self, personality_context: str = "") -> dict:
         """Build comprehensive context for server including memory, session, and awareness"""
@@ -3405,6 +3363,9 @@ class StandaloneRealtimeAVA:
         if self._is_step_status_message(text):
             print(f"[tts-filter] Blocked agent-loop status: {text[:60]}...")
             return
+        # TTS SOURCE OF TRUTH: sha1 proves no hidden rewrite between /respond and TTS
+        _sha1 = hashlib.sha1(text.encode()).hexdigest()[:12]
+        print(f"[tts-in] TTS_SOURCE=respond turn_id={turn_id} sha1={_sha1} preview='{text[:60]}...'")
         speak_text = self._prepare_tts_text(text)
         if not speak_text:
             return
@@ -3626,17 +3587,20 @@ class StandaloneRealtimeAVA:
 
                         reply = await self._ask_server_respond(enhanced_transcript)
                         if reply:
-                            # Final safety filter - never speak step status messages
+                            # Final safety filter - block step status (don't replace with canned text)
                             if self._is_step_status_message(reply):
-                                print(f"[filter] Suppressing step status: {reply[:50]}...")
-                                reply = self._get_natural_response(enhanced_transcript, reply)
+                                print(f"[filter] Blocked step status at ASR receiver: {reply[:60]}...")
+                                reply = ''
+                        if reply:
                             print(f"🤖 AVA: {reply}")
 
                             # TURN STATE: Entering SPEAK phase
                             self._turn_state.transition(TurnState.SPEAK, "TTS starting")
-                            await self._speak_text(reply, turn_id=tts_token)
-                            # TURN STATE: Back to IDLE after speaking
-                            self._turn_state.force_idle("TTS complete")
+                            try:
+                                await self._speak_text(reply, turn_id=tts_token)
+                            finally:
+                                # TURN STATE: Back to IDLE after speaking (guaranteed cleanup)
+                                self._turn_state.force_idle("TTS complete")
 
                             # Track for correction detection
                             self._last_user_transcript = transcript
@@ -3649,7 +3613,7 @@ class StandaloneRealtimeAVA:
                                 except:
                                     pass
                         else:
-                            # No reply - return to IDLE
+                            # No reply or blocked status - return to IDLE
                             self._turn_state.force_idle("no reply")
                     else:
                         # PARTIAL TRANSCRIPT: Display only, NEVER trigger tools
@@ -4599,14 +4563,22 @@ class StandaloneRealtimeAVA:
                                                         if not self._check_confirmation(content):
                                                             confirmation_msg = f"Should I {content}? Say 'yes' to confirm or 'no' to cancel."
                                                             print(f"AVA: {confirmation_msg}")
-                                                            self._speak_text(confirmation_msg, turn_id=tts_token)
+                                                            # Dispatch async _speak_text through event loop (sync context)
+                                                            if loop and loop.is_running():
+                                                                asyncio.run_coroutine_threadsafe(self._speak_text(confirmation_msg, turn_id=tts_token), loop).result(timeout=30)
+                                                            else:
+                                                                asyncio.run(self._speak_text(confirmation_msg, turn_id=tts_token))
                                                             return
 
                                                     # Try local tool dispatch
                                                     tool_result = self._try_tool_dispatch(content)
                                                     if tool_result:
                                                         print(f"AVA: {tool_result}")
-                                                        self._speak_text(tool_result, turn_id=tts_token)
+                                                        # Dispatch async _speak_text through event loop (sync context)
+                                                        if loop and loop.is_running():
+                                                            asyncio.run_coroutine_threadsafe(self._speak_text(tool_result, turn_id=tts_token), loop).result(timeout=30)
+                                                        else:
+                                                            asyncio.run(self._speak_text(tool_result, turn_id=tts_token))
                                                         # Record in session history
                                                         if self.session_manager_enabled and self.voice_session:
                                                             self.voice_session.add_exchange(content, tool_result)
