@@ -179,7 +179,8 @@ for i, line in enumerate(lines):
 
 if class_start and class_end:
     class_src = "\n".join(lines[class_start:class_end])
-    exec_ns = {"threading": threading, "time": time, "print": _silent_print}
+    import uuid
+    exec_ns = {"threading": threading, "time": time, "uuid": uuid, "print": _silent_print}
     exec(class_src, exec_ns)
     TurnState = exec_ns["TurnState"]
     TurnStateMachine = exec_ns["TurnStateMachine"]
@@ -291,7 +292,7 @@ for phrase in pass_phrases:
 check("TTS chokepoint in _speak_text()",
       "_is_step_status_message(text)" in runner_src and "[tts-filter]" in runner_src)
 check("TTS chokepoint in synthesize_speech()",
-      "_is_step_status_message(text)" in runner_src.split("def synthesize_speech")[1][:500] if "def synthesize_speech" in runner_src else False)
+      "_is_step_status_message(text)" in runner_src.split("def synthesize_speech")[1][:800] if "def synthesize_speech" in runner_src else False)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -339,6 +340,90 @@ check("validation_mode.enabled = true in config",
 # Check barge-in disabled
 check("barge_in.enabled = false in config",
       config.get("barge_in", {}).get("enabled") == False)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TEST 6: Turn-scoped TTS token
+# ══════════════════════════════════════════════════════════════════════════════
+
+print("\n[TEST 6] Turn-scoped TTS token — voice-only response gate")
+
+# Signature checks
+check("_speak_text has turn_id param",
+      "def _speak_text(self, text: str, turn_id=None)" in runner_src)
+check("synthesize_speech has turn_id param",
+      "def synthesize_speech(self, text, turn_id=None)" in runner_src)
+check("_maybe_handle_local_intent has turn_id param",
+      "def _maybe_handle_local_intent(self, transcript: str, turn_id=None)" in runner_src)
+check("mint_tts_token method exists",
+      "def mint_tts_token(self, reason=" in runner_src)
+check("tts_token property exists",
+      "def tts_token(self):" in runner_src and "@property" in runner_src)
+check("[tts.blocked_background] string in source",
+      "[tts.blocked_background]" in runner_src)
+
+# Static check: every _speak_text( call has turn_id= (except the signature)
+speak_calls = [line.strip() for line in runner_src.split("\n")
+               if "_speak_text(" in line and "def _speak_text" not in line and line.strip()]
+all_have_turn_id = all("turn_id=" in call for call in speak_calls)
+check("All _speak_text calls have turn_id=",
+      all_have_turn_id,
+      f"Missing turn_id in: {[c[:60] for c in speak_calls if 'turn_id=' not in c]}" if not all_have_turn_id else "")
+
+# Static check: every synthesize_speech( call has turn_id= (except the signature)
+synth_calls = [line.strip() for line in runner_src.split("\n")
+               if "synthesize_speech(" in line and "def synthesize_speech" not in line and line.strip()]
+all_synth_have_turn_id = all("turn_id=" in call for call in synth_calls)
+check("All synthesize_speech calls have turn_id=",
+      all_synth_have_turn_id,
+      f"Missing turn_id in: {[c[:60] for c in synth_calls if 'turn_id=' not in c]}" if not all_synth_have_turn_id else "")
+
+# Manual logic tests using the extracted TurnStateMachine
+if 'TurnStateMachine' in dir() or 'TurnStateMachine' in exec_ns:
+    TSM = exec_ns.get("TurnStateMachine", None)
+    TS = exec_ns.get("TurnState", None)
+    if TSM and TS:
+        # Test 1: Mint token via DECIDE transition
+        sm2 = TSM()
+        sm2.transition(TS.LISTEN, "test")
+        sm2.transition(TS.FINAL, "test")
+        sm2.transition(TS.DECIDE, "test")
+        token_after_decide = sm2.tts_token
+        check("DECIDE transition mints tts_token",
+              token_after_decide is not None and len(token_after_decide) == 8)
+
+        # Test 2: force_idle clears token
+        sm2.transition(TS.SPEAK, "test")
+        sm2.force_idle("test clear")
+        check("force_idle clears tts_token",
+              sm2.tts_token is None)
+
+        # Test 3: mint_tts_token manual mint
+        manual_token = sm2.mint_tts_token("test-manual")
+        check("mint_tts_token returns non-None 8-char string",
+              manual_token is not None and len(manual_token) == 8)
+
+        # Test 4: Each mint produces a different token
+        sm3 = TSM()
+        sm3.transition(TS.LISTEN, "t")
+        sm3.transition(TS.FINAL, "t")
+        sm3.transition(TS.DECIDE, "t")
+        token_a = sm3.tts_token
+        sm3.force_idle("reset")
+        sm3.transition(TS.LISTEN, "t")
+        sm3.transition(TS.FINAL, "t")
+        sm3.transition(TS.DECIDE, "t")
+        token_b = sm3.tts_token
+        check("Different turns produce different tokens",
+              token_a != token_b)
+
+        # Test 5: Startup announcement is log-only (no TTS)
+        check("Startup announcement is log-only (no TTS speak)",
+              "Brain server isn't reachable. Running voice only. (no TTS" in runner_src)
+    else:
+        check("TurnStateMachine available for logic tests", False)
+else:
+    check("TurnStateMachine available for logic tests", False)
 
 
 # ══════════════════════════════════════════════════════════════════════════════

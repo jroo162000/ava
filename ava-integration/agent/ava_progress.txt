@@ -10,6 +10,66 @@ RULES FOR CLAUDE:
 -->
 
 ================================================================================
+2026-02-06 - Turn-Scoped TTS Token (Voice-Only Response Gate)
+================================================================================
+
+WHAT CHANGED:
+- Added turn-scoped TTS token to TurnStateMachine:
+  - `_tts_token` field initialized to None
+  - Token minted (uuid4 hex[:8]) on transition to DECIDE
+  - Token cleared on force_idle()
+  - `tts_token` property for thread-safe read
+  - `mint_tts_token()` method for agent mode (no DECIDE transition)
+- Gated `_speak_text()`: requires valid turn_id matching active token
+- Gated `synthesize_speech()`: same turn_id gate for local TTS path
+- Gated unified voice path: token check before `_voice_session.speak()`
+- Updated `_maybe_handle_local_intent()` signature: added `turn_id=None`
+- Threaded turn_id through ALL voice paths:
+  - Standard ASR receiver (Deepgram)
+  - LocalVoiceEngine hybrid path
+  - LocalVoiceEngine legacy Whisper path
+  - Unified voice session path
+  - Agent mode ConversationText handler
+- Converted startup degraded-mode announcement to log-only (no TTS — no active turn)
+- Blocked TTS calls without valid token log: [tts.blocked_background]
+- Added `import uuid` to runner
+
+FILES MODIFIED:
+- ava_standalone_realtime.py:
+  - TurnStateMachine: _tts_token, tts_token property, mint_tts_token()
+  - transition(): mint on DECIDE
+  - force_idle(): clear token
+  - _speak_text(): turn_id gate
+  - synthesize_speech(): turn_id gate
+  - _maybe_handle_local_intent(): turn_id param, all _speak_text calls threaded
+  - ASR receiver: capture token after DECIDE, pass to _maybe_handle_local_intent + _speak_text
+  - LocalVoiceEngine hybrid: same
+  - LocalVoiceEngine legacy: same
+  - Unified voice path: same + direct speak() gate
+  - Agent mode: mint_tts_token on user text, pass to all handlers
+  - Startup announcement: log-only, no TTS
+- scripts/voice_smoke_test.py:
+  - Added `uuid` to exec namespace for TurnStateMachine tests
+  - Widened synthesize_speech chokepoint check window (500->800 chars)
+  - Added Test 6: Turn-scoped TTS token (13 checks)
+
+WHAT TEST PROVED IT:
+- Smoke test: 18/18 PASS
+- Voice smoke test: 57/57 PASS (was 44/44, +13 new Test 6 checks)
+  - Signature checks: _speak_text, synthesize_speech, _maybe_handle_local_intent
+  - mint_tts_token method exists, tts_token property exists
+  - [tts.blocked_background] string in source
+  - Static: ALL _speak_text calls have turn_id=
+  - Static: ALL synthesize_speech calls have turn_id=
+  - Logic: DECIDE mints token, force_idle clears it
+  - Logic: mint_tts_token returns 8-char string
+  - Logic: different turns produce different tokens
+  - Startup announcement is log-only
+
+WHAT'S NEXT:
+- Ready for user direction on next work items
+
+================================================================================
 2026-02-06 - Whisper Stability Guard (Stop 20s Stalls / Empty Finals)
 ================================================================================
 

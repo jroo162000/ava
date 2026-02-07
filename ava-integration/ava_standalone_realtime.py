@@ -26,6 +26,7 @@ import re
 import platform
 import subprocess
 import random
+import uuid
 VOICE_UNIFIED = os.getenv("VOICE_UNIFIED", "0") == "1"  # legacy override only
 try:
     # Unified voice scaffolding
@@ -278,6 +279,7 @@ class TurnStateMachine:
         self._lock = threading.Lock()
         self._turn_id = 0
         self._turn_start_time = 0.0
+        self._tts_token = None
         # D005: Barge-in HARD DISABLED for stability. Do not re-enable via config.
         self._barge_in_enabled = False
         self._interrupted = False
@@ -333,6 +335,11 @@ class TurnStateMachine:
             reason_str = f" ({reason})" if reason else ""
             print(f"[turn-state] {old_state} -> {new_state}{reason_str}")
 
+            # Mint TTS token when entering DECIDE — only this turn may speak
+            if new_state == TurnState.DECIDE:
+                self._tts_token = uuid.uuid4().hex[:8]
+                print(f"[turn-token] Minted {self._tts_token} for turn {self._turn_id}")
+
             return True
 
     def _is_valid_transition(self, old: str, new: str) -> bool:
@@ -370,11 +377,24 @@ class TurnStateMachine:
             if old_state != TurnState.IDLE:
                 print(f"[turn-state] {old_state} -> {TurnState.IDLE} ({reason})")
                 self._state = TurnState.IDLE
+                self._tts_token = None
 
     def was_interrupted(self) -> bool:
         """Check if the current turn was started via barge-in interrupt."""
         with self._lock:
             return self._interrupted
+
+    @property
+    def tts_token(self):
+        with self._lock:
+            return self._tts_token
+
+    def mint_tts_token(self, reason="agent-mode"):
+        """Manually mint a TTS token for code paths that don't use transition(DECIDE)."""
+        with self._lock:
+            self._tts_token = uuid.uuid4().hex[:8]
+            print(f"[turn-token] Minted {self._tts_token} ({reason})")
+            return self._tts_token
 
 
 class WavToPcmStripper:
@@ -558,9 +578,14 @@ class LocalVoiceEngine:
         samples = struct.unpack('<' + 'h' * n, audio_bytes[:n*2])
         return (sum(s*s for s in samples) / n) ** 0.5
     
-    async def synthesize_speech(self, text):
+    async def synthesize_speech(self, text, turn_id=None):
         """Generate speech using Edge TTS and play it"""
         if not text or not EDGE_TTS_AVAILABLE:
+            return
+        # TURN-SCOPED TTS GATE: Only user-turn responses may speak
+        active_token = getattr(self.parent._turn_state, 'tts_token', None) if hasattr(self.parent, '_turn_state') else None
+        if turn_id is None or turn_id != active_token:
+            print(f"[tts.blocked_background] Rejected (local): turn_id={turn_id} active={active_token} text='{(text or '')[:40]}...'")
             return
         # CHOKEPOINT FILTER: Block internal agent-loop status from local TTS path
         if hasattr(self.parent, '_is_step_status_message') and self.parent._is_step_status_message(text):
@@ -830,6 +855,7 @@ class LocalVoiceEngine:
                                     self.parent._turn_state.transition(TurnState.LISTEN, "user speaking")
                                     self.parent._turn_state.transition(TurnState.FINAL, "final transcript")
                                     self.parent._turn_state.transition(TurnState.DECIDE, "processing")
+                                tts_token = self.parent._turn_state.tts_token
 
                                 # Get response from server (only if addressed)
                                 loop = asyncio.new_event_loop()
@@ -840,7 +866,7 @@ class LocalVoiceEngine:
 
                                     # Handle local intents first
                                     handled = loop.run_until_complete(
-                                        self.parent._maybe_handle_local_intent(transcript)
+                                        self.parent._maybe_handle_local_intent(transcript, turn_id=tts_token)
                                     )
                                     if not handled:
                                         # Check for past mistakes
@@ -858,7 +884,7 @@ class LocalVoiceEngine:
                                             if hasattr(self.parent, '_turn_state'):
                                                 self.parent._turn_state.transition(TurnState.SPEAK, "TTS starting")
                                             loop.run_until_complete(
-                                                self.synthesize_speech(reply)
+                                                self.synthesize_speech(reply, turn_id=tts_token)
                                             )
                                             # TURN STATE: Back to IDLE
                                             if hasattr(self.parent, '_turn_state'):
@@ -938,6 +964,7 @@ class LocalVoiceEngine:
                                 self.parent._turn_state.transition(TurnState.LISTEN, "user speaking")
                                 self.parent._turn_state.transition(TurnState.FINAL, "final transcript")
                                 self.parent._turn_state.transition(TurnState.DECIDE, "processing")
+                            tts_token = self.parent._turn_state.tts_token if hasattr(self.parent, '_turn_state') else None
 
                             # Get response from server (only if addressed)
                             loop = asyncio.new_event_loop()
@@ -948,7 +975,7 @@ class LocalVoiceEngine:
 
                                 # Handle local intents first
                                 handled = loop.run_until_complete(
-                                    self.parent._maybe_handle_local_intent(transcript)
+                                    self.parent._maybe_handle_local_intent(transcript, turn_id=tts_token)
                                 )
                                 if not handled:
                                     # Check for past mistakes
@@ -966,7 +993,7 @@ class LocalVoiceEngine:
                                         if hasattr(self.parent, '_turn_state'):
                                             self.parent._turn_state.transition(TurnState.SPEAK, "TTS starting")
                                         loop.run_until_complete(
-                                            self.synthesize_speech(reply)
+                                            self.synthesize_speech(reply, turn_id=tts_token)
                                         )
                                         # TURN STATE: Back to IDLE
                                         if hasattr(self.parent, '_turn_state'):
@@ -1546,6 +1573,7 @@ class StandaloneRealtimeAVA:
             self._turn_state.transition(TurnState.LISTEN, "user speaking")
             self._turn_state.transition(TurnState.FINAL, "final transcript")
             self._turn_state.transition(TurnState.DECIDE, "processing")
+            tts_token = self._turn_state.tts_token
 
             # Mirror correction/local-intent/enhancement + respond flow
             try:
@@ -1560,7 +1588,7 @@ class StandaloneRealtimeAVA:
                 if self._detect_correction(txt):
                     self._handle_correction(txt)
                 # Local intents first
-                handled = loop.run_until_complete(self._maybe_handle_local_intent(txt))
+                handled = loop.run_until_complete(self._maybe_handle_local_intent(txt, turn_id=tts_token))
                 if not handled:
                     enhanced = self._get_enhanced_transcript(txt)
                     # Utterance commit handling
@@ -1586,7 +1614,12 @@ class StandaloneRealtimeAVA:
                             except Exception:
                                 pass
                             print(f"[tts-debug] speak() called with: {reply[:50]}...")
-                            self._voice_session.speak(reply)
+                            # TURN-SCOPED TTS GATE for unified path
+                            active_token = self._turn_state.tts_token
+                            if tts_token != active_token:
+                                print(f"[tts.blocked_background] Rejected (unified): turn_id={tts_token} active={active_token}")
+                            else:
+                                self._voice_session.speak(reply)
                             if utt_id:
                                 self._utt_committed.add(utt_id)
                         except Exception:
@@ -1964,7 +1997,7 @@ class StandaloneRealtimeAVA:
                 self._announce_degraded = False
                 time.sleep(0.2)
                 try:
-                    self._voice_session.speak("Brain server isn't reachable. I'm running voice only.")
+                    print("[voice-unified] Brain server isn't reachable. Running voice only. (no TTS — no active turn)")
                 except Exception:
                     pass
         except Exception:
@@ -3351,8 +3384,13 @@ class StandaloneRealtimeAVA:
         except Exception:
             pass
 
-    async def _speak_text(self, text: str):
+    async def _speak_text(self, text: str, turn_id=None):
         if not text:
+            return
+        # TURN-SCOPED TTS GATE: Only user-turn responses may speak
+        active_token = getattr(self._turn_state, 'tts_token', None)
+        if turn_id is None or turn_id != active_token:
+            print(f"[tts.blocked_background] Rejected: turn_id={turn_id} active={active_token} text='{(text or '')[:40]}...'")
             return
         # CHOKEPOINT FILTER: Block internal agent-loop status from ALL voice paths
         if self._is_step_status_message(text):
@@ -3562,13 +3600,14 @@ class StandaloneRealtimeAVA:
                         self._turn_state.transition(TurnState.LISTEN, "user speaking")
                         self._turn_state.transition(TurnState.FINAL, "final transcript")
                         self._turn_state.transition(TurnState.DECIDE, "processing")
+                        tts_token = self._turn_state.tts_token
 
                         # Check if this is a correction of AVA's last response
                         if self._detect_correction(transcript):
                             self._handle_correction(transcript)
 
                         # Intercept local intents (doctor/capabilities/approval)
-                        handled = await self._maybe_handle_local_intent(transcript)
+                        handled = await self._maybe_handle_local_intent(transcript, turn_id=tts_token)
                         if handled:
                             self._turn_state.force_idle("local intent handled")
                             continue
@@ -3586,7 +3625,7 @@ class StandaloneRealtimeAVA:
 
                             # TURN STATE: Entering SPEAK phase
                             self._turn_state.transition(TurnState.SPEAK, "TTS starting")
-                            await self._speak_text(reply)
+                            await self._speak_text(reply, turn_id=tts_token)
                             # TURN STATE: Back to IDLE after speaking
                             self._turn_state.force_idle("TTS complete")
 
@@ -4525,6 +4564,7 @@ class StandaloneRealtimeAVA:
                                         # Self-awareness and tools routing: on user text, handle local intents first,
                                         # then try corrected tools via cmpuse Agent; else call AVA server and speak reply
                                         if role == 'user' and content.strip():
+                                            tts_token = self._turn_state.mint_tts_token("agent-user-text")
                                             try:
                                                 import asyncio
                                                 loop = None
@@ -4535,10 +4575,10 @@ class StandaloneRealtimeAVA:
                                                 # Handle self-awareness/intents locally first
                                                 handled = False
                                                 if loop and loop.is_running():
-                                                    fut0 = asyncio.run_coroutine_threadsafe(self._maybe_handle_local_intent(content), loop)
+                                                    fut0 = asyncio.run_coroutine_threadsafe(self._maybe_handle_local_intent(content, turn_id=tts_token), loop)
                                                     handled = bool(fut0.result(timeout=10))
                                                 else:
-                                                    handled = asyncio.run(self._maybe_handle_local_intent(content))
+                                                    handled = asyncio.run(self._maybe_handle_local_intent(content, turn_id=tts_token))
                                                 if handled:
                                                     return
                                                 
@@ -4550,14 +4590,14 @@ class StandaloneRealtimeAVA:
                                                         if not self._check_confirmation(content):
                                                             confirmation_msg = f"Should I {content}? Say 'yes' to confirm or 'no' to cancel."
                                                             print(f"AVA: {confirmation_msg}")
-                                                            self._speak_text(confirmation_msg)
+                                                            self._speak_text(confirmation_msg, turn_id=tts_token)
                                                             return
-                                                    
+
                                                     # Try local tool dispatch
                                                     tool_result = self._try_tool_dispatch(content)
                                                     if tool_result:
                                                         print(f"AVA: {tool_result}")
-                                                        self._speak_text(tool_result)
+                                                        self._speak_text(tool_result, turn_id=tts_token)
                                                         # Record in session history
                                                         if self.session_manager_enabled and self.voice_session:
                                                             self.voice_session.add_exchange(content, tool_result)
@@ -5192,7 +5232,7 @@ class StandaloneRealtimeAVA:
 
         return None  # Not chat-only, let server handle it
 
-    async def _maybe_handle_local_intent(self, transcript: str) -> bool:
+    async def _maybe_handle_local_intent(self, transcript: str, turn_id=None) -> bool:
         """Handle key voice intents locally to keep server-truth consistent"""
         try:
             text = (transcript or '').strip()
@@ -5204,7 +5244,7 @@ class StandaloneRealtimeAVA:
             chat_reply = self._is_chat_only(text)
             if chat_reply:
                 print(f"[chat-first] Direct reply (no agent loop): '{chat_reply}'")
-                await self._speak_text(chat_reply)
+                await self._speak_text(chat_reply, turn_id=turn_id)
                 return True
 
             # Voice approval for apply: require nonce, e.g., "APPLY 4821"
@@ -5215,13 +5255,13 @@ class StandaloneRealtimeAVA:
                 if re.search(rf"\bapply\s+{re.escape(nonce)}\b", lower, re.IGNORECASE):
                     conf = float(getattr(self, '_last_asr_confidence', 1.0) or 1.0)
                     if conf < 0.85:
-                        await self._speak_text("I didn't catch that clearly. Please press F10 twice or confirm in the UI.")
+                        await self._speak_text("I didn't catch that clearly. Please press F10 twice or confirm in the UI.", turn_id=turn_id)
                         return True
                     # Require second factor if confidence is borderline
                     if conf < 0.95:
                         self._apply_hotkey_armed = True
                         self._apply_hotkey_armed_until = time.time() + 10.0
-                        await self._speak_text("Second factor required. Press F10 twice or confirm in the UI.")
+                        await self._speak_text("Second factor required. Press F10 twice or confirm in the UI.", turn_id=turn_id)
                         return True
                     token = f"YES_APPLY_{int(now)}"
                     res = None
@@ -5229,7 +5269,7 @@ class StandaloneRealtimeAVA:
                         res = self.server_client.doctor(mode='apply', reason=self._apply_reason or 'voice_apply', confirm_token=token)
                     msg = 'Applied maintenance successfully.' if res and res.get('ok') and not (res.get('applyResult') or {}).get('rolledBack') else 'Apply failed or rolled back.'
                     print(f"[doctor] Voice approval → apply: {msg}")
-                    await self._speak_text(msg)
+                    await self._speak_text(msg, turn_id=turn_id)
                     self._pending_apply_until = 0.0
                     self._apply_reason = ''
                     self._apply_nonce = None
@@ -5243,7 +5283,7 @@ class StandaloneRealtimeAVA:
                 ok = bool(res and res.get('ok'))
                 msg = 'Maintenance report generated.' if ok else 'Maintenance request failed.'
                 print(f"[doctor] Voice propose: {msg}")
-                await self._speak_text(msg)
+                await self._speak_text(msg, turn_id=turn_id)
                 return True
 
             # Trigger: doctor apply (ask for confirmation)
@@ -5253,7 +5293,7 @@ class StandaloneRealtimeAVA:
                 self._apply_nonce = random.randint(1000, 9999)
                 prompt = f"To confirm, say: APPLY {self._apply_nonce}."
                 print("[doctor] Awaiting voice confirmation with nonce for apply...")
-                await self._speak_text(prompt)
+                await self._speak_text(prompt, turn_id=turn_id)
                 return True
 
             # Trigger: brain reconnect
@@ -5261,10 +5301,10 @@ class StandaloneRealtimeAVA:
                 try:
                     self._ensure_server_started()
                     status = getattr(self, '_brain_status', 'unknown')
-                    await self._speak_text('Brain reconnected.' if status in ('up','started') else 'Brain still unreachable. Running voice only.')
+                    await self._speak_text('Brain reconnected.' if status in ('up','started') else 'Brain still unreachable. Running voice only.', turn_id=turn_id)
                 except Exception as e:
                     print(f"[server] Reconnect error: {e}")
-                    await self._speak_text('Could not reconnect to brain.')
+                    await self._speak_text('Could not reconnect to brain.', turn_id=turn_id)
                 return True
 
             # Capability/identity short-hands
@@ -5272,7 +5312,7 @@ class StandaloneRealtimeAVA:
                 if getattr(self, 'server_caps', None):
                     tools = self.server_caps.get('tools') if isinstance(self.server_caps, dict) else []
                     reply = f"I currently have {len(tools or [])} tools available."
-                    await self._speak_text(reply)
+                    await self._speak_text(reply, turn_id=turn_id)
                     return True
             if any(p in lower for p in ['who are you', 'what are you']):
                 if getattr(self, 'server_explain', None) and self.server_explain.get('ok'):
@@ -5282,7 +5322,7 @@ class StandaloneRealtimeAVA:
                         f"I am {who.get('name') or 'AVA'}. "
                         f"LLM {can.get('llmProvider') or 'unknown'}, bridge is {'healthy' if can.get('bridgeHealthy') else 'down'}."
                     )
-                    await self._speak_text(reply)
+                    await self._speak_text(reply, turn_id=turn_id)
                     return True
 
             # NEW: Intent router for classified commands
