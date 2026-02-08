@@ -10,6 +10,90 @@ RULES FOR CLAUDE:
 -->
 
 ================================================================================
+2026-02-07 - Priorities 2-4: Piper routing, echo suppression, latency
+================================================================================
+
+WHAT CHANGED:
+- P2: _speak_text() detects unified mode and routes through _voice_session.speak()
+      (Piper/Edge local) instead of Deepgram remote API. Fixes 400 error spam.
+      Startup log confirms TTS engine selection.
+- P3: Unified bus handler now sets/clears runner tts_active on tts.start/tts.end.
+      ASR partials dropped during TTS and 10s grace period. Echo gate covers
+      both finals (in _on_final_user_text) and partials (in bus handler).
+- P4: Consolidated [latency] line emitted at tts.end: asr=Nms llm=Nms
+      tts_synth=Nms playback=Nms total=Nms. Uses existing timestamps.
+
+TESTS ADDED:
+- Test 10: 8 checks — unified TTS routing (Piper-only, no Deepgram remote)
+- Test 11: 8 checks — echo suppression (tts_active + partial gating)
+- Test 12: 10 checks — latency instrumentation (consolidated line)
+- Total: 119/119 voice smoke, 18/18 base smoke
+
+SUBAGENT DELEGATION:
+- Direct (Integration Lead): P2, P3, P4 — all targeted single-file changes
+
+================================================================================
+2026-02-07 - Voice Fidelity Hardening (Steps A-E)
+================================================================================
+
+WHAT CHANGED:
+- A1: DISABLE_AUTONOMY guards on all 3 Node schedulers (defense-in-depth)
+- A2: Fixed 2 agent-mode _speak_text calls (silent no-op → proper async dispatch)
+- B1: Deleted _get_natural_response() from Python (55 lines of canned text poison)
+- B2: sha1 fidelity logging at /respond output + TTS input (proves no hidden rewrites)
+- B3: try/finally on all SPEAK→force_idle paths (no leaked state)
+- C1: Deleted getNaturalResponse() from Node api.js; run_tools honored (stepLimit=1,
+      runTools=false); tool execution guard in act() skips tools when disabled
+- D1: 17-check TTS fidelity smoke test (Test 9) catches "hardcoded voice" regression
+
+SUBAGENT DELEGATION:
+- tool-gate-engineer: A1 (scheduler guards), C1 (getNaturalResponse + run_tools)
+- voice-stabilizer: A2 (speak call fix)
+- Direct (Integration Lead): B1, B2, B3, D1
+
+FILES MODIFIED:
+- ava_standalone_realtime.py: B1 (remove _get_natural_response), B2 (sha1 logging),
+  B3 (try/finally), A2 (agent mode async dispatch)
+- scripts/voice_smoke_test.py: D1 (Test 9: 17 fidelity checks, total now 93)
+- ava-server/src/server.js: A1 (DISABLE_AUTONOMY if/else wrapping all schedulers)
+- ava-server/src/services/digestScheduler.js: A1 (callee guard)
+- ava-server/src/services/doctor.js: A1 (callee guard)
+- ava-server/src/routes/api.js: C1 (delete getNaturalResponse, honor run_tools)
+- ava-server/src/services/agentLoop.js: C1 (runTools state, act() guard)
+
+TESTS:
+- 18/18 smoke, 93/93 voice smoke, 48/48 pytest
+
+GIT: committed 7b9c99a, pushed to voice-stability-hardening
+
+================================================================================
+2026-02-06 - Merge-Blocker Pytest Tests (Scheduler + Wake-Only)
+================================================================================
+
+WHAT CHANGED:
+- Added TestSchedulerDisabledInVoiceMode (5 pytest tests):
+  - test_scheduler_exits_early_on_disable_autonomy
+  - test_scheduler_no_full_autonomy_after_guard
+  - test_scheduler_forbidden_strings_unreachable
+  - test_heartbeat_exits_early_on_disable_autonomy
+  - test_runner_sets_disable_autonomy
+- Added TestWakeOnlyNoAgentLoop (14 pytest tests):
+  - 8 parametrized wake-only ack tests (ava, ha ava, hey ava, etc.)
+  - 4 parametrized command-reaches-agent tests
+  - test_wake_only_gate_exists_in_source
+  - test_no_agent_loop_for_bare_wake_word (end-to-end routing proof)
+
+FILES MODIFIED:
+- tests/test_voice_invariants.py: +207 lines, two new test classes
+
+TESTS:
+- 48/48 pytest (29 existing + 19 new)
+- 18/18 smoke test
+- 76/76 voice smoke test
+
+GIT: committed 1e97bed, pushed to voice-stability-hardening
+
+================================================================================
 2026-02-06 - Memory Filter: Validation Mode Restricts to Facts Only
 ================================================================================
 

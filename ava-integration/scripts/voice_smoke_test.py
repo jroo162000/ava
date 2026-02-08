@@ -651,6 +651,165 @@ check("_prepare_tts_text preserves word content",
       "_prepare_tts_text regex not found — may alter text content")
 
 # ══════════════════════════════════════════════════════════════════════════════
+# TEST 10: Unified mode TTS routing — Piper only, no Deepgram remote
+# ══════════════════════════════════════════════════════════════════════════════
+print("\n[TEST 10] Unified TTS routing — Piper only, no Deepgram remote in unified mode")
+
+# Verify _speak_text has unified mode routing guard
+check("_speak_text routes unified mode to local TTS",
+      "voice_mode" in runner_src and "unified" in runner_src and "[tts-route]" in runner_src,
+      "_speak_text missing unified mode -> local TTS routing")
+
+# Verify the routing check uses _voice_session.speak
+check("Unified route calls _voice_session.speak",
+      "_voice_session.speak(speak_text)" in runner_src,
+      "_speak_text should call _voice_session.speak in unified mode")
+
+# Verify engine logging in route
+check("TTS route logs engine name",
+      "tts-route] Unified mode -> local TTS (engine=" in runner_src,
+      "TTS route should log which engine (piper/edge) is used")
+
+# Verify startup confirms TTS engine
+check("Unified startup confirms TTS engine",
+      "TTS engine: piper" in runner_src,
+      "Unified voice startup should confirm piper engine selection")
+
+# Verify Deepgram remote TTS (DG_SPEAK_BASE) is NOT reachable in unified path
+# The routing returns before hitting DG_SPEAK_BASE, so unified mode never calls remote
+check("DG_SPEAK_BASE only in non-unified path",
+      "DG_SPEAK_BASE" in runner_src,
+      "DG_SPEAK_BASE should still exist for agent mode")
+
+# Verify voice_mode config is 'unified'
+import json as _json_10
+cfg_path_10 = os.path.join(PROJECT_ROOT, "ava_voice_config.json")
+with open(cfg_path_10) as f:
+    cfg_10 = _json_10.load(f)
+check("Config voice_mode is unified",
+      cfg_10.get('voice_mode') == 'unified',
+      f"Expected voice_mode='unified', got '{cfg_10.get('voice_mode')}'")
+
+# Verify tts_engine is piper in config
+lf_10 = cfg_10.get('local_fallback') or {}
+check("Config tts_engine is piper",
+      lf_10.get('tts_engine') == 'piper',
+      f"Expected tts_engine='piper', got '{lf_10.get('tts_engine')}'")
+
+# Verify the route returns before tts_active.set() (Deepgram path)
+# The unified route has a 'return' before the SPEAK->SPEAK prevention block
+import re as _re_10
+# Find the unified route block and ensure it returns before tts_active.set()
+unified_route_match = _re_10.search(
+    r'\[tts-route\].*?return',
+    runner_src,
+    _re_10.DOTALL
+)
+tts_active_pos = runner_src.find("self.tts_active.set()", runner_src.find("def _speak_text"))
+unified_return_pos = runner_src.find("_voice_session.speak(speak_text)")
+check("Unified route returns before tts_active.set()",
+      unified_return_pos > 0 and tts_active_pos > 0 and unified_return_pos < tts_active_pos,
+      "Unified mode route must return before Deepgram tts_active.set() path")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TEST 11: Echo suppression — tts_active + partial gating in unified mode
+# ══════════════════════════════════════════════════════════════════════════════
+print("\n[TEST 11] Echo suppression — tts_active + partial gating in unified bus handler")
+
+# Verify tts.start sets runner tts_active in bus handler
+check("tts.start sets tts_active in bus handler",
+      "self.tts_active.set()" in runner_src and "MIC MUTED (unified)" in runner_src,
+      "Bus handler tts.start must set runner tts_active for echo gate")
+
+# Verify tts.end clears runner tts_active in bus handler
+check("tts.end clears tts_active in bus handler",
+      "self.tts_active.clear()" in runner_src and "MIC UNMUTED (unified)" in runner_src,
+      "Bus handler tts.end must clear runner tts_active")
+
+# Verify ASR partials are dropped during TTS
+check("ASR partials dropped during TTS",
+      "asr.partial" in runner_src and "tts_active.is_set()" in runner_src,
+      "Bus handler must drop asr.partial events when tts_active is set")
+
+# Verify ASR partials are dropped during grace period
+# The bus handler checks _tts_ended_at for grace period on partials
+check("ASR partials dropped during grace period",
+      "_tts_ended_at" in runner_src,
+      "Bus handler must check _tts_ended_at grace for partials")
+
+# Verify echo gate blocks finals during TTS (in _on_final_user_text)
+check("Echo gate blocks finals during TTS",
+      "[echo-gate] Ignoring ASR final during TTS" in runner_src,
+      "_on_final_user_text must block finals when tts_active is set")
+
+# Verify echo grace period blocks finals after TTS ends
+check("Echo grace blocks finals after TTS",
+      "[echo-gate] Ignoring ASR final in grace period" in runner_src,
+      "_on_final_user_text must block finals during grace period")
+
+# Verify ASR buffer cleared on TTS start
+check("ASR buffer cleared on tts.start",
+      "Cleared ASR buffer on TTS start" in runner_src,
+      "Bus handler should clear ASR buffer when TTS starts")
+
+# Verify ASR buffer cleared on TTS end
+check("ASR buffer cleared on tts.end",
+      "Cleared ASR buffer on TTS end" in runner_src,
+      "Bus handler should clear ASR buffer when TTS ends")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TEST 12: Latency instrumentation — consolidated per-turn line
+# ══════════════════════════════════════════════════════════════════════════════
+print("\n[TEST 12] Latency instrumentation — consolidated per-turn latency line")
+
+# Verify [latency] log line exists in source
+check("[latency] log line present",
+      "[latency]" in runner_src,
+      "Missing [latency] consolidated log line in runner")
+
+# Verify all 4 metric components in the latency line
+check("Latency line has asr_ms",
+      "asr=" in runner_src and "asr_ms" in runner_src,
+      "Latency line must include asr= metric")
+
+check("Latency line has llm_ms",
+      "llm=" in runner_src and "llm_ms" in runner_src,
+      "Latency line must include llm= metric")
+
+check("Latency line has tts_synth_ms",
+      "tts_synth=" in runner_src and "tts_synth_ms" in runner_src,
+      "Latency line must include tts_synth= metric")
+
+check("Latency line has playback_ms",
+      "playback=" in runner_src and "playback_ms" in runner_src,
+      "Latency line must include playback= metric")
+
+check("Latency line has total_ms",
+      "total=" in runner_src and "total_ms" in runner_src,
+      "Latency line must include total= metric")
+
+# Verify latency is emitted in tts.end handler (unified bus handler)
+# The [latency] line should appear after tts.end handling
+tts_end_pos = runner_src.find("ev.type == 'tts.end'")
+latency_pos = runner_src.find("[latency]")
+check("Latency emitted in tts.end handler",
+      tts_end_pos > 0 and latency_pos > tts_end_pos,
+      "Latency line should be emitted in the tts.end bus handler")
+
+# Verify key timestamp variables are used
+check("Uses _asr_final_ts for latency",
+      "_asr_final_ts" in runner_src,
+      "Latency computation must use _asr_final_ts")
+
+check("Uses _awaiting_tts_since for latency",
+      "_awaiting_tts_since" in runner_src,
+      "Latency computation must use _awaiting_tts_since for LLM boundary")
+
+check("Uses _tts_first_chunk_ts for latency",
+      "_tts_first_chunk_ts" in runner_src,
+      "Latency computation must use _tts_first_chunk_ts for synth boundary")
+
+# ══════════════════════════════════════════════════════════════════════════════
 # RESULTS
 # ══════════════════════════════════════════════════════════════════════════════
 

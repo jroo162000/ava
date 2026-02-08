@@ -1672,6 +1672,7 @@ class StandaloneRealtimeAVA:
                 model = p.get('model') or str((Path(__file__).resolve().parent / 'voices' / 'piper' / 'en_US-lessac-medium.onnx'))
                 tts = _PiperBinTTS(exe_path=exe, model_path=model)
                 self._voice_session.set_tts(tts, self._playback_enqueue_sync)
+                print(f"[voice-unified] TTS engine: piper (all TTS routes through local, no remote API)")
                 # Playback rate will be adjusted on first chunk via tts.current_sample_rate
             else:
                 edge_voice = lf.get('edge_voice', 'en-US-MichelleNeural')
@@ -1698,6 +1699,12 @@ class StandaloneRealtimeAVA:
                     # Use same debounce path; do not hard-stop here to avoid oscillation
                     self.user_speaking.set()
                 elif ev.type == 'asr.partial':
+                    # ECHO GATE: Drop partials during TTS to prevent echo feedback
+                    if self.tts_active.is_set():
+                        return
+                    # ECHO GRACE: Also drop partials shortly after TTS ends
+                    if self._tts_ended_at and (time.time() - self._tts_ended_at) < 10.0:
+                        return
                     # First partial timing
                     if self._speech_start_ts and not self._first_partial_ts:
                         self._first_partial_ts = time.time()
@@ -1709,6 +1716,10 @@ class StandaloneRealtimeAVA:
                     # Capture meta so callback can enforce utterance commit rules
                     self._last_asr_final_meta = ev.meta or {}
                 elif ev.type == 'tts.start':
+                    # HALF-DUPLEX: Set runner tts_active flag so echo gate blocks ASR
+                    self.tts_active.set()
+                    self._tts_last_active = time.time()
+                    print("[half-duplex] MIC MUTED (unified) - TTS starting")
                     # Clear audio queue when new TTS starts to prevent overlap
                     try:
                         if hasattr(self, 'audio_queue') and self.audio_queue is not None:
@@ -1739,9 +1750,26 @@ class StandaloneRealtimeAVA:
                     except Exception:
                         pass
                 elif ev.type == 'tts.end':
-                    # Record when TTS ended for echo grace period
+                    # HALF-DUPLEX: Clear runner tts_active flag, start grace period
+                    self.tts_active.clear()
                     self._tts_ended_at = time.time()
-                    print(f"[echo-gate] TTS ended, grace period started")
+                    print("[half-duplex] MIC UNMUTED (unified) - TTS complete (grace period active)")
+                    # LATENCY: Consolidated per-turn latency line
+                    try:
+                        _asr_ts = getattr(self, '_asr_final_ts', 0.0)
+                        _vad_end = getattr(self, '_speech_end_ts', 0.0)
+                        _llm_start = _asr_ts
+                        _llm_end = getattr(self, '_awaiting_tts_since', 0.0)
+                        _first_chunk = getattr(self, '_tts_first_chunk_ts', 0.0)
+                        _tts_end = self._tts_ended_at
+                        asr_ms = int((_asr_ts - _vad_end) * 1000) if _asr_ts and _vad_end else 0
+                        llm_ms = int((_llm_end - _llm_start) * 1000) if _llm_end and _llm_start else 0
+                        tts_synth_ms = int((_first_chunk - _llm_end) * 1000) if _first_chunk and _llm_end else 0
+                        playback_ms = int((_tts_end - _first_chunk) * 1000) if _tts_end and _first_chunk else 0
+                        total_ms = asr_ms + llm_ms + tts_synth_ms + playback_ms
+                        print(f"[latency] asr={asr_ms}ms llm={llm_ms}ms tts_synth={tts_synth_ms}ms playback={playback_ms}ms total={total_ms}ms")
+                    except Exception:
+                        pass
                     # TURN STATE: Back to IDLE after TTS completes
                     self._turn_state.force_idle("TTS complete (tts.end event)")
                     # Clear ASR buffer to prevent accumulated TTS audio from being transcribed
@@ -3368,6 +3396,13 @@ class StandaloneRealtimeAVA:
         print(f"[tts-in] TTS_SOURCE=respond turn_id={turn_id} sha1={_sha1} preview='{text[:60]}...'")
         speak_text = self._prepare_tts_text(text)
         if not speak_text:
+            return
+        # UNIFIED MODE: Route through local TTS (Piper/Edge) instead of Deepgram remote
+        if getattr(self, '_voice_session', None) and self.cfg.get('voice_mode') == 'unified':
+            lf = self.cfg.get('local_fallback') or {}
+            engine = lf.get('tts_engine', 'edge')
+            print(f"[tts-route] Unified mode -> local TTS (engine={engine}): '{speak_text[:50]}...'")
+            self._voice_session.speak(speak_text)
             return
         # SPEAK->SPEAK PREVENTION: Drop new speak calls if already speaking
         if self.tts_active.is_set():
