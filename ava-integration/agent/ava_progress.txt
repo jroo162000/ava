@@ -1,0 +1,668 @@
+# AVA Integration Progress Log
+
+<!--
+PURPOSE: Session-by-session log of changes, tests, and next steps.
+RULES FOR CLAUDE:
+- Append new sessions at the top (newest first).
+- Each entry: date, what changed, what test proved it, what's next.
+- Reference DECISIONS.md for architectural choices.
+- Reference ava_feature_list.json for pass/fail status.
+-->
+
+================================================================================
+2026-02-07 - Priorities 2-4: Piper routing, echo suppression, latency
+================================================================================
+
+WHAT CHANGED:
+- P2: _speak_text() detects unified mode and routes through _voice_session.speak()
+      (Piper/Edge local) instead of Deepgram remote API. Fixes 400 error spam.
+      Startup log confirms TTS engine selection.
+- P3: Unified bus handler now sets/clears runner tts_active on tts.start/tts.end.
+      ASR partials dropped during TTS and 10s grace period. Echo gate covers
+      both finals (in _on_final_user_text) and partials (in bus handler).
+- P4: Consolidated [latency] line emitted at tts.end: asr=Nms llm=Nms
+      tts_synth=Nms playback=Nms total=Nms. Uses existing timestamps.
+
+TESTS ADDED:
+- Test 10: 8 checks — unified TTS routing (Piper-only, no Deepgram remote)
+- Test 11: 8 checks — echo suppression (tts_active + partial gating)
+- Test 12: 10 checks — latency instrumentation (consolidated line)
+- Total: 119/119 voice smoke, 18/18 base smoke
+
+SUBAGENT DELEGATION:
+- Direct (Integration Lead): P2, P3, P4 — all targeted single-file changes
+
+================================================================================
+2026-02-07 - Voice Fidelity Hardening (Steps A-E)
+================================================================================
+
+WHAT CHANGED:
+- A1: DISABLE_AUTONOMY guards on all 3 Node schedulers (defense-in-depth)
+- A2: Fixed 2 agent-mode _speak_text calls (silent no-op → proper async dispatch)
+- B1: Deleted _get_natural_response() from Python (55 lines of canned text poison)
+- B2: sha1 fidelity logging at /respond output + TTS input (proves no hidden rewrites)
+- B3: try/finally on all SPEAK→force_idle paths (no leaked state)
+- C1: Deleted getNaturalResponse() from Node api.js; run_tools honored (stepLimit=1,
+      runTools=false); tool execution guard in act() skips tools when disabled
+- D1: 17-check TTS fidelity smoke test (Test 9) catches "hardcoded voice" regression
+
+SUBAGENT DELEGATION:
+- tool-gate-engineer: A1 (scheduler guards), C1 (getNaturalResponse + run_tools)
+- voice-stabilizer: A2 (speak call fix)
+- Direct (Integration Lead): B1, B2, B3, D1
+
+FILES MODIFIED:
+- ava_standalone_realtime.py: B1 (remove _get_natural_response), B2 (sha1 logging),
+  B3 (try/finally), A2 (agent mode async dispatch)
+- scripts/voice_smoke_test.py: D1 (Test 9: 17 fidelity checks, total now 93)
+- ava-server/src/server.js: A1 (DISABLE_AUTONOMY if/else wrapping all schedulers)
+- ava-server/src/services/digestScheduler.js: A1 (callee guard)
+- ava-server/src/services/doctor.js: A1 (callee guard)
+- ava-server/src/routes/api.js: C1 (delete getNaturalResponse, honor run_tools)
+- ava-server/src/services/agentLoop.js: C1 (runTools state, act() guard)
+
+TESTS:
+- 18/18 smoke, 93/93 voice smoke, 48/48 pytest
+
+GIT: committed 7b9c99a, pushed to voice-stability-hardening
+
+================================================================================
+2026-02-06 - Merge-Blocker Pytest Tests (Scheduler + Wake-Only)
+================================================================================
+
+WHAT CHANGED:
+- Added TestSchedulerDisabledInVoiceMode (5 pytest tests):
+  - test_scheduler_exits_early_on_disable_autonomy
+  - test_scheduler_no_full_autonomy_after_guard
+  - test_scheduler_forbidden_strings_unreachable
+  - test_heartbeat_exits_early_on_disable_autonomy
+  - test_runner_sets_disable_autonomy
+- Added TestWakeOnlyNoAgentLoop (14 pytest tests):
+  - 8 parametrized wake-only ack tests (ava, ha ava, hey ava, etc.)
+  - 4 parametrized command-reaches-agent tests
+  - test_wake_only_gate_exists_in_source
+  - test_no_agent_loop_for_bare_wake_word (end-to-end routing proof)
+
+FILES MODIFIED:
+- tests/test_voice_invariants.py: +207 lines, two new test classes
+
+TESTS:
+- 48/48 pytest (29 existing + 19 new)
+- 18/18 smoke test
+- 76/76 voice smoke test
+
+GIT: committed 1e97bed, pushed to voice-stability-hardening
+
+================================================================================
+2026-02-06 - Memory Filter: Validation Mode Restricts to Facts Only
+================================================================================
+
+WHAT CHANGED:
+- Python _ask_server_respond(): sends memory_filter="facts_only" when _validation_mode is True
+  - /respond path: payload includes memory_filter for agentLoop
+  - /chat path: also sets includeMemory=False to disable memory entirely
+- Node agentLoop.js: createAgentState() stores memoryFilter from options
+  - observe(): when memoryFilter==='facts_only', restricts retrieveRelevant types to
+    [FACT, PREFERENCE, CONSTRAINT] only — excludes WORKFLOW, WARNING, AGENT_ACTION
+  - Logs: [agent] Memory filter: facts_only (validation mode)
+- Node api.js: both /respond routes extract memory_filter from request body
+  and pass as memoryFilter to runAgentLoop options
+
+FILES MODIFIED:
+- ava_standalone_realtime.py: _ask_server_respond() payload + validation_mode gate
+- ava-server/src/services/agentLoop.js: createAgentState, observe() memory type filter
+- ava-server/src/routes/api.js: both /respond routes forward memory_filter
+- scripts/voice_smoke_test.py: Test 8 (7 checks)
+
+WHAT TEST PROVED IT:
+- Smoke test: 18/18 PASS
+- Voice smoke test: 76/76 PASS (was 69, +7 new Test 8 checks)
+  - Python sends memory_filter='facts_only' in validation mode
+  - Python gates on _validation_mode
+  - agentLoop stores memoryFilter in state
+  - agentLoop restricts types on facts_only
+  - agentLoop excludes WORKFLOW
+  - /respond route extracts memory_filter
+
+ACCEPTANCE:
+- Memory retrieval for "ha ava" returns 0 workflows/warnings/agent_actions
+- Only FACT, PREFERENCE, CONSTRAINT memories allowed in validation mode
+- Normal mode (VALIDATION_MODE=0) unaffected — full memory retrieval
+
+================================================================================
+2026-02-06 - Wake-Word-Only Gate (Stop Agent Loop on Bare "ava")
+================================================================================
+
+WHAT CHANGED:
+- Added wake-word-only gate to _is_chat_only() in canonical runner
+  - After stripping wake word + filler tokens (ha, um, uh, hey, hi, etc.),
+    if fewer than MIN_CONTENT_WORDS (2) remain, returns short ack instead of None
+  - Ack replies: "Yeah?", "I'm here.", "Go ahead.", "Listening.", "What's up?"
+  - Logs: [wake-only] Wake word detected, no command content: '...' -> ack only
+- Added MIN_CONTENT_WORDS = 2 class constant
+- Gate runs BEFORE greeting patterns and command verb checks
+- Commands with verbs still flow to agent loop: "ava open chrome" -> agent loop
+- No /respond call, no memory retrieval, no tool execution for bare wake words
+
+FILES MODIFIED:
+- ava_standalone_realtime.py:
+  - _is_chat_only(): wake-word-only gate at top, MIN_CONTENT_WORDS constant
+- scripts/voice_smoke_test.py:
+  - Added Test 7: Wake-word-only gate (12 checks)
+
+WHAT TEST PROVED IT:
+- Smoke test: 18/18 PASS
+- Voice smoke test: 69/69 PASS (was 57, +12 new Test 7 checks)
+  - Wake-only 'ava' -> ack (no agent loop) ✓
+  - Wake-only 'ha ava' -> ack (no agent loop) ✓
+  - Wake-only 'hey ava' -> ack (no agent loop) ✓
+  - Wake-only 'hi ava' -> ack (no agent loop) ✓
+  - Wake-only 'ava um' -> ack (no agent loop) ✓
+  - Wake-only 'ava hello' -> ack (no agent loop) ✓
+  - Command 'ava open chrome' -> agent loop ✓
+  - Command 'ava search for news' -> agent loop ✓
+  - Command 'ava type hello' -> agent loop ✓
+
+ACCEPTANCE:
+- Saying only "ava" (or "hey ava") never triggers agent loop
+- Never says "completed tasks" for bare wake words
+- Short ack returned locally (~instant, no server round-trip)
+
+================================================================================
+2026-02-06 - Turn-Scoped TTS Token (Voice-Only Response Gate)
+================================================================================
+
+WHAT CHANGED:
+- Added turn-scoped TTS token to TurnStateMachine:
+  - `_tts_token` field initialized to None
+  - Token minted (uuid4 hex[:8]) on transition to DECIDE
+  - Token cleared on force_idle()
+  - `tts_token` property for thread-safe read
+  - `mint_tts_token()` method for agent mode (no DECIDE transition)
+- Gated `_speak_text()`: requires valid turn_id matching active token
+- Gated `synthesize_speech()`: same turn_id gate for local TTS path
+- Gated unified voice path: token check before `_voice_session.speak()`
+- Updated `_maybe_handle_local_intent()` signature: added `turn_id=None`
+- Threaded turn_id through ALL voice paths:
+  - Standard ASR receiver (Deepgram)
+  - LocalVoiceEngine hybrid path
+  - LocalVoiceEngine legacy Whisper path
+  - Unified voice session path
+  - Agent mode ConversationText handler
+- Converted startup degraded-mode announcement to log-only (no TTS — no active turn)
+- Blocked TTS calls without valid token log: [tts.blocked_background]
+- Added `import uuid` to runner
+
+FILES MODIFIED:
+- ava_standalone_realtime.py:
+  - TurnStateMachine: _tts_token, tts_token property, mint_tts_token()
+  - transition(): mint on DECIDE
+  - force_idle(): clear token
+  - _speak_text(): turn_id gate
+  - synthesize_speech(): turn_id gate
+  - _maybe_handle_local_intent(): turn_id param, all _speak_text calls threaded
+  - ASR receiver: capture token after DECIDE, pass to _maybe_handle_local_intent + _speak_text
+  - LocalVoiceEngine hybrid: same
+  - LocalVoiceEngine legacy: same
+  - Unified voice path: same + direct speak() gate
+  - Agent mode: mint_tts_token on user text, pass to all handlers
+  - Startup announcement: log-only, no TTS
+- scripts/voice_smoke_test.py:
+  - Added `uuid` to exec namespace for TurnStateMachine tests
+  - Widened synthesize_speech chokepoint check window (500->800 chars)
+  - Added Test 6: Turn-scoped TTS token (13 checks)
+
+WHAT TEST PROVED IT:
+- Smoke test: 18/18 PASS
+- Voice smoke test: 57/57 PASS (was 44/44, +13 new Test 6 checks)
+  - Signature checks: _speak_text, synthesize_speech, _maybe_handle_local_intent
+  - mint_tts_token method exists, tts_token property exists
+  - [tts.blocked_background] string in source
+  - Static: ALL _speak_text calls have turn_id=
+  - Static: ALL synthesize_speech calls have turn_id=
+  - Logic: DECIDE mints token, force_idle clears it
+  - Logic: mint_tts_token returns 8-char string
+  - Logic: different turns produce different tokens
+  - Startup announcement is log-only
+
+WHAT'S NEXT:
+- Ready for user direction on next work items
+
+================================================================================
+2026-02-06 - Whisper Stability Guard (Stop 20s Stalls / Empty Finals)
+================================================================================
+
+WHAT CHANGED:
+- Raised min_audio_length 0.3s -> 0.8s in HybridASREngine (prevents tiny clips)
+- Raised Whisper RMS threshold 0.005 -> 0.01 in 3 files (hybrid, standalone, provider)
+- Added TTS/echo-gate guard to get_final_result(): skips Whisper during TTS playback
+  and echo-gate grace period, discards accumulated echo audio
+- Added same guard to legacy Whisper path (LocalVoiceEngine buffer_duration > 0.8s)
+- Reduced Whisper timeout 5s -> 3s (prevents pipeline stalls)
+- Removed 15+ DEBUG print lines from ava_hybrid_asr.py:
+  - No more "[whisper-worker] Waiting for audio..." spam
+  - No more "Raw result: ''" spam on empty results
+  - Only non-empty results logged: "[whisper] Result: '...' (Xs, N segments)"
+- Raised legacy buffer_duration threshold 0.5s -> 0.8s
+
+FILES MODIFIED:
+- ava_hybrid_asr.py:
+  - min_audio_length: 0.3 -> 0.8
+  - get_final_result(): tts_active/echo_gate_active params, RMS pre-check, 3s timeout
+  - _transcribe_whisper(): RMS 0.005 -> 0.01, removed debug prints
+  - _whisper_worker(): removed 6 debug prints
+- ava_standalone_realtime.py:
+  - Hybrid caller: passes tts_active + echo_gate_active, timeout 3s
+  - Legacy path: buffer_duration 0.5 -> 0.8, TTS/echo guard
+  - transcribe_audio(): RMS 0.005 -> 0.01
+- voice/providers/whisper_provider.py: RMS 0.005 -> 0.01
+
+WHAT TEST PROVED IT:
+- Smoke test: 18/18 PASS
+- Syntax check: all 3 modified files compile clean
+- Guards verified: Whisper cannot run during SPEAK or echo-gate period
+- Empty result spam eliminated: only non-empty results logged
+
+================================================================================
+2026-02-06 - Turn-State Hard Lock: Eliminate SPEAK->LISTEN Errors
+================================================================================
+
+WHAT CHANGED:
+- Hardened TurnStateMachine: SPEAK state rejects ALL transitions via transition()
+  - Uses [speak-lock] log instead of [VOICE_ERROR] — silently drops, not an error
+  - Only force_idle() can exit SPEAK state (used by "TTS complete" path)
+- Hard disabled barge-in: interrupt_speaking() always returns False
+  - barge_in_enabled property always returns False
+  - Setter ignores all attempts to enable
+  - Hot-reload path ignores config barge_in.enabled value
+- Set barge_in.enabled: false in ava_voice_config.json
+- All VAD start events, Vosk/Whisper finals during TTS are silently dropped
+
+FILES MODIFIED:
+- ava_standalone_realtime.py:
+  - TurnStateMachine: transition() hard lock, interrupt_speaking() disabled
+  - Added is_speaking() helper
+  - Hot-reload: barge-in always forced to False
+- ava_voice_config.json: barge_in.enabled: false
+
+WHAT TEST PROVED IT:
+- Smoke test: 18/18 PASS
+- Turn-state hard lock test: 11/11
+  - SPEAK->LISTEN: silently dropped (no VOICE_ERROR)
+  - SPEAK->FINAL: silently dropped
+  - SPEAK->DECIDE: silently dropped
+  - interrupt_speaking(): returns False
+  - force_idle(): exits SPEAK to IDLE correctly
+  - barge_in_enabled property: always False
+
+BARGE-IN REINTRODUCTION:
+- To re-enable barge-in later, remove hard locks in TurnStateMachine and
+  hot-reload path. Gate behind a NEW feature flag with proven N-session stability.
+
+================================================================================
+2026-02-06 - Tool Policy Gate: Require Command Verb (+ Wake Word in Validation)
+================================================================================
+
+WHAT CHANGED:
+- Added COMMAND_VERBS class constant (39 verbs) to StandaloneRealtimeAVA
+- Added _has_command_verb() method: checks if transcript contains any command verb
+- Added _should_allow_tools() policy gate:
+  - Validation mode ON: requires wake word AND command verb
+  - Validation mode OFF: requires command verb at minimum
+- Gated 3 tool entry points:
+  1. _try_tool_dispatch(): returns None if policy fails (no local tool dispatch)
+  2. _ask_server_respond(): sends run_tools=False if policy fails (server chat only)
+  3. handle_tool_call(): blocks tool execution if policy fails (last-resort gate)
+- Refactored _is_chat_only() to use shared COMMAND_VERBS constant
+- All gates log: [tool-gate] Blocked — no command verb...
+
+FILES MODIFIED:
+- ava_standalone_realtime.py:
+  - Class constant COMMAND_VERBS (line ~1048)
+  - _has_command_verb() and _should_allow_tools() (near _is_chat_only)
+  - _try_tool_dispatch(): policy gate at entry
+  - _ask_server_respond(): run_tools=tools_allowed (not hardcoded True)
+  - handle_tool_call(): command verb check before Node boundary call
+
+WHAT TEST PROVED IT:
+- Smoke test: 18/18 PASS
+- Tool policy gate test: 21/21
+  - Validation ON: "hello a lot" blocked, "ava type hello" allowed
+  - Validation OFF: "hello a lot" blocked, "type hello" allowed
+  - Wake word only (no verb) blocked: "hey ava"
+  - Command verb only (no wake) blocked in validation: "type hello"
+
+================================================================================
+2026-02-06 - Chat-First Routing (No Agent Loops for Greetings/Questions)
+================================================================================
+
+WHAT CHANGED:
+- Added _is_chat_only() method to canonical runner (~line 5062)
+  - Detects greetings, short questions, simple phrases without command verbs
+  - Returns instant local reply string, or None to let agent handle it
+  - Command verb whitelist: open/search/create/type/send/close/start/stop/run/
+    delete/move/rename/copy/paste/click/find/show/play/record/capture/etc.
+  - Only transcripts WITH a command verb go to agent loop
+- Added chat-first gate at top of _maybe_handle_local_intent()
+  - Runs BEFORE any server call in ALL voice paths (unified, local hybrid,
+    local legacy, Vosk unified)
+  - Logs: [chat-first] Direct reply (no agent loop): '...'
+- Greetings respond locally (~instant), no server round-trip
+- Time/date questions answered locally with datetime
+- Wake word greetings handled: "hello ava", "hey eva", etc.
+
+FILES MODIFIED:
+- ava_standalone_realtime.py:
+  - _is_chat_only(): new method
+  - _maybe_handle_local_intent(): added chat-first gate at top
+
+WHAT TEST PROVED IT:
+- Smoke test: 18/18 PASS
+- Chat-first routing test: 25/25
+  - 13 chat phrases correctly handled locally (no agent loop)
+  - 12 command phrases correctly sent to agent loop
+- Acceptance: "hello", "hey ava", "what time is it" -> local reply, no agent loop
+
+================================================================================
+2026-02-06 - TTS Response Filter: Block Agent-Loop Status Messages
+================================================================================
+
+WHAT CHANGED:
+- Expanded _is_step_status_message() with substring blacklist for all required phrases:
+  "partially completed", "waiting for user input", "waiting_user", "idempotency",
+  "tool execution", "agent loop", "max steps reached", "step limit", etc.
+- Added regex patterns: "has been partially completed", "waiting for user/input"
+- Moved filter into _speak_text() as a CHOKEPOINT — ALL voice paths now filtered:
+  - Deepgram TTS path (_speak_text at line ~3300)
+  - Local Edge TTS path (synthesize_speech at line ~580)
+- Blocked messages logged: [tts-filter] Blocked agent-loop status: ...
+- Normal conversational responses pass through unaffected
+
+FILES MODIFIED:
+- ava_standalone_realtime.py:
+  - _is_step_status_message(): expanded with blocked_substrings list + new patterns
+  - _speak_text(): added chokepoint filter before TTS
+  - synthesize_speech(): added chokepoint filter before local TTS
+
+WHAT TEST PROVED IT:
+- Smoke test: 18/18 PASS
+- Acceptance phrase test: 15/15 (11 blocked correctly, 4 normal responses pass)
+- Blocked: "partially completed", "step X of Y", "waiting_user", "idempotency",
+  "tool execution", "agent loop", "waiting for user input", "I am executing"
+- Passed: greetings, weather, system info, tool confirmations
+
+================================================================================
+2026-02-06 - HARD DISABLE Full Autonomy in Voice Mode
+================================================================================
+
+WHAT CHANGED:
+- Added DISABLE_AUTONOMY=1 env flag, set by voice runner at startup (line 206)
+- Guarded moltbookScheduler.js: startMoltbookScheduler() exits early with log when flag set
+- Guarded moltbook_heartbeat.py: run_heartbeat() exits early with log when flag set
+- Updated start_ava_with_moltbook.bat: sets DISABLE_AUTONOMY=1 before any scripts
+- Log lines when disabled: "[autonomy] disabled (voice mode)"
+- No "Starting FULL AUTONOMY mode", no "Activity loop running", no "Checking post" in voice logs
+
+FILES MODIFIED:
+- ava_standalone_realtime.py (line 205-207: set DISABLE_AUTONOMY=1)
+- ava-server/src/services/moltbookScheduler.js (lines 1002-1006: env guard)
+- moltbook_heartbeat.py (lines 131-133: env guard)
+- start_ava_with_moltbook.bat (added set DISABLE_AUTONOMY=1)
+
+WHAT TEST PROVED IT:
+- Smoke test: 18/18 PASS
+- Python syntax check: all modified files compile clean
+- Heartbeat test with DISABLE_AUTONOMY=1: returns {status: disabled_voice_mode}
+- ProactiveManager + passive learning already gated by validation_mode (enabled in prior session)
+
+WHAT'S NEXT:
+- Ready for user direction on next work items
+
+================================================================================
+2026-02-05 - Audio Input & Validation Mode Fixes
+================================================================================
+
+WHAT CHANGED:
+- Fixed VALIDATION_MODE startup logging: now prints env + config values unconditionally
+- Fixed audio input for WASAPI device 17: all 4 mic-open locations now use rate cascade
+  (config rate -> 48000 -> 44100 -> 16000) with explicit logging, no silent fallback
+- Added resampling: if mic opens at non-16kHz rate, audio is resampled via _resample_audio()
+- Lowered Whisper RMS gate 0.01 -> 0.005 in 3 files
+- Synced local governance files to match GitHub repo (were stale from initial setup)
+
+FILES MODIFIED:
+- ava_standalone_realtime.py (4 mic-open locations, RMS threshold, validation logging)
+- ava_hybrid_asr.py (RMS threshold)
+- voice/providers/whisper_provider.py (RMS threshold)
+- agent/DECISIONS.md, ava_state.json, ava_feature_list.json, ava_progress.txt (synced)
+
+WHAT TEST PROVED IT:
+- Smoke test: 18/18 PASS
+- Python syntax check: all 3 modified files compile clean
+
+WHAT'S NEXT:
+- All phases 1-4 complete (all features passes: true)
+- Governance files synced to repo state
+- Ready for user direction on next work items
+
+================================================================================
+2026-02-02 - Native Segfault Prevention (Phase 4 Complete)
+================================================================================
+
+WHAT CHANGED:
+- Created scripts/preflight_check.py: validates audio devices, sample rates, native deps, config
+- Created scripts/crash_supervisor.py: enhanced watchdog with all features
+- Added safe_mode and crash_supervision config sections to ava_voice_config.json
+- Added state file writing to ava_standalone_realtime.py (minimal changes)
+- Extended smoke test with 3 new checks for crash supervision
+
+PREFLIGHT CHECKS:
+- PyAudio availability and version
+- Audio device enumeration (input/output)
+- Sample rate compatibility (22050 Hz)
+- Config file validity
+- Piper TTS executable/model
+- Vosk model availability
+
+CRASH CONTAINMENT:
+- Supervised subprocess with stdout/stderr capture
+- Exponential backoff: 3s -> 6s -> 12s -> ... (max 60s)
+- Max 5 restarts in 5-minute window
+- Segfault detection (exit codes -11, 139, -6, 134)
+
+SAFE MODE:
+- Auto-enabled after 3 crashes in window
+- Disables barge-in (fragile feature)
+- Environment variable: AVA_SAFE_MODE=1
+- Logged: [SAFE_MODE] Running in safe mode
+
+CRASH REPORTS:
+- Location: logs/crash_reports/crash_YYYYMMDD_HHMMSS.json
+- Contents: exit_code, is_segfault, runtime, turn_state, audio_backend, config_flags, last 200 log lines
+- State file: logs/runner_state.json (updated every 2s)
+
+WHAT TEST PROVED IT:
+- Preflight: 6/6 checks pass
+- Smoke test: 14/14 checks pass (3 new crash supervision checks)
+- Safe mode config verified
+- Crash supervisor structure verified
+- Crash report capability verified
+
+STATUS: native_segfault_prevention flipped to passes: true
+
+================================================================================
+2026-02-02 - D005 Barge-in COMPLETE (Feature Flag ON)
+================================================================================
+
+WHAT CHANGED:
+- Enabled barge-in in ava_voice_config.json (enabled: true)
+- Ran full verification with barge-in ENABLED
+- Flipped barge_in to passes: true in ava_feature_list.json
+
+D005 VERIFICATION RESULTS:
+- Smoke test: 11/11 PASS (with barge-in enabled)
+- Regression tests: 29/29 PASS (with barge-in enabled)
+- All D005 prerequisites satisfied:
+  - Turn-state machine is authoritative
+  - Tool safety under interruption (final-only gating preserved)
+  - Echo/feedback containment (TTS cancelled, cooldown enforced)
+  - No concurrent turns (single state machine)
+
+STATUS: D005 UNBLOCKED - barge_in feature complete and enabled
+
+================================================================================
+2026-02-02 - D005 Barge-in Implementation (Feature Flag OFF)
+================================================================================
+
+WHAT CHANGED:
+- Added barge_in config section to ava_voice_config.json (enabled: false)
+- Updated TurnStateMachine with:
+  - barge_in_enabled property
+  - interrupt_speaking() method for SPEAK -> IDLE -> LISTEN transition
+  - was_interrupted() tracking
+- Added barge-in config loading in _load_config() (hot-reloadable)
+- Added barge-in interrupt handling in transcript processing:
+  - Detects speech during SPEAK state
+  - Respects cooldown between interrupts
+  - Cancels TTS on interrupt if configured
+  - Preserves final-only gating (partials can interrupt TTS but not trigger tools)
+
+D005 SAFEGUARDS IMPLEMENTED:
+- Turn-state machine is authoritative (explicit transitions only)
+- Tool safety under interruption (final-only gating preserved)
+- Echo/feedback containment (TTS cancelled, cooldown enforced)
+- No concurrent turns (single state machine)
+
+BARGE-IN CONFIG OPTIONS:
+- enabled: false (default OFF per D005)
+- min_speech_ms: 500 (minimum speech duration to trigger)
+- require_final_to_interrupt: true (only finals can trigger)
+- cancel_tts_on_interrupt: true (stop TTS immediately)
+- cooldown_after_interrupt_ms: 1000 (prevent rapid interrupts)
+
+TESTS ADDED:
+- Smoke test: check_barge_in_safety(), check_barge_in_state_integrity()
+- Regression: TestBargeInSafety (6 tests), TestBargeInSimulation (3 tests)
+
+WHAT TEST PROVED IT:
+- Smoke test: 11/11 PASS (2 new D005 checks)
+- Regression tests: 29/29 PASS (9 new barge-in tests)
+
+================================================================================
+2026-02-02 - QA/Regression: Voice Invariant Tests Added
+================================================================================
+
+WHAT CHANGED:
+- Created tests/test_voice_invariants.py (20 regression tests, 770 lines)
+- Extended scripts/smoke_test.py with voice invariant preflight checks
+- Created tests/README_VOICE_TESTS.md quick reference
+
+REGRESSION TESTS (20 total):
+- TestPartialTranscriptSafety (4 tests): Tools never execute on partials
+- TestNodeBoundaryEnforcement (2 tests): All tools via Node gateway
+- TestIdempotencyGuarantee (3 tests): Duplicates blocked within TTL
+- TestHalfDuplexDiscipline (3 tests): Mic muted during SPEAKING
+- TestTurnStateTransitions (4 tests): Valid state flow enforced
+- TestRegressionScenarios (3 tests): Complex bug scenarios
+- Integration check (1 test): Smoke test verification
+
+WHAT TEST PROVED IT:
+- pytest: 20/20 tests pass in 4.99s
+- smoke_test.py: All checks pass
+
+================================================================================
+2026-02-02 - Voice Stabilization: Half-Duplex + Final-Only Gating
+================================================================================
+
+WHAT CHANGED:
+- Added TurnState enum and TurnStateMachine class
+- Implemented explicit turn-state transitions: IDLE -> LISTEN -> FINAL -> DECIDE -> SPEAK -> IDLE
+- Added PARTIAL -> NO_TOOL logging (partials cannot trigger tools)
+- Added FINAL -> DECIDE logging (finals enter decision phase)
+- Enforced half-duplex: mic muted during SPEAK state
+- Added voice_stabilization config block to ava_voice_config.json
+
+WHAT TEST PROVED IT:
+- Smoke test: 4/4 PASS (unchanged)
+
+================================================================================
+2026-02-02 - Node Tool Execution Boundary Enforced
+================================================================================
+
+WHAT CHANGED:
+- Refactored ava_standalone_realtime.py handle_tool_call() to use Node boundary
+- Refactored ava_bridge.py /tool endpoint to proxy to Node /tools/:name/execute
+- Added execute_tool() method to ava_server_client.py
+- Removed direct cmpuse Agent tool execution from Python
+- Created TOOL_BOUNDARY_ARCHITECTURE.md documenting the pattern
+
+WHAT TEST PROVED IT:
+- Smoke test: 4/4 PASS
+
+================================================================================
+2026-02-02 - Repo Curation: Archive Duplicate Runners
+================================================================================
+
+WHAT CHANGED:
+- Created ava-integration/archive/ folder
+- Archived non-canonical runners
+- Updated start_ava.ps1 to start only canonical runner
+
+WHAT TEST PROVED IT:
+- Smoke test: 4/4 PASS
+
+================================================================================
+2026-02-02 - Idempotency Cache Implemented
+================================================================================
+
+WHAT CHANGED:
+- Added IdempotencyCache class to ava-server/src/services/tools.js
+- Modified executeTool() to check cache before execution
+- Added /tools/idempotency/stats and /tools/idempotency/clear endpoints
+- Created 26 unit tests in ava-server/tests/idempotency.test.js
+
+WHAT TEST PROVED IT:
+- Unit tests: 26/26 passed
+- Smoke test: 4/4 passed
+
+================================================================================
+2026-02-02 - Canonical Smoke Test Created
+================================================================================
+
+WHAT CHANGED:
+- Created scripts/smoke_test.py
+- Smoke test checks 4 invariants
+
+WHAT TEST PROVED IT:
+- Ran smoke test: 3/4 passed (idempotency not yet implemented)
+
+================================================================================
+2026-02-02 - Integration Lead Artifacts Setup
+================================================================================
+
+WHAT CHANGED:
+- Created agent/ folder with governance artifacts
+- Documented 9 architectural decisions in DECISIONS.md
+- Established feature checklist in ava_feature_list.json
+- Set runtime state in ava_state.json
+
+================================================================================
+2026-02-02 - Voice Stability Fixes (Prior Session)
+================================================================================
+
+WHAT CHANGED:
+- Fixed segfaults by aligning sample rate to 22050 Hz throughout
+- Added TTS serialization in session.py speak() method
+- Implemented queue draining on tts.start and tts.end events
+- Created voice_watchdog.py for crash recovery
+- Lowered VAD threshold from 1200 to 300
+
+================================================================================
+KNOWN ISSUES
+================================================================================
+1. Native PyAudio/PortAudio segfaults still occur occasionally
+   - Mitigated by watchdog auto-restart
+   - Root cause: threading issues in native libraries
+
+2. WASAPI device 17 may not support 16000 Hz directly
+   - Fixed 2026-02-05: rate cascade + resample in all mic-open paths

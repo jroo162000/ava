@@ -23,6 +23,11 @@ let _timer = null;
 let _lastMinute = '';
 
 export function startDigestScheduler() {
+  // Guard: skip scheduler when voice mode is active
+  if (process.env.DISABLE_AUTONOMY === '1') {
+    logger.info('[autonomy] disabled (voice mode) — digest scheduler will not start');
+    return;
+  }
   if (_timer) return;
   _timer = setInterval(() => {
     try {
