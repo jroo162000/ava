@@ -1942,6 +1942,10 @@ class StandaloneRealtimeAVA:
                     except Exception:
                         pass
                 elif ev.type == 'playback.end':
+                    # Debounce duplicate playback.end and own the end-of-playback state here
+                    if getattr(self, '_playback_end_fired', False):
+                        return
+                    self._playback_end_fired = True
                     # Now it is safe to end the speaking turn.
                     try:
                         self.tts_active.clear()
@@ -4099,6 +4103,7 @@ class StandaloneRealtimeAVA:
                         break
 
                     # Write audio chunk to stream
+                    audio_copy = None
                     try:
                         # NEW: end-of-utterance marker handling
                         if audio_data is self._UTT_END:
@@ -4108,9 +4113,9 @@ class StandaloneRealtimeAVA:
                             except Exception:
                                 pass
                             try:
-                                if hasattr(self, '_voice_bus') and self._voice_bus and not getattr(self, '_playback_end_fired', False):
-                                    self._voice_bus.emit(type('E', (), {'type': 'playback.end'}))
-                                    self._playback_end_fired = True
+                                if hasattr(self, '_voice_bus') and self._voice_bus:
+                                    # Emit instance, not class
+                                    self._voice_bus.emit(type('E', (), {'type': 'playback.end'})())
                             except Exception:
                                 pass
                             continue
@@ -4132,8 +4137,9 @@ class StandaloneRealtimeAVA:
                         self.playback_busy.clear()
                     # Update global playback RMS EMA for echo gating
                     try:
-                        pr = self._rms_int16(audio_data)
-                        self._playback_rms_ema = (self._playback_rms_ema * 0.85) + (pr * 0.15)
+                        if audio_copy:
+                            pr = self._rms_int16(audio_copy)
+                            self._playback_rms_ema = (self._playback_rms_ema * 0.85) + (pr * 0.15)
                     except Exception:
                         pass
 
