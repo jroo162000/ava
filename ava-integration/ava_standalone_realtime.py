@@ -4071,9 +4071,6 @@ class StandaloneRealtimeAVA:
 
                     # Write audio chunk to stream
                     try:
-                        # Drop immediately during abort window to ensure snappy barge-in
-                        if time.time() < getattr(self, '_playback_abort_until', 0.0):
-                            continue
                         # NEW: end-of-utterance marker handling
                         if audio_data is self._UTT_END:
                             self._utt_in_progress = False
@@ -4086,6 +4083,9 @@ class StandaloneRealtimeAVA:
                                     self._voice_bus.emit(type('E', (), {'type': 'playback.end'}))
                             except Exception:
                                 pass
+                            continue
+                        # Drop immediately during abort window to ensure snappy barge-in
+                        if time.time() < getattr(self, '_playback_abort_until', 0.0):
                             continue
                         self.playback_busy.set()
                         # Debug: log playback activity periodically
