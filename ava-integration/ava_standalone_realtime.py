@@ -2371,6 +2371,10 @@ class StandaloneRealtimeAVA:
                 pass
             # Queue the sentinel marking end of audible utterance
             self.audio_queue.put_nowait(self._UTT_END)
+            try:
+                print(f"[tts-end] enqueued _UTT_END (q={self.audio_queue.qsize()})")
+            except Exception:
+                pass
         except Exception:
             # Fail-safe: never hang the state machine
             self._utt_in_progress = False
@@ -4107,6 +4111,10 @@ class StandaloneRealtimeAVA:
                     try:
                         # NEW: end-of-utterance marker handling
                         if audio_data is self._UTT_END:
+                            try:
+                                print(f"[playback] received _UTT_END (q={self.audio_queue.qsize()})")
+                            except Exception:
+                                pass
                             self._utt_in_progress = False
                             try:
                                 self.utt_playback_done.set()
