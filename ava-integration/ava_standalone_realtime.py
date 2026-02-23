@@ -57,7 +57,7 @@ try:
     # Unified voice scaffolding
     from voice.bus import EventBus as _VoiceEventBus
     from voice.session import VoiceSession as _VoiceSession
-    from voice.providers.local_hybrid import LocalHybridProvider as _LocalHybridProvider
+    from voice.providers.local_hybrid import LocalHybridProvider as _LocalHybridProvider, VoiceEvent as _VoiceEvent
     from voice.tts.edge_stream import EdgeStreamTTS as _EdgeStreamTTS
     from voice.tts.piper_bin import PiperBinTTS as _PiperBinTTS
     _VOICE_SCAFFOLD_AVAILABLE = True
@@ -1609,6 +1609,8 @@ class StandaloneRealtimeAVA:
 
         # Create bus and provider
         self._voice_bus = _VoiceEventBus()
+        # Alias to match event emission style used across providers
+        self.bus = self._voice_bus
         whisper_model = (self.cfg.get('local_fallback') or {}).get('whisper_model', 'small')
         self._voice_provider = _LocalHybridProvider(self._voice_bus, whisper_model=whisper_model)
         # Utterance commit tracking
@@ -1917,8 +1919,7 @@ class StandaloneRealtimeAVA:
                         except Exception:
                             pass
                         try:
-                            if hasattr(self, '_voice_bus') and self._voice_bus:
-                                self._voice_bus.emit(type('E', (), {'type': 'playback.end'}))
+                            self.bus.emit(_VoiceEvent(type="playback.end"))
                         except Exception:
                             pass
                     # Start a watchdog to emit playback.end once audio queue drains (fallback if sentinel is missed)
@@ -1929,8 +1930,7 @@ class StandaloneRealtimeAVA:
                             try:
                                 if self.audio_queue.empty() and not self.playback_busy.is_set():
                                     try:
-                                        if hasattr(self, '_voice_bus') and self._voice_bus:
-                                            self._voice_bus.emit(type('E', (), {'type': 'playback.end'}))
+                                        self.bus.emit(_VoiceEvent(type="playback.end"))
                                     except Exception:
                                         pass
                                     break
@@ -4113,9 +4113,8 @@ class StandaloneRealtimeAVA:
                             except Exception:
                                 pass
                             try:
-                                if hasattr(self, '_voice_bus') and self._voice_bus:
-                                    # Emit instance, not class
-                                    self._voice_bus.emit(type('E', (), {'type': 'playback.end'})())
+                                # Use unified event model
+                                self.bus.emit(_VoiceEvent(type="playback.end"))
                             except Exception:
                                 pass
                             continue
