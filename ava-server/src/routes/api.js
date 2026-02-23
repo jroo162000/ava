@@ -146,12 +146,38 @@ router.post('/respond', async (req, res) => {
 
     try { conversationLogger.logUserMessage(userText, { sessionId, endpoint: '/respond', freshSession }); } catch {}
 
+    // CONVERSATIONAL PATH: When tools are disabled, bypass agent loop entirely.
+    // The agent loop frames everything as "task execution" which produces verbose
+    // non-answers for simple factual questions. Direct LLM call gives natural replies.
+    if (run_tools === false) {
+      logger.info('[respond] Conversational path (no tools)', { text: userText.slice(0, 60) });
+      const { context, persona, style } = req.body || {};
+      const sysPrompt = `You are AVA, a helpful voice assistant. Your responses are spoken aloud, so keep them natural and conversational. Prefer short, direct answers — a sentence or two is usually enough. Avoid unnecessary elaboration, but give complete answers when the question calls for it.${context ? '\n\nContext: ' + context : ''}`;
+      const llmResult = await llmService.chat([
+        { role: 'system', content: sysPrompt },
+        { role: 'user', content: userText }
+      ], { temperature: 0.3, max_tokens: 200 });
+      let finalText = (llmResult.text || llmResult.content || '').trim();
+
+      if (isStepStatusMessage(finalText)) {
+        console.log(`[respond] Blocked step status (conv): ${finalText.slice(0, 60)}...`);
+        finalText = '';
+      }
+
+      try { conversationLogger.logAssistantMessage(finalText, { sessionId, responseType: 'conversational' }); } catch {}
+
+      return res.json({ ok: true, output_text: String(finalText || '').slice(0, 4000), agent: {
+        id: 'conv-' + Date.now(),
+        status: 'success',
+        steps: 0,
+        result: finalText,
+        errors: []
+      }});
+    }
+
+    // TOOL PATH: Full agent loop for tool-enabled requests
     const loopOptions = {};
     if (memory_filter) loopOptions.memoryFilter = memory_filter;
-    if (run_tools === false) {
-      loopOptions.stepLimit = 1;   // No multi-step agent loop for non-tool requests
-      loopOptions.runTools = false;
-    }
     const state = await (await import('../services/agentLoop.js')).default.runAgentLoop(userText, loopOptions);
     let finalText = state.final_result || 'Done.';
 
@@ -160,7 +186,7 @@ router.post('/respond', async (req, res) => {
       console.log(`[respond] Blocked step status: ${finalText.slice(0, 60)}...`);
       finalText = '';
     }
-    
+
     try { conversationLogger.logAssistantMessage(finalText, { sessionId, responseType: 'agent' }); } catch {}
 
     res.json({ ok: true, output_text: String(finalText || '').slice(0, 4000), agent: {

@@ -71,7 +71,9 @@ class HybridASREngine:
         sample_rate: int = 16000,
         silence_threshold: float = 500,  # RMS threshold
         silence_duration: float = 0.5,   # Seconds of silence before final
-        min_audio_length: float = 0.8,   # Minimum audio to process (seconds) — raised for Whisper stability
+        min_audio_length: float = 0.8,   # Minimum audio to process (seconds) - raised for Whisper stability
+        max_utterance_sec: float = 6.0,
+        wake_words: list[str] | None = None,
         debug: bool = False
     ):
         self.vosk_model_path = vosk_model_path
@@ -114,6 +116,19 @@ class HybridASREngine:
             "hey bob", "my house", "that's my house",
             "www.", ".com", ".org", "click", "bell",
         ]
+
+        # Utterance timing and gating
+        self._utt_start_ts = 0.0
+        self._max_utt_sec = float(max_utterance_sec or 6.0)
+        self.capture_enabled = True if (wake_words is None or len(wake_words) == 0) else False
+        self._wake_words = [w.lower() for w in (wake_words or [])]
+
+    def set_capture_enabled(self, enabled: bool):
+        self.capture_enabled = bool(enabled)
+        if not self.capture_enabled:
+            with self._buffer_lock:
+                self._audio_buffer.clear()
+            self._utt_start_ts = 0.0
     
     def _log(self, msg: str):
         if self.debug:
@@ -125,9 +140,12 @@ class HybridASREngine:
         
         # Load VOSK
         if VOSK_AVAILABLE:
+            # Prefer relative model under repo to avoid brittle absolute paths
+            base_dir = os.path.dirname(__file__)
             vosk_paths = [
                 self.vosk_model_path,
-                r"C:\Users\USER 1\ava-integration\vosk-models\vosk-model-small-en-us-0.15",
+                os.path.join(base_dir, "vosk-models", "vosk-model-small-en-us-0.15"),
+                r"C:\Users\USER 1\ava\ava-integration\vosk-models\vosk-model-small-en-us-0.15",
                 "vosk-model-small-en-us-0.15",
                 "model",
             ]
@@ -223,9 +241,10 @@ class HybridASREngine:
         if rms > self.silence_threshold:
             self._last_speech_time = now
         
-        # Accumulate for Whisper
-        with self._buffer_lock:
-            self._audio_buffer.extend(audio_bytes)
+        # Accumulate for Whisper only if capture is enabled (wake-gated)
+        if self.capture_enabled:
+            with self._buffer_lock:
+                self._audio_buffer.extend(audio_bytes)
         
         # Feed to VOSK for instant streaming
         if self.vosk_recognizer:
@@ -254,6 +273,15 @@ class HybridASREngine:
                     if partial:
                         # Vosk detected speech - update speech time regardless of RMS
                         self._last_speech_time = now
+                        # Wake gating: enable capture only after wake phrase seen in partials
+                        try:
+                            if not self.capture_enabled and self._wake_words:
+                                low = partial.lower()
+                                if any(w in low for w in self._wake_words):
+                                    self.capture_enabled = True
+                                    self._utt_start_ts = self._utt_start_ts or now
+                        except Exception:
+                            pass
                         if partial != self._vosk_partial:
                             self._vosk_partial = partial
                             print(f"[vosk] partial: {partial}")  # DEBUG
@@ -264,6 +292,12 @@ class HybridASREngine:
                 print(f"[vosk] ERROR: {e}")  # DEBUG
                 self._log(f"VOSK error: {e}")
         
+        # Hard utterance cutoff
+        try:
+            if self._utt_start_ts and (now - self._utt_start_ts) > self._max_utt_sec and self.has_enough_audio():
+                return self.get_final_result()
+        except Exception:
+            pass
         return self._vosk_partial if self._vosk_partial else None
     
     def is_speaking(self) -> bool:
@@ -343,6 +377,10 @@ class HybridASREngine:
         self._vosk_partial = ""
         self._vosk_final = ""
         self._last_speech_time = 0
+        # Reset capture to wait for next wake if gating is active
+        if self._wake_words:
+            self.capture_enabled = False
+        self._utt_start_ts = 0.0
         
         # Process with Whisper
         self._whisper_done.clear()
@@ -508,18 +546,6 @@ if __name__ == "__main__":
         print("Failed to start engine")
         sys.exit(1)
     
-    print("\nSpeak something (Ctrl+C to stop)...")
-    print("-" * 60)
-    
-    p = pyaudio.PyAudio()
-    stream = p.open(
-        format=pyaudio.paInt16,
-        channels=1,
-        rate=16000,
-        input=True,
-        frames_per_buffer=1600
-    )
-    
     try:
         while True:
             audio = stream.read(1600, exception_on_overflow=False)
@@ -540,3 +566,4 @@ if __name__ == "__main__":
         stream.close()
         p.terminate()
         engine.stop()
+

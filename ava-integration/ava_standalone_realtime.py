@@ -29,6 +29,30 @@ import random
 import uuid
 import hashlib
 VOICE_UNIFIED = os.getenv("VOICE_UNIFIED", "0") == "1"  # legacy override only
+
+# -------------------- Latency JSONL helpers --------------------
+def _latlog_path() -> str | None:
+    try:
+        p = os.environ.get("AVA_LATENCY_LOG")
+        return p.strip() if p else None
+    except Exception:
+        return None
+
+def _latlog_write(rec: dict) -> None:
+    try:
+        p = _latlog_path()
+        if not p:
+            return
+        # Ensure parent exists and append JSONL
+        rec = dict(rec)
+        rec["ts"] = time.time()
+        parent = os.path.dirname(p)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        with open(p, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
 try:
     # Unified voice scaffolding
     from voice.bus import EventBus as _VoiceEventBus
@@ -53,9 +77,14 @@ if sys.platform == 'win32':
 WS_AVAILABLE = True
 try:
     import websockets
-    WS_ClosedOK = websockets.exceptions.ConnectionClosedOK
-    WS_ClosedError = websockets.exceptions.ConnectionClosedError
-    WS_ClosedGeneral = websockets.exceptions.ConnectionClosed
+    try:
+        # Modern versions (v13+): import exceptions from submodule
+        from websockets.exceptions import ConnectionClosedOK as WS_ClosedOK, ConnectionClosedError as WS_ClosedError, ConnectionClosed as WS_ClosedGeneral
+    except Exception:
+        # Fallback: some versions expose names at top-level or with different structure
+        WS_ClosedOK = getattr(websockets, 'ConnectionClosedOK', Exception)
+        WS_ClosedError = getattr(websockets, 'ConnectionClosedError', Exception)
+        WS_ClosedGeneral = getattr(websockets, 'ConnectionClosed', Exception)
 except Exception as e:
     websockets = None  # type: ignore
     WS_AVAILABLE = False
@@ -65,7 +94,7 @@ except Exception as e:
         pass
     class WS_ClosedGeneral(Exception):
         pass
-    print(f"[warning] websockets not available: {e}")
+    print(f"[warning] websockets not available or incompatible: {e}")
 
 import pyaudio
 from corrected_tool_definitions import CORRECTED_TOOLS
@@ -1092,6 +1121,22 @@ class StandaloneRealtimeAVA:
     def __init__(self):
         load_into_env()
 
+        # Create latency log file on startup (if configured) to verify writability
+        try:
+            lp = _latlog_path()
+            if lp:
+                parent = os.path.dirname(lp)
+                if parent:
+                    os.makedirs(parent, exist_ok=True)
+                with open(lp, "a", encoding="utf-8") as _f:
+                    pass
+                try:
+                    _latlog_write({"stage": "app_start"})
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
         # Load provider keys (optional; auto-select voice later)
         self.deepgram_key = os.getenv("DEEPGRAM_API_KEY") or self._read_key_file("deepgram key.txt")
         self.gemini_key = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY") or self._read_key_file("gemini api key.txt")
@@ -1122,7 +1167,8 @@ class StandaloneRealtimeAVA:
         self.session_id = None
 
         # Audio playback queue and thread
-        self.audio_queue = queue.Queue(maxsize=200)  # Limit queue to prevent memory issues
+        # Increase playback queue size to absorb TTS burstiness and prevent clipping
+        self.audio_queue = queue.Queue(maxsize=1200)
         self.playback_thread = None
         self.playback_stream = None
         self._playback_abort_until = 0.0
@@ -1398,6 +1444,7 @@ class StandaloneRealtimeAVA:
         print("=" * 80)
         print(f"Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         # Decide voice mode now (auto if not set)
+        # Decide voice mode now (auto if not set)
         self.voice_selected = self._select_voice_mode()
         if self.voice_selected == 'unified':
             # Determine TTS engine for banner
@@ -1414,7 +1461,16 @@ class StandaloneRealtimeAVA:
         print(f"Tools Available: 20 JARVIS-level capabilities")
         print("=" * 80)
         print("Features:")
-        print("  - Always listening (no wake word needed)")
+        # Reflect actual validation mode configuration for wake words
+        try:
+            vm = self.cfg.get('validation_mode') or {}
+            wake_required = bool(vm.get('enabled', False)) and bool(vm.get('require_wake_for_tools', False))
+        except Exception:
+            wake_required = False
+        if wake_required:
+            print("  - Wake word required (e.g., 'Hey AVA')")
+        else:
+            print("  - Always listening (no wake word needed)")
         print("  - Bidirectional realtime voice conversation")
         print("  - Sub-second response latency")
         print("  - Can interrupt AVA mid-sentence")
@@ -1547,6 +1603,12 @@ class StandaloneRealtimeAVA:
 
         # Track when TTS last ended for echo grace period
         self._tts_ended_at = 0.0
+        # Configurable echo grace period (seconds)
+        try:
+            ec = (self.cfg.get('echo_cancellation') or {})
+            self._echo_grace_sec = float(ec.get('grace_period_sec', 2.0) or 2.0)
+        except Exception:
+            self._echo_grace_sec = 2.0
 
         # Bridge: on final user text -> existing respond + TTS path
         def _on_final_user_text(txt: str):
@@ -1556,9 +1618,9 @@ class StandaloneRealtimeAVA:
             if self.tts_active.is_set():
                 print(f"[echo-gate] Ignoring ASR final during TTS: {txt[:30]}...")
                 return
-            # ECHO GRACE: Also ignore ASR finals for 10s after TTS ends (covers playback + Vosk buffer)
+            # ECHO GRACE: Ignore ASR finals for a short period after TTS ends (config-driven)
             import time
-            grace_period = 10.0
+            grace_period = getattr(self, '_echo_grace_sec', 2.0) or 2.0
             if self._tts_ended_at and (time.time() - self._tts_ended_at) < grace_period:
                 print(f"[echo-gate] Ignoring ASR final in grace period: {txt[:30]}...")
                 return
@@ -1608,12 +1670,30 @@ class StandaloneRealtimeAVA:
                     # Mark ASR final timestamp for metrics
                     asr_final_ts = time.time()
                     self._asr_final_ts = asr_final_ts
+                    try:
+                        _latlog_write({"stage": "asr_final", "text_len": len(txt or "")})
+                    except Exception:
+                        pass
                     reply = loop.run_until_complete(self._ask_server_respond(enhanced))
+                    try:
+                        # Approximate LLM latency from ASR final to now
+                        llm_ms_local = None
+                        if self._asr_final_ts:
+                            llm_ms_local = int(max(0, (time.time() - self._asr_final_ts) * 1000))
+                        _latlog_write({"stage": "llm_done", "reply_len": len(reply or ""), **({"llm_ms": llm_ms_local} if llm_ms_local is not None else {})})
+                    except Exception:
+                        pass
                     if reply:
                         # TURN STATE: Entering SPEAK phase
                         self._turn_state.transition(TurnState.SPEAK, "TTS starting")
                         # Speak via unified TTS (Edge TTS streaming)
                         try:
+                            # ASR FINAL checkpoint
+                            try:
+                                _latlog_write({"stage": "asr_final", "text_len": len(txt or "")})
+                            except Exception:
+                                pass
+
                             self._awaiting_tts_since = time.time()
                             self._tts_first_chunk_ts = 0.0
                             try:
@@ -1622,6 +1702,25 @@ class StandaloneRealtimeAVA:
                             except Exception:
                                 pass
                             print(f"[tts-debug] speak() called with: {reply[:50]}...")
+                            # LLM DONE checkpoint (measure LLM latency locally if possible)
+                            try:
+                                # If we have asr_final_ts and llm_end-like markers in metrics, prefer them;
+                                # otherwise estimate from await timings already completed above.
+                                llm_ms_local = None
+                                try:
+                                    _asr_ts = getattr(self, '_asr_final_ts', None)
+                                    _llm_end = time.time()
+                                    if _asr_ts:
+                                        llm_ms_local = int(max(0, (_llm_end - _asr_ts) * 1000))
+                                except Exception:
+                                    pass
+                                _latlog_write({
+                                    "stage": "llm_done",
+                                    "reply_len": len(reply or ""),
+                                    **({"llm_ms": llm_ms_local} if llm_ms_local is not None else {})
+                                })
+                            except Exception:
+                                pass
                             # TURN-SCOPED TTS GATE for unified path
                             active_token = self._turn_state.tts_token
                             if tts_token != active_token:
@@ -1632,7 +1731,11 @@ class StandaloneRealtimeAVA:
                                 self._voice_session.speak(reply)
                             if utt_id:
                                 self._utt_committed.add(utt_id)
-                        except Exception:
+                        except Exception as e:
+                            try:
+                                _latlog_write({"stage": "tts_error", "err": repr(e)})
+                            except Exception:
+                                pass
                             # TTS failed — force cleanup to prevent leaked SPEAK state
                             self._turn_state.force_idle("TTS error (unified)")
                         # Note: On success, TURN STATE -> IDLE handled by voice session's tts.end event
@@ -1646,9 +1749,17 @@ class StandaloneRealtimeAVA:
                             pass
                     else:
                         # No reply - return to IDLE
+                        try:
+                            _latlog_write({"stage": "no_reply"})
+                        except Exception:
+                            pass
                         self._turn_state.force_idle("no reply")
                 else:
                     # Local intent handled - return to IDLE
+                    try:
+                        _latlog_write({"stage": "local_intent_handled"})
+                    except Exception:
+                        pass
                     self._turn_state.force_idle("local intent handled")
             except Exception:
                 self._turn_state.force_idle("error")
@@ -1672,6 +1783,17 @@ class StandaloneRealtimeAVA:
                 model = p.get('model') or str((Path(__file__).resolve().parent / 'voices' / 'piper' / 'en_US-lessac-medium.onnx'))
                 tts = _PiperBinTTS(exe_path=exe, model_path=model)
                 self._voice_session.set_tts(tts, self._playback_enqueue_sync)
+                # Default micro-utterance chunking for Piper if not explicitly configured
+                try:
+                    if not (self.cfg.get('tts_chunking') and isinstance(self.cfg.get('tts_chunking'), dict)):
+                        self._voice_session.tts_chunking_cfg = {
+                            'enabled': True,
+                            'max_words': 6,
+                            'max_chars': 60,
+                            'min_words': 3,
+                        }
+                except Exception:
+                    pass
                 print(f"[voice-unified] TTS engine: piper (all TTS routes through local, no remote API)")
                 # Playback rate will be adjusted on first chunk via tts.current_sample_rate
             else:
@@ -1686,6 +1808,16 @@ class StandaloneRealtimeAVA:
         # Subscribe for barge-in / VAD and asr.final meta capture
         def _bus_handler(ev):
             try:
+                # Global latency checkpoints from voice bus
+                et = getattr(ev, 'type', None)
+                if et == 'asr.final':
+                    try:
+                        _latlog_write({
+                            "stage": "asr_final",
+                            "text_len": len(getattr(ev, 'text', '') or ''),
+                        })
+                    except Exception:
+                        pass
                 if ev.type == 'vad.start':
                     # Mark speaking; mic loop applies debounce to prevent echo loops
                     self.user_speaking.set()
@@ -1703,7 +1835,8 @@ class StandaloneRealtimeAVA:
                     if self.tts_active.is_set():
                         return
                     # ECHO GRACE: Also drop partials shortly after TTS ends
-                    if self._tts_ended_at and (time.time() - self._tts_ended_at) < 10.0:
+                    grace_period = getattr(self, '_echo_grace_sec', 2.0) or 2.0
+                    if self._tts_ended_at and (time.time() - self._tts_ended_at) < grace_period:
                         return
                     # First partial timing
                     if self._speech_start_ts and not self._first_partial_ts:
@@ -1768,6 +1901,36 @@ class StandaloneRealtimeAVA:
                         playback_ms = int((_tts_end - _first_chunk) * 1000) if _tts_end and _first_chunk else 0
                         total_ms = asr_ms + llm_ms + tts_synth_ms + playback_ms
                         print(f"[latency] asr={asr_ms}ms llm={llm_ms}ms tts_synth={tts_synth_ms}ms playback={playback_ms}ms total={total_ms}ms")
+
+                        # Optional JSONL latency log for Voice Lab tools.
+                        # Enable by setting AVA_LATENCY_LOG to a file path.
+                        log_path = os.environ.get('AVA_LATENCY_LOG', '').strip()
+                        if log_path:
+                            rec = {
+                                "ts": time.time(),
+                                "asr_ms": asr_ms,
+                                "llm_ms": llm_ms,
+                                "tts_synth_ms": tts_synth_ms,
+                                "playback_ms": playback_ms,
+                                "total_ms": total_ms,
+                            }
+                            try:
+                                rec.update({
+                                    "speech_end_ts": _vad_end or 0.0,
+                                    "asr_final_ts": _asr_ts or 0.0,
+                                    "llm_end_ts": _llm_end or 0.0,
+                                    "tts_first_chunk_ts": _first_chunk or 0.0,
+                                    "tts_end_ts": _tts_end or 0.0,
+                                })
+                            except Exception:
+                                pass
+                            try:
+                                if os.path.dirname(log_path):
+                                    os.makedirs(os.path.dirname(log_path), exist_ok=True)
+                                with open(log_path, 'a', encoding='utf-8') as f:
+                                    f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                            except Exception:
+                                pass
                     except Exception:
                         pass
                     # TURN STATE: Back to IDLE after TTS completes
@@ -2123,7 +2286,9 @@ class StandaloneRealtimeAVA:
             pcm_bytes = _resample_audio(pcm_bytes, src_rate, int(self.playback_rate))
 
         FRAME_BYTES = int((int(self.playback_rate) // 50) * 2)  # 20ms frames
-        MAX_FRAMES = 500  # ~10 seconds for Piper (synthesizes entire file first)
+        # Keep the queue short for realtime feel. Target ~400ms max buffered audio.
+        # Increase cap to allow multi‑second buffering; previously ~0.4s caused drops
+        CAP_FRAMES = max(int(10.00 / 0.02), 1)  # ~10 seconds at 20ms per frame
         try:
             # Slice into ~20ms frames for snappy playback
             i = 0
@@ -2133,11 +2298,17 @@ class StandaloneRealtimeAVA:
                 i += FRAME_BYTES
                 if not chunk:
                     break
-                # Block if queue is full (don't drop frames for Piper)
+                # Never block here (blocking creates audible gaps).
+                # If the queue is above CAP_FRAMES, drop oldest frames to keep audio "now".
                 try:
-                    self.audio_queue.put(chunk, block=True, timeout=5.0)
-                except queue.Full:
-                    # Only drop if truly stuck
+                    while self.audio_queue.qsize() >= CAP_FRAMES:
+                        try:
+                            self.audio_queue.get_nowait()
+                        except Exception:
+                            break
+                    self.audio_queue.put_nowait(chunk)
+                except Exception:
+                    # If still full or queue unavailable, drop this frame.
                     pass
                 try:
                     self.metrics['playback_queue_frames'] = self.audio_queue.qsize()
