@@ -1172,6 +1172,12 @@ class StandaloneRealtimeAVA:
         self.playback_thread = None
         self.playback_stream = None
         self._playback_abort_until = 0.0
+        # End-of-utterance sentinel and playback completion tracking
+        # None is reserved as poison pill for the worker; use a unique object for utterance boundaries
+        self._UTT_END = object()
+        self.utt_playback_done = threading.Event()
+        self.utt_playback_done.set()
+        self._utt_in_progress = False
         # Barge-in / echo gating
         self.tts_active = threading.Event()
         self.user_speaking = threading.Event()
@@ -1584,6 +1590,12 @@ class StandaloneRealtimeAVA:
                 self._utter_rate_checked = False
             except Exception:
                 pass
+            # Ensure completion state doesn't hang
+            try:
+                self._utt_in_progress = False
+                self.utt_playback_done.set()
+            except Exception:
+                pass
         except Exception:
             pass
 
@@ -1883,79 +1895,43 @@ class StandaloneRealtimeAVA:
                     except Exception:
                         pass
                 elif ev.type == 'tts.end':
-                    # HALF-DUPLEX: Clear runner tts_active flag, start grace period
-                    self.tts_active.clear()
+                    # tts.end == synthesis complete, NOT playback complete. Do not unmute or drain here.
                     self._tts_ended_at = time.time()
-                    print("[half-duplex] MIC UNMUTED (unified) - TTS complete (grace period active)")
-                    # LATENCY: Consolidated per-turn latency line
+                    print("[half-duplex] TTS synthesis complete (unified) - waiting for playback to finish")
+                    # Signal playback end-of-utterance; playback worker will emit playback.end
                     try:
-                        _asr_ts = getattr(self, '_asr_final_ts', 0.0)
-                        _vad_end = getattr(self, '_speech_end_ts', 0.0)
-                        _llm_start = _asr_ts
-                        _llm_end = getattr(self, '_awaiting_tts_since', 0.0)
-                        _first_chunk = getattr(self, '_tts_first_chunk_ts', 0.0)
-                        _tts_end = self._tts_ended_at
-                        asr_ms = int((_asr_ts - _vad_end) * 1000) if _asr_ts and _vad_end else 0
-                        llm_ms = int((_llm_end - _llm_start) * 1000) if _llm_end and _llm_start else 0
-                        tts_synth_ms = int((_first_chunk - _llm_end) * 1000) if _first_chunk and _llm_end else 0
-                        playback_ms = int((_tts_end - _first_chunk) * 1000) if _tts_end and _first_chunk else 0
-                        total_ms = asr_ms + llm_ms + tts_synth_ms + playback_ms
-                        print(f"[latency] asr={asr_ms}ms llm={llm_ms}ms tts_synth={tts_synth_ms}ms playback={playback_ms}ms total={total_ms}ms")
-
-                        # Optional JSONL latency log for Voice Lab tools.
-                        # Enable by setting AVA_LATENCY_LOG to a file path.
-                        log_path = os.environ.get('AVA_LATENCY_LOG', '').strip()
-                        if log_path:
-                            rec = {
-                                "ts": time.time(),
-                                "asr_ms": asr_ms,
-                                "llm_ms": llm_ms,
-                                "tts_synth_ms": tts_synth_ms,
-                                "playback_ms": playback_ms,
-                                "total_ms": total_ms,
-                            }
-                            try:
-                                rec.update({
-                                    "speech_end_ts": _vad_end or 0.0,
-                                    "asr_final_ts": _asr_ts or 0.0,
-                                    "llm_end_ts": _llm_end or 0.0,
-                                    "tts_first_chunk_ts": _first_chunk or 0.0,
-                                    "tts_end_ts": _tts_end or 0.0,
-                                })
-                            except Exception:
-                                pass
-                            try:
-                                if os.path.dirname(log_path):
-                                    os.makedirs(os.path.dirname(log_path), exist_ok=True)
-                                with open(log_path, 'a', encoding='utf-8') as f:
-                                    f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-                            except Exception:
-                                pass
+                        self._queue_utterance_end()
+                    except Exception:
+                        self._utt_in_progress = False
+                        try:
+                            self.utt_playback_done.set()
+                        except Exception:
+                            pass
+                        try:
+                            if hasattr(self, '_voice_bus') and self._voice_bus:
+                                self._voice_bus.emit(type('E', (), {'type': 'playback.end'}))
+                        except Exception:
+                            pass
+                elif ev.type == 'playback.end':
+                    # Now it is safe to end the speaking turn.
+                    try:
+                        self.tts_active.clear()
                     except Exception:
                         pass
-                    # TURN STATE: Back to IDLE after TTS completes
-                    self._turn_state.force_idle("TTS complete (tts.end event)")
-                    # Clear ASR buffer to prevent accumulated TTS audio from being transcribed
+                    self._tts_ended_at = time.time()
+                    print("[half-duplex] MIC UNMUTED (unified) - playback finished")
+                    # TURN STATE: Back to IDLE only after audible speech finishes
+                    try:
+                        self._turn_state.force_idle("TTS playback finished (playback.end)")
+                    except Exception:
+                        pass
+                    # Clear ASR buffer AFTER playback finishes
                     try:
                         if hasattr(self, '_voice_provider') and self._voice_provider:
                             asr = getattr(self._voice_provider, 'asr', None)
                             if asr and hasattr(asr, 'clear_buffer'):
                                 asr.clear_buffer()
-                                print(f"[echo-gate] Cleared ASR buffer on TTS end")
-                    except Exception:
-                        pass
-                    # Also clear the audio queue to prevent leftover chunks from building up
-                    try:
-                        if hasattr(self, 'audio_queue') and self.audio_queue is not None:
-                            drained = 0
-                            while not self.audio_queue.empty():
-                                try:
-                                    self.audio_queue.get_nowait()
-                                    drained += 1
-                                except Exception:
-                                    break
-                            if drained > 0:
-                                print(f"[echo-gate] Drained {drained} leftover audio chunks")
+                                print("[echo-gate] Cleared ASR buffer on playback end")
                     except Exception:
                         pass
             except Exception:
@@ -2262,6 +2238,8 @@ class StandaloneRealtimeAVA:
         Assumes 24kHz, 16-bit mono (960 bytes per 20ms frame).
         Resamples audio if TTS produces a different sample rate (e.g., Piper at 22050 Hz).
         """
+        # Helper to be called by tts.end to mark utterance boundary
+        # Note: actual method defined elsewhere; this is just reference usage context.
         # If TTS reports a different sample rate (Piper), resample instead of reopening stream
         try:
             if getattr(self, '_utter_rate_checked', False) is False:
@@ -2303,7 +2281,14 @@ class StandaloneRealtimeAVA:
                 try:
                     while self.audio_queue.qsize() >= CAP_FRAMES:
                         try:
-                            self.audio_queue.get_nowait()
+                            item = self.audio_queue.get_nowait()
+                            # NEVER discard utterance-end sentinel if it somehow got into the trim range
+                            if item is self._UTT_END:
+                                try:
+                                    self.audio_queue.put_nowait(item)
+                                except Exception:
+                                    pass
+                                break
                         except Exception:
                             break
                     self.audio_queue.put_nowait(chunk)
@@ -2314,6 +2299,34 @@ class StandaloneRealtimeAVA:
                     self.metrics['playback_queue_frames'] = self.audio_queue.qsize()
                 except Exception:
                     pass
+
+    def _queue_utterance_end(self):
+        """Signal the playback worker that the current utterance is complete."""
+        if not getattr(self, "_utt_in_progress", False):
+            return
+        try:
+            # Make room if needed, but NEVER discard an existing _UTT_END if present
+            try:
+                while self.audio_queue.qsize() > 0 and self.audio_queue.qsize() > 600:
+                    item = self.audio_queue.get_nowait()
+                    if item is self._UTT_END:
+                        # put it back and stop trimming
+                        try:
+                            self.audio_queue.put_nowait(item)
+                        except Exception:
+                            pass
+                        break
+            except Exception:
+                pass
+
+            self.audio_queue.put_nowait(self._UTT_END)
+        except Exception:
+            # Fail-safe: never hang the state machine
+            self._utt_in_progress = False
+            try:
+                self.utt_playback_done.set()
+            except Exception:
+                pass
                 # First-chunk latency measurement
                 if self._awaiting_tts_since and not self._tts_first_chunk_ts:
                     self._tts_first_chunk_ts = time.time()
@@ -3583,6 +3596,12 @@ class StandaloneRealtimeAVA:
         # Mic loop checks this flag and suppresses audio input during TTS
         self.tts_active.set()
         self._tts_last_active = time.time()
+        # Arm utterance tracking for playback-complete signaling
+        try:
+            self.utt_playback_done.clear()
+            self._utt_in_progress = True
+        except Exception:
+            pass
         print("[half-duplex] MIC MUTED - TTS starting")
         speak_url = f"{DG_SPEAK_BASE}&encoding=linear16&sample_rate={self.playback_rate}"
         req = urllib.request.Request(
@@ -4051,6 +4070,19 @@ class StandaloneRealtimeAVA:
                     try:
                         # Drop immediately during abort window to ensure snappy barge-in
                         if time.time() < getattr(self, '_playback_abort_until', 0.0):
+                            continue
+                        # NEW: end-of-utterance marker handling
+                        if audio_data is self._UTT_END:
+                            self._utt_in_progress = False
+                            try:
+                                self.utt_playback_done.set()
+                            except Exception:
+                                pass
+                            try:
+                                if hasattr(self, '_voice_bus') and self._voice_bus:
+                                    self._voice_bus.emit(type('E', (), {'type': 'playback.end'}))
+                            except Exception:
+                                pass
                             continue
                         self.playback_busy.set()
                         # Debug: log playback activity periodically
