@@ -1178,6 +1178,8 @@ class StandaloneRealtimeAVA:
         self.utt_playback_done = threading.Event()
         self.utt_playback_done.set()
         self._utt_in_progress = False
+        # Guard to avoid duplicate playback.end emissions
+        self._playback_end_fired = False
         # Barge-in / echo gating
         self.tts_active = threading.Event()
         self.user_speaking = threading.Event()
@@ -1865,6 +1867,13 @@ class StandaloneRealtimeAVA:
                     self.tts_active.set()
                     self._tts_last_active = time.time()
                     print("[half-duplex] MIC MUTED (unified) - TTS starting")
+                    # Arm utterance tracking for playback-complete signaling and reset end guard
+                    try:
+                        self.utt_playback_done.clear()
+                        self._utt_in_progress = True
+                        self._playback_end_fired = False
+                    except Exception:
+                        pass
                     # Clear audio queue when new TTS starts to prevent overlap
                     try:
                         if hasattr(self, 'audio_queue') and self.audio_queue is not None:
@@ -1912,6 +1921,26 @@ class StandaloneRealtimeAVA:
                                 self._voice_bus.emit(type('E', (), {'type': 'playback.end'}))
                         except Exception:
                             pass
+                    # Start a watchdog to emit playback.end once audio queue drains (fallback if sentinel is missed)
+                    def _watchdog():
+                        import time as _t
+                        deadline = _t.time() + 12.0
+                        while _t.time() < deadline:
+                            try:
+                                if self.audio_queue.empty() and not self.playback_busy.is_set():
+                                    try:
+                                        if hasattr(self, '_voice_bus') and self._voice_bus:
+                                            self._voice_bus.emit(type('E', (), {'type': 'playback.end'}))
+                                    except Exception:
+                                        pass
+                                    break
+                            except Exception:
+                                break
+                            _t.sleep(0.15)
+                    try:
+                        threading.Thread(target=_watchdog, daemon=True).start()
+                    except Exception:
+                        pass
                 elif ev.type == 'playback.end':
                     # Now it is safe to end the speaking turn.
                     try:
@@ -4079,8 +4108,9 @@ class StandaloneRealtimeAVA:
                             except Exception:
                                 pass
                             try:
-                                if hasattr(self, '_voice_bus') and self._voice_bus:
+                                if hasattr(self, '_voice_bus') and self._voice_bus and not getattr(self, '_playback_end_fired', False):
                                     self._voice_bus.emit(type('E', (), {'type': 'playback.end'}))
+                                    self._playback_end_fired = True
                             except Exception:
                                 pass
                             continue
