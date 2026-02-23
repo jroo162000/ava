@@ -3670,6 +3670,14 @@ class StandaloneRealtimeAVA:
 
         except Exception as e:
             print(f"TTS error: {e}")
+            # Fallback to local TTS in unified mode so the user still hears a reply
+            try:
+                if getattr(self, '_voice_session', None):
+                    print("[tts-fallback] Remote TTS failed; routing to local TTS")
+                    self._voice_session.speak(speak_text)
+                    return
+            except Exception:
+                pass
         finally:
             # HALF-DUPLEX: Unmute mic after TTS completes
             self.tts_active.clear()
