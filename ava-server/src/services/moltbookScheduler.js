@@ -999,6 +999,12 @@ let _activityRunning = false; // Prevent concurrent activity runs
 export function startMoltbookScheduler() {
   if (_timer) return;
 
+  // Guard: skip scheduler when voice mode is active
+  if (process.env.DISABLE_AUTONOMY === '1') {
+    logger.info('[autonomy] disabled (voice mode) — moltbook scheduler will not start');
+    return;
+  }
+
   logger.info('[moltbook-scheduler] Starting FULL AUTONOMY mode');
 
   // Run immediately on startup

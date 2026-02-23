@@ -109,11 +109,14 @@ class LocalHybridProvider(VoiceProvider):
             self._in_utt = False
             self._current_utt_id = None
 
+        # Use slightly lower silence threshold to improve stop detection on typical mics
         self.asr = HybridASREngine(
             whisper_model=self.whisper_model,
             on_partial=on_partial,
             on_final=on_final,
             sample_rate=16000,
+            silence_threshold=300,
+            silence_duration=0.6,
         )
         ok = self.asr.start()
         if not ok:
@@ -129,16 +132,14 @@ class LocalHybridProvider(VoiceProvider):
             self.asr = None
 
     def push_audio(self, pcm16: bytes) -> None:
-        if not self._running or not self.asr:
-            # DEBUG: print why we're not feeding
-            if not hasattr(self, '_dbg_skip_count'):
-                self._dbg_skip_count = 0
-            self._dbg_skip_count += 1
-            if self._dbg_skip_count % 50 == 1:
-                print(f"[provider] SKIPPING audio: running={self._running} asr={self.asr is not None}")
+        # Always feed audio to ASR wake detector if available; do not choke/gate early
+        if not self._running:
+            return
+        eng = self.asr
+        if not eng:
             return
         try:
-            self.asr.feed_audio(pcm16)
+            eng.feed_audio(pcm16)
         except Exception as e:
             print(f"[provider] feed_audio error: {e}")
 

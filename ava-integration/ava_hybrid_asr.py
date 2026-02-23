@@ -71,7 +71,9 @@ class HybridASREngine:
         sample_rate: int = 16000,
         silence_threshold: float = 500,  # RMS threshold
         silence_duration: float = 0.5,   # Seconds of silence before final
-        min_audio_length: float = 0.3,   # Minimum audio to process (seconds)
+        min_audio_length: float = 0.8,   # Minimum audio to process (seconds) - raised for Whisper stability
+        max_utterance_sec: float = 6.0,
+        wake_words: list[str] | None = None,
         debug: bool = False
     ):
         self.vosk_model_path = vosk_model_path
@@ -114,6 +116,19 @@ class HybridASREngine:
             "hey bob", "my house", "that's my house",
             "www.", ".com", ".org", "click", "bell",
         ]
+
+        # Utterance timing and gating
+        self._utt_start_ts = 0.0
+        self._max_utt_sec = float(max_utterance_sec or 6.0)
+        self.capture_enabled = True if (wake_words is None or len(wake_words) == 0) else False
+        self._wake_words = [w.lower() for w in (wake_words or [])]
+
+    def set_capture_enabled(self, enabled: bool):
+        self.capture_enabled = bool(enabled)
+        if not self.capture_enabled:
+            with self._buffer_lock:
+                self._audio_buffer.clear()
+            self._utt_start_ts = 0.0
     
     def _log(self, msg: str):
         if self.debug:
@@ -125,9 +140,12 @@ class HybridASREngine:
         
         # Load VOSK
         if VOSK_AVAILABLE:
+            # Prefer relative model under repo to avoid brittle absolute paths
+            base_dir = os.path.dirname(__file__)
             vosk_paths = [
                 self.vosk_model_path,
-                r"C:\Users\USER 1\ava-integration\vosk-models\vosk-model-small-en-us-0.15",
+                os.path.join(base_dir, "vosk-models", "vosk-model-small-en-us-0.15"),
+                r"C:\Users\USER 1\ava\ava-integration\vosk-models\vosk-model-small-en-us-0.15",
                 "vosk-model-small-en-us-0.15",
                 "model",
             ]
@@ -223,9 +241,10 @@ class HybridASREngine:
         if rms > self.silence_threshold:
             self._last_speech_time = now
         
-        # Accumulate for Whisper
-        with self._buffer_lock:
-            self._audio_buffer.extend(audio_bytes)
+        # Accumulate for Whisper only if capture is enabled (wake-gated)
+        if self.capture_enabled:
+            with self._buffer_lock:
+                self._audio_buffer.extend(audio_bytes)
         
         # Feed to VOSK for instant streaming
         if self.vosk_recognizer:
@@ -254,6 +273,15 @@ class HybridASREngine:
                     if partial:
                         # Vosk detected speech - update speech time regardless of RMS
                         self._last_speech_time = now
+                        # Wake gating: enable capture only after wake phrase seen in partials
+                        try:
+                            if not self.capture_enabled and self._wake_words:
+                                low = partial.lower()
+                                if any(w in low for w in self._wake_words):
+                                    self.capture_enabled = True
+                                    self._utt_start_ts = self._utt_start_ts or now
+                        except Exception:
+                            pass
                         if partial != self._vosk_partial:
                             self._vosk_partial = partial
                             print(f"[vosk] partial: {partial}")  # DEBUG
@@ -264,6 +292,12 @@ class HybridASREngine:
                 print(f"[vosk] ERROR: {e}")  # DEBUG
                 self._log(f"VOSK error: {e}")
         
+        # Hard utterance cutoff
+        try:
+            if self._utt_start_ts and (now - self._utt_start_ts) > self._max_utt_sec and self.has_enough_audio():
+                return self.get_final_result()
+        except Exception:
+            pass
         return self._vosk_partial if self._vosk_partial else None
     
     def is_speaking(self) -> bool:
@@ -298,26 +332,44 @@ class HybridASREngine:
         with self._buffer_lock:
             return len(self._audio_buffer) >= self.min_audio_bytes
     
-    def get_final_result(self, timeout: float = 5.0) -> str:
+    def get_final_result(self, timeout: float = 3.0, tts_active: bool = False,
+                         echo_gate_active: bool = False) -> str:
         """
         Get final transcription from Whisper (most accurate).
 
         Call this when silence is detected after speech.
         Resets the buffer after processing.
 
+        Args:
+            timeout: Max wait for Whisper result (default 3s, reduced from 5s)
+            tts_active: If True, TTS is playing — skip Whisper to prevent echo/stall
+            echo_gate_active: If True, within echo-gate grace period — skip
+
         Returns:
             Whisper transcription (accurate) or empty string
         """
+        # GUARD: Do not dispatch Whisper while TTS is active or echo gate is up
+        if tts_active or echo_gate_active:
+            with self._buffer_lock:
+                self._audio_buffer.clear()  # Discard echo audio
+            return ""
+
         with self._buffer_lock:
-            print(f"[whisper] Buffer size: {len(self._audio_buffer)} bytes (min: {self.min_audio_bytes})")  # DEBUG
             if len(self._audio_buffer) < self.min_audio_bytes:
-                print(f"[whisper] Buffer too small, skipping")  # DEBUG
-                self._log(f"Buffer too small: {len(self._audio_buffer)} bytes")
                 return ""
 
             audio_to_process = bytes(self._audio_buffer)
             self._audio_buffer.clear()
-            print(f"[whisper] Processing {len(audio_to_process)} bytes of audio")  # DEBUG
+
+            # Pre-check RMS before dispatching to Whisper — avoid empty results
+            try:
+                n_samples = len(audio_to_process) // 2
+                samples = struct.unpack('<' + 'h' * n_samples, audio_to_process)
+                rms = (sum(s * s for s in samples) / n_samples) ** 0.5 / 32768.0
+                if rms < 0.01:
+                    return ""
+            except Exception:
+                pass
         
         # Reset VOSK state
         if self.vosk_recognizer:
@@ -325,46 +377,38 @@ class HybridASREngine:
         self._vosk_partial = ""
         self._vosk_final = ""
         self._last_speech_time = 0
+        # Reset capture to wait for next wake if gating is active
+        if self._wake_words:
+            self.capture_enabled = False
+        self._utt_start_ts = 0.0
         
         # Process with Whisper
         self._whisper_done.clear()
         self._whisper_result = None
         self._whisper_queue.put(audio_to_process)
         
-        # Wait for result
-        print(f"[whisper] Waiting for result (timeout={timeout}s)...")  # DEBUG
+        # Wait for result (3s max to prevent pipeline stalls)
         if self._whisper_done.wait(timeout=timeout):
             result = self._whisper_result
-            print(f"[whisper] Got result: '{result}'")  # DEBUG
             if result:
-                print(f"[whisper] Calling on_final callback...")  # DEBUG
                 if self.on_final:
                     self.on_final(result)
                 return result
-            else:
-                print(f"[whisper] Result was empty")  # DEBUG
 
-        print(f"[whisper] Timeout waiting for result")  # DEBUG
         self._log("Whisper timeout")
         return ""
     
     def _whisper_worker(self):
         """Background thread for Whisper processing"""
-        print("[whisper-worker] Thread started")  # DEBUG
         while self._running:
             try:
-                print("[whisper-worker] Waiting for audio...")  # DEBUG
                 audio_bytes = self._whisper_queue.get(timeout=1.0)
                 if audio_bytes is None:
-                    print("[whisper-worker] Got None, exiting")  # DEBUG
                     break
 
-                print(f"[whisper-worker] Got {len(audio_bytes)} bytes, transcribing...")  # DEBUG
                 result = self._transcribe_whisper(audio_bytes)
-                print(f"[whisper-worker] Transcription result: '{result}'")  # DEBUG
                 self._whisper_result = result
                 self._whisper_done.set()
-                print("[whisper-worker] Done set")  # DEBUG
 
             except queue.Empty:
                 continue
@@ -375,9 +419,7 @@ class HybridASREngine:
     
     def _transcribe_whisper(self, audio_bytes: bytes) -> str:
         """Transcribe audio with Whisper + hallucination filtering"""
-        print(f"[whisper-transcribe] Starting, model={self.whisper_model is not None}")  # DEBUG
         if not self.whisper_model:
-            print("[whisper-transcribe] No model!")  # DEBUG
             return ""
 
         try:
@@ -386,17 +428,15 @@ class HybridASREngine:
             samples = struct.unpack('<' + 'h' * n_samples, audio_bytes)
             audio_np = np.array(samples, dtype=np.float32) / 32768.0
 
-            # Check energy
+            # Check energy — raised threshold to prevent empty results from noise
             rms = np.sqrt(np.mean(audio_np ** 2))
-            print(f"[whisper-transcribe] Audio RMS: {rms:.4f}")  # DEBUG
             if rms < 0.01:
-                print(f"[whisper-transcribe] Audio too quiet (rms={rms:.4f} < 0.01), skipping")  # DEBUG
                 self._log("Audio too quiet, skipping")
                 return ""
             
             # Transcribe
             start = time.time()
-            print(f"[whisper-transcribe] Calling Whisper model...")  # DEBUG
+            # Whisper transcription call
             segments, info = self.whisper_model.transcribe(
                 audio_np,
                 beam_size=5,
@@ -411,7 +451,8 @@ class HybridASREngine:
             text = " ".join([seg.text for seg in segments_list]).strip()
             elapsed = time.time() - start
 
-            print(f"[whisper-transcribe] Raw result: '{text}' ({elapsed:.2f}s, {len(segments_list)} segments)")  # DEBUG
+            if text:
+                print(f"[whisper] Result: '{text}' ({elapsed:.2f}s, {len(segments_list)} segments)")
             self._log(f"Whisper: '{text}' ({elapsed:.2f}s)")
 
             # Filter hallucinations
@@ -505,18 +546,6 @@ if __name__ == "__main__":
         print("Failed to start engine")
         sys.exit(1)
     
-    print("\nSpeak something (Ctrl+C to stop)...")
-    print("-" * 60)
-    
-    p = pyaudio.PyAudio()
-    stream = p.open(
-        format=pyaudio.paInt16,
-        channels=1,
-        rate=16000,
-        input=True,
-        frames_per_buffer=1600
-    )
-    
     try:
         while True:
             audio = stream.read(1600, exception_on_overflow=False)
@@ -537,3 +566,4 @@ if __name__ == "__main__":
         stream.close()
         p.terminate()
         engine.stop()
+

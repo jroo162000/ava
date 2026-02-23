@@ -18,7 +18,9 @@ echo.
 echo ================================================================================
 echo.
 
-cd "C:\Users\USER 1\ava-integration"
-python ava_standalone_realtime.py
+REM Use script directory as working dir to avoid path issues
+cd /d "%~dp0"
+echo Launching AVA standalone realtime (logs: standalone.out.log / standalone.err.log)
+python ava_standalone_realtime.py 1>standalone.out.log 2>standalone.err.log
 
 pause
