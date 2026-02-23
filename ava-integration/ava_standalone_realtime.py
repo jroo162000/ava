@@ -2292,6 +2292,20 @@ class StandaloneRealtimeAVA:
                         except Exception:
                             break
                     self.audio_queue.put_nowait(chunk)
+                    # Mark first-chunk timestamp for latency only once per TTS
+                    try:
+                        if getattr(self, '_awaiting_tts_since', 0.0) and not getattr(self, '_tts_first_chunk_ts', 0.0):
+                            self._tts_first_chunk_ts = time.time()
+                            try:
+                                self.metrics['last_eos_to_first_audio_ms'] = int((self._tts_first_chunk_ts - self._awaiting_tts_since) * 1000)
+                                if getattr(self, '_speech_end_ts', 0.0):
+                                    self.metrics['last_vad_end_to_first_audio_ms'] = int((self._tts_first_chunk_ts - self._speech_end_ts) * 1000)
+                                if getattr(self, '_asr_final_ts', 0.0):
+                                    self.metrics['asr_final_to_first_audio_ms'] = int((self._tts_first_chunk_ts - self._asr_final_ts) * 1000)
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
                 except Exception:
                     # If still full or queue unavailable, drop this frame.
                     pass
@@ -2299,6 +2313,11 @@ class StandaloneRealtimeAVA:
                     self.metrics['playback_queue_frames'] = self.audio_queue.qsize()
                 except Exception:
                     pass
+        except Exception as e:
+            try:
+                print(f"Audio queue error: {e}")
+            except Exception:
+                pass
 
     def _queue_utterance_end(self):
         """Signal the playback worker that the current utterance is complete."""
@@ -2310,7 +2329,6 @@ class StandaloneRealtimeAVA:
                 while self.audio_queue.qsize() > 0 and self.audio_queue.qsize() > 600:
                     item = self.audio_queue.get_nowait()
                     if item is self._UTT_END:
-                        # put it back and stop trimming
                         try:
                             self.audio_queue.put_nowait(item)
                         except Exception:
@@ -2318,7 +2336,7 @@ class StandaloneRealtimeAVA:
                         break
             except Exception:
                 pass
-
+            # Queue the sentinel marking end of audible utterance
             self.audio_queue.put_nowait(self._UTT_END)
         except Exception:
             # Fail-safe: never hang the state machine
@@ -2327,22 +2345,7 @@ class StandaloneRealtimeAVA:
                 self.utt_playback_done.set()
             except Exception:
                 pass
-                # First-chunk latency measurement
-                if self._awaiting_tts_since and not self._tts_first_chunk_ts:
-                    self._tts_first_chunk_ts = time.time()
-                    try:
-                        self.metrics['last_eos_to_first_audio_ms'] = int((self._tts_first_chunk_ts - self._awaiting_tts_since) * 1000)
-                        if self._speech_end_ts:
-                            self.metrics['last_vad_end_to_first_audio_ms'] = int((self._tts_first_chunk_ts - self._speech_end_ts) * 1000)
-                        if getattr(self, '_asr_final_ts', 0.0):
-                            self.metrics['asr_final_to_first_audio_ms'] = int((self._tts_first_chunk_ts - self._asr_final_ts) * 1000)
-                    except Exception:
-                        pass
-        except Exception as e:
-            try:
-                print(f"Audio queue error: {e}")
-            except Exception:
-                pass
+        
 
     def _dbg(self, tag: str, msg: str, data: dict | None = None):
         try:
