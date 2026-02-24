@@ -8,6 +8,15 @@ This version removes OpenAI Realtime usage. It:
 - Adds simple barge-in and echo gating
 """
 
+# Boot diagnostics for harness/debug
+print(f"[BOOT] running file: {__file__}")
+try:
+    import subprocess, os
+    _rev = subprocess.check_output(["git", "rev-parse", "--short", "HEAD"], cwd=os.path.dirname(__file__)).decode().strip()
+    print(f"[BOOT] git head: {_rev}")
+except Exception as _e:
+    print(f"[BOOT] git head: (unavailable) {_e}")
+
 import asyncio
 import base64
 import json
@@ -1744,6 +1753,11 @@ class StandaloneRealtimeAVA:
                             except Exception:
                                 pass
                             print(f"[tts-debug] speak() called with: {reply[:50]}...")
+                            try:
+                                if os.environ.get("AVA_HARNESS", "").strip() == "1":
+                                    print(f"[HARNESS] speak() choke hit (sha1={hashlib.sha1((reply or '').encode()).hexdigest()[:12]})")
+                            except Exception:
+                                pass
                             # LLM DONE checkpoint (measure LLM latency locally if possible)
                             try:
                                 # If we have asr_final_ts and llm_end-like markers in metrics, prefer them;
@@ -2138,9 +2152,10 @@ class StandaloneRealtimeAVA:
                                 print(f"[mic] rms={int(mic_rms)}")
                     except Exception:
                         pass
-                    # Feed ASR
+                    # Feed ASR (skip during TTS/grace; harness still captures above)
                     try:
-                        self._voice_session.push_audio(data)
+                        if not _suppress_asr_frame:
+                            self._voice_session.push_audio(data)
                         # DEBUG disabled for stability
                         # if hasattr(self, '_voice_provider') and hasattr(self._voice_provider, 'asr'):
                         #     asr = self._voice_provider.asr
@@ -2226,13 +2241,14 @@ class StandaloneRealtimeAVA:
                 try:
                     time.sleep(2.0)
                     m = self.metrics
+                    cap = getattr(self, '_playback_cap_frames', 20)
                     line = (
                         f"[rt] cap->partial={m.get('last_capture_to_partial_ms',0)}ms  "
                         f"vadEnd->ASR={m.get('last_vad_end_to_asr_final_ms',0)}ms  "
                         f"vadEnd->audio={m.get('last_vad_end_to_first_audio_ms',0)}ms  "
                         f"ASR->audio={m.get('asr_final_to_first_audio_ms',0)}ms  "
                         f"bargeStop={m.get('last_barge_stop_ms',0)}ms  "
-                        f"q={m.get('playback_queue_frames',0)}/{20}"
+                        f"q={m.get('playback_queue_frames',0)}/{cap}"
                     )
                     print("\r" + line, end="", flush=True)
                 except Exception:
@@ -2345,6 +2361,10 @@ class StandaloneRealtimeAVA:
         # Keep the queue short for realtime feel. Target ~400ms max buffered audio.
         # Increase cap to allow multi‑second buffering; previously ~0.4s caused drops
         CAP_FRAMES = max(int(10.00 / 0.02), 1)  # ~10 seconds at 20ms per frame
+        try:
+            self._playback_cap_frames = CAP_FRAMES
+        except Exception:
+            pass
         try:
             # Slice into ~20ms frames for snappy playback
             i = 0
