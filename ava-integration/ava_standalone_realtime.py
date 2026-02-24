@@ -1488,7 +1488,11 @@ class StandaloneRealtimeAVA:
         print(f"Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         # Decide voice mode now (auto if not set)
         # Decide voice mode now (auto if not set)
-        self.voice_selected = self._select_voice_mode()
+        # Select and store voice mode so all checks use a consistent source of truth
+        self.voice_mode = self._select_voice_mode()
+        self._voice_mode = self.voice_mode
+        # Back-compat alias if referenced elsewhere
+        self.voice_selected = self.voice_mode
         if self.voice_selected == 'unified':
             # Determine TTS engine for banner
             lf = (self.cfg.get('local_fallback') or {})
@@ -3775,13 +3779,19 @@ class StandaloneRealtimeAVA:
             return
         # TTS SOURCE OF TRUTH: sha1 proves no hidden rewrite between /respond and TTS
         _sha1 = hashlib.sha1(text.encode()).hexdigest()[:12]
-        print(f"[tts-in] TTS_SOURCE=respond turn_id={turn_id} sha1={_sha1} preview='{text[:60]}...'")
+        # Decide final routing source for logging
+        _mode_eff = getattr(self, 'voice_mode', None) or getattr(self, '_voice_mode', None) or self._select_voice_mode()
+        _tts_source = "local" if _mode_eff == "unified" else "respond"
+        print(f"[tts-in] TTS_SOURCE={_tts_source} turn_id={turn_id} sha1={_sha1} preview='{text[:60]}...'")
         speak_text = self._prepare_tts_text(text)
         if not speak_text:
             return
-        # UNIFIED MODE: Route through local TTS (Piper/Edge) instead of Deepgram remote
-        if getattr(self, '_voice_session', None) and self.cfg.get('voice_mode') == 'unified':
-            lf = self.cfg.get('local_fallback') or {}
+        # UNIFIED MODE: always local TTS, never remote
+        _sel_mode = getattr(self, 'voice_mode', None) or getattr(self, '_voice_mode', None)
+        if not _sel_mode:
+            _sel_mode = self._select_voice_mode()
+        if _sel_mode == 'unified' and getattr(self, '_voice_session', None):
+            lf = (self.cfg.get('local_fallback') or {})
             engine = lf.get('tts_engine', 'edge')
             print(f"[tts-route] Unified mode -> local TTS (engine={engine}): '{speak_text[:50]}...'")
             self._voice_session.speak(speak_text)
@@ -3813,6 +3823,7 @@ class StandaloneRealtimeAVA:
             method='POST'
         )
         ctx = ssl.create_default_context()
+        fell_back_to_local = False
         try:
             # Stream audio chunks directly to playback for lower latency
             with urllib.request.urlopen(req, context=ctx, timeout=60) as resp:
@@ -3832,19 +3843,21 @@ class StandaloneRealtimeAVA:
             try:
                 if getattr(self, '_voice_session', None):
                     print("[tts-fallback] Remote TTS failed; routing to local TTS")
+                    fell_back_to_local = True
                     self._voice_session.speak(speak_text)
                     return
             except Exception:
                 pass
         finally:
-            # HALF-DUPLEX: Unmute mic after TTS completes
-            self.tts_active.clear()
-            self._tts_ended_at = time.time()
-            print("[half-duplex] MIC UNMUTED - TTS complete (grace period active)")
-            try:
-                self.metrics['tts_utterances'] += 1
-            except Exception:
-                pass
+            # HALF-DUPLEX: Unmute mic after TTS completes (only if we didn't reroute to local)
+            if not fell_back_to_local:
+                self.tts_active.clear()
+                self._tts_ended_at = time.time()
+                print("[half-duplex] MIC UNMUTED - TTS complete (grace period active)")
+                try:
+                    self.metrics['tts_utterances'] += 1
+                except Exception:
+                    pass
 
     def _listen_url(self) -> str:
         model = self.cfg.get('asr_model') or 'nova-2'
