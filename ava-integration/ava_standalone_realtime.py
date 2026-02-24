@@ -1994,7 +1994,8 @@ class StandaloneRealtimeAVA:
                     self._playback_end_fired = True
                     # Start short ASR blackout to avoid tail finals
                     try:
-                        self._asr_blackout_until = time.time() + 0.7
+                        self._asr_blackout_until = time.time() + 0.8
+                        print(f"[asr] blackout until {self._asr_blackout_until:.3f} (+0.8s)")
                     except Exception:
                         pass
                     # Now it is safe to end the speaking turn.
