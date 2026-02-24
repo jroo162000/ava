@@ -2095,6 +2095,7 @@ class StandaloneRealtimeAVA:
             gate_pos_frames = 0  # Two-frame confirm to suppress pops
             try:
                 while self.running:
+                    _suppress_asr_frame = False
                     try:
                         data = mic_stream.read(chunk_frames, exception_on_overflow=False)
                         if _need_mic_resample:
