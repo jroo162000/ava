@@ -16,6 +16,7 @@ import sys
 import wave
 import threading
 import queue
+import datetime
 from datetime import datetime
 from pathlib import Path
 import time
@@ -623,6 +624,14 @@ class LocalVoiceEngine:
             return
         # TTS SOURCE OF TRUTH: sha1 proves no hidden rewrite between /respond and TTS
         _sha1 = hashlib.sha1(text.encode()).hexdigest()[:12]
+        # HARNESS: force unified local TTS (Piper) so measurements are consistent
+        try:
+            if os.environ.get("AVA_HARNESS", "").strip() == "1":
+                if getattr(self, '_voice_session', None):
+                    self._voice_session.speak(text)
+                    return
+        except Exception:
+            pass
         print(f"[tts-in] TTS_SOURCE=local turn_id={turn_id} sha1={_sha1} preview='{text[:60]}...'")
         try:
             print(f"[local-tts] Synthesizing: {text[:50]}...")
@@ -1180,6 +1189,26 @@ class StandaloneRealtimeAVA:
         self._utt_in_progress = False
         # Guard to avoid duplicate playback.end emissions
         self._playback_end_fired = False
+
+        # -----------------------
+        # Program 3 Harness (WAV capture): user_wav + tts_wav
+        # Enable with env AVA_HARNESS=1
+        # Optional env AVA_HARNESS_DIR="C:\\path\\to\\dir"
+        # -----------------------
+        self._harness_enabled = (os.environ.get("AVA_HARNESS", "").strip() == "1")
+        self._harness_dir = os.environ.get("AVA_HARNESS_DIR", "").strip()
+        self._harness_lock = threading.Lock()
+
+        # Rolling ids/tags
+        self._harness_turn_seq = 0
+
+        # Buffers
+        self._harness_user_buf = bytearray()
+        self._harness_tts_buf = bytearray()
+
+        # Current tag for the utterance under capture
+        self._harness_user_tag = None
+        self._harness_tts_tag = None
         # Barge-in / echo gating
         self.tts_active = threading.Event()
         self.user_speaking = threading.Event()
@@ -2073,8 +2102,9 @@ class StandaloneRealtimeAVA:
                         if self._echo_suppression_enabled:
                             # Check if TTS is currently active
                             if self.tts_active.is_set():
-                                # Mic is likely picking up TTS output - skip this frame entirely
-                                continue
+                                # Mic is likely picking up TTS output - skip this frame entirely (except in harness)
+                                if not getattr(self, '_harness_enabled', False):
+                                    continue
 
                             # Check if in echo grace period - short period to let room acoustics settle
                             # This prevents TTS residue from entering ASR buffer
@@ -2082,8 +2112,9 @@ class StandaloneRealtimeAVA:
                             if hasattr(self, '_tts_ended_at') and self._tts_ended_at:
                                 time_since_tts = time.time() - self._tts_ended_at
                                 if time_since_tts < mic_grace_period:
-                                    # Within grace period - skip ALL frames to prevent TTS residue
-                                    continue
+                                    # Within grace period - skip ALL frames to prevent TTS residue (except in harness)
+                                    if not getattr(self, '_harness_enabled', False):
+                                        continue
                     except Exception:
                         pass
 
@@ -2128,6 +2159,17 @@ class StandaloneRealtimeAVA:
                         is_spk = bool(asr and hasattr(asr, 'is_speaking') and asr.is_speaking())
                         if is_spk:
                             self.user_speaking.set()
+                            # Harness: start/continue capturing user speech (post-resample, 16k mono int16)
+                            try:
+                                if getattr(self, '_harness_enabled', False):
+                                    if not prev_speaking:
+                                        with self._harness_lock:
+                                            self._harness_user_buf.clear()
+                                            self._harness_user_tag = self._harness_turn_tag()
+                                    with self._harness_lock:
+                                        self._harness_user_buf.extend(data)
+                            except Exception:
+                                pass
                             # Adaptive threshold while TTS is active to avoid echo loops
                             if self.tts_active.is_set():
                                 dyn_thresh = max(self.START_THRESH, int(self._playback_rms_ema * 2.0))
@@ -2164,6 +2206,12 @@ class StandaloneRealtimeAVA:
                             if prev_speaking:
                                 self._speech_end_ts = time.time()
                                 prev_speaking = False
+                                # Harness: flush user wav at end of utterance
+                                try:
+                                    if getattr(self, '_harness_enabled', False):
+                                        self._harness_flush_user(sample_rate=16000)
+                                except Exception:
+                                    pass
                     except Exception:
                         pass
             finally:
@@ -2324,6 +2372,15 @@ class StandaloneRealtimeAVA:
                                 break
                         except Exception:
                             break
+                    # Harness: buffer TTS audio (already resampled to playback_rate)
+                    try:
+                        if getattr(self, '_harness_enabled', False) and getattr(self, '_utt_in_progress', False):
+                            with self._harness_lock:
+                                if self._harness_tts_tag is None:
+                                    self._harness_tts_tag = self._harness_turn_tag()
+                                self._harness_tts_buf.extend(chunk)
+                    except Exception:
+                        pass
                     self.audio_queue.put_nowait(chunk)
                     # Mark first-chunk timestamp for latency only once per TTS
                     try:
@@ -2380,6 +2437,89 @@ class StandaloneRealtimeAVA:
             self._utt_in_progress = False
             try:
                 self.utt_playback_done.set()
+            except Exception:
+                pass
+
+    # ---------------- Harness helpers (Program 3) ----------------
+    def _harness_get_dir(self) -> Path:
+        """Return harness output directory, creating it if needed."""
+        try:
+            if self._harness_dir:
+                d = Path(self._harness_dir)
+            else:
+                d = Path(__file__).resolve().parent / "harness_wav"
+            d.mkdir(parents=True, exist_ok=True)
+            return d
+        except Exception:
+            d = Path.cwd() / "harness_wav"
+            try:
+                d.mkdir(parents=True, exist_ok=True)
+            except Exception:
+                pass
+            return d
+
+    def _harness_now_stamp(self) -> str:
+        # includes milliseconds
+        return datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+
+    def _harness_turn_tag(self) -> str:
+        """
+        Prefer an existing per-turn token if your runtime sets one.
+        Fall back to a local sequence.
+        """
+        for attr in ("_turn_token", "_current_turn_token", "_active_turn_token", "turn_token"):
+            try:
+                v = getattr(self, attr, None)
+                if v:
+                    return str(v)
+            except Exception:
+                pass
+        try:
+            self._harness_turn_seq += 1
+            return f"seq{self._harness_turn_seq}"
+        except Exception:
+            return "seqX"
+
+    def _harness_write_wav(self, path: Path, pcm_bytes: bytes, sample_rate: int) -> None:
+        """Write mono 16-bit PCM wav."""
+        try:
+            with wave.open(str(path), "wb") as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)
+                wf.setframerate(int(sample_rate))
+                wf.writeframes(pcm_bytes)
+        except Exception:
+            pass
+
+    def _harness_flush_user(self, sample_rate: int) -> None:
+        if not getattr(self, "_harness_enabled", False):
+            return
+        with self._harness_lock:
+            if not self._harness_user_buf:
+                return
+            tag = self._harness_user_tag or self._harness_turn_tag()
+            out = self._harness_get_dir() / f"{self._harness_now_stamp()}__turn-{tag}__user.wav"
+            self._harness_write_wav(out, bytes(self._harness_user_buf), sample_rate)
+            self._harness_user_buf.clear()
+            self._harness_user_tag = None
+            try:
+                print(f"[harness] wrote user_wav: {out}")
+            except Exception:
+                pass
+
+    def _harness_flush_tts(self, sample_rate: int) -> None:
+        if not getattr(self, "_harness_enabled", False):
+            return
+        with self._harness_lock:
+            if not self._harness_tts_buf:
+                return
+            tag = self._harness_tts_tag or self._harness_turn_tag()
+            out = self._harness_get_dir() / f"{self._harness_now_stamp()}__turn-{tag}__tts.wav"
+            self._harness_write_wav(out, bytes(self._harness_tts_buf), sample_rate)
+            self._harness_tts_buf.clear()
+            self._harness_tts_tag = None
+            try:
+                print(f"[harness] wrote tts_wav: {out}")
             except Exception:
                 pass
         
@@ -4126,6 +4266,12 @@ class StandaloneRealtimeAVA:
                             self._utt_in_progress = False
                             try:
                                 self.utt_playback_done.set()
+                            except Exception:
+                                pass
+                            # Harness: flush TTS wav when audible utterance ends (authoritative)
+                            try:
+                                if getattr(self, '_harness_enabled', False):
+                                    self._harness_flush_tts(sample_rate=int(self.playback_rate))
                             except Exception:
                                 pass
                             try:
