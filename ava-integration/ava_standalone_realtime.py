@@ -625,13 +625,10 @@ class LocalVoiceEngine:
         # TTS SOURCE OF TRUTH: sha1 proves no hidden rewrite between /respond and TTS
         _sha1 = hashlib.sha1(text.encode()).hexdigest()[:12]
         # HARNESS: force unified local TTS (Piper) so measurements are consistent
-        try:
-            if os.environ.get("AVA_HARNESS", "").strip() == "1":
-                if getattr(self, '_voice_session', None):
-                    self._voice_session.speak(text)
-                    return
-        except Exception:
-            pass
+        if os.environ.get("AVA_HARNESS", "").strip() == "1":
+            print(f"[HARNESS] unified Piper TTS forced (sha1={_sha1})")
+            self._voice_session.speak(text)
+            return
         print(f"[tts-in] TTS_SOURCE=local turn_id={turn_id} sha1={_sha1} preview='{text[:60]}...'")
         try:
             print(f"[local-tts] Synthesizing: {text[:50]}...")
