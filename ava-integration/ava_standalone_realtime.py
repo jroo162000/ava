@@ -1195,6 +1195,8 @@ class StandaloneRealtimeAVA:
         self._utt_in_progress = False
         # Guard to avoid duplicate playback.end emissions
         self._playback_end_fired = False
+        # ASR blackout window after playback.end to prevent tail finals
+        self._asr_blackout_until = 0.0
 
         # -----------------------
         # Program 3 Harness (WAV capture): user_wav + tts_wav
@@ -1990,6 +1992,11 @@ class StandaloneRealtimeAVA:
                     if getattr(self, '_playback_end_fired', False):
                         return
                     self._playback_end_fired = True
+                    # Start short ASR blackout to avoid tail finals
+                    try:
+                        self._asr_blackout_until = time.time() + 0.7
+                    except Exception:
+                        pass
                     # Now it is safe to end the speaking turn.
                     try:
                         self.tts_active.clear()
@@ -2115,22 +2122,21 @@ class StandaloneRealtimeAVA:
 
                     # ECHO CANCELLATION: Suppress mic input while TTS is active or in grace period
                     try:
-                        if self._echo_suppression_enabled:
-                            # Check if TTS is currently active
-                            if self.tts_active.is_set():
-                                # Mic is likely picking up TTS output - skip this frame entirely (except in harness)
-                                if not getattr(self, '_harness_enabled', False):
-                                    continue
+                        # Hard suppression when TTS active
+                        if self.tts_active.is_set():
+                            _suppress_asr_frame = True
 
-                            # Check if in echo grace period - short period to let room acoustics settle
-                            # This prevents TTS residue from entering ASR buffer
-                            mic_grace_period = 3.0  # Seconds after TTS to suppress mic
+                        # Short blackout after playback.end to avoid tail finals
+                        if getattr(self, '_asr_blackout_until', 0.0):
+                            if time.time() < float(self._asr_blackout_until or 0.0):
+                                _suppress_asr_frame = True
+
+                        # Extended grace suppression to let room acoustics settle
+                        if self._echo_suppression_enabled:
+                            mic_grace_period = 3.0
                             if hasattr(self, '_tts_ended_at') and self._tts_ended_at:
-                                time_since_tts = time.time() - self._tts_ended_at
-                                if time_since_tts < mic_grace_period:
-                                    # Within grace period - skip ALL frames to prevent TTS residue (except in harness)
-                                    if not getattr(self, '_harness_enabled', False):
-                                        continue
+                                if (time.time() - self._tts_ended_at) < mic_grace_period:
+                                    _suppress_asr_frame = True
                     except Exception:
                         pass
 
@@ -2157,7 +2163,7 @@ class StandaloneRealtimeAVA:
                                 print(f"[mic] rms={int(mic_rms)}")
                     except Exception:
                         pass
-                    # Feed ASR (skip during TTS/grace; harness still captures above)
+                    # Feed ASR (skip during TTS/blackout/grace; harness still captures above)
                     try:
                         if not _suppress_asr_frame:
                             self._voice_session.push_audio(data)
