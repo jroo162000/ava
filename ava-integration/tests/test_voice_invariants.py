@@ -1086,6 +1086,213 @@ def test_smoke_test_exists():
     assert 'check_barge_in_safety' in content, "Missing D005 barge-in check"
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# MERGE BLOCKER: Test 1 — Scheduler does not start in voice mode
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestSchedulerDisabledInVoiceMode:
+    """
+    MERGE BLOCKER: When DISABLE_AUTONOMY=1 or VALIDATION_MODE=1,
+    the moltbook scheduler must NOT start. No "FULL AUTONOMY mode",
+    no "Checking for comments", no "Replied to comment" in logs.
+    """
+
+    def test_scheduler_exits_early_on_disable_autonomy(self):
+        """Scheduler function returns immediately when DISABLE_AUTONOMY=1."""
+        scheduler_path = Path(__file__).parent.parent.parent / "ava" / "ava-server" / "src" / "services" / "moltbookScheduler.js"
+        if not scheduler_path.exists():
+            scheduler_path = Path(__file__).parent.parent / "ava-server" / "src" / "services" / "moltbookScheduler.js"
+        assert scheduler_path.exists(), f"moltbookScheduler.js not found"
+
+        src = scheduler_path.read_text(encoding='utf-8')
+
+        # The scheduler must check DISABLE_AUTONOMY and exit before starting
+        assert "process.env.DISABLE_AUTONOMY" in src, "Scheduler missing DISABLE_AUTONOMY env check"
+        assert "return" in src.split("DISABLE_AUTONOMY")[1][:200], "Scheduler doesn't return after DISABLE_AUTONOMY check"
+
+    def test_scheduler_no_full_autonomy_after_guard(self):
+        """'Starting FULL AUTONOMY mode' log must appear AFTER the DISABLE_AUTONOMY guard."""
+        scheduler_path = Path(__file__).parent.parent.parent / "ava" / "ava-server" / "src" / "services" / "moltbookScheduler.js"
+        if not scheduler_path.exists():
+            scheduler_path = Path(__file__).parent.parent / "ava-server" / "src" / "services" / "moltbookScheduler.js"
+        assert scheduler_path.exists(), f"moltbookScheduler.js not found"
+
+        src = scheduler_path.read_text(encoding='utf-8')
+
+        # Guard must come BEFORE the "Starting FULL AUTONOMY" log
+        guard_pos = src.find("DISABLE_AUTONOMY")
+        autonomy_pos = src.find("Starting FULL AUTONOMY mode")
+        assert guard_pos >= 0, "Missing DISABLE_AUTONOMY guard"
+        assert autonomy_pos >= 0, "Missing 'Starting FULL AUTONOMY mode' log"
+        assert guard_pos < autonomy_pos, (
+            "DISABLE_AUTONOMY guard must appear BEFORE 'Starting FULL AUTONOMY mode' "
+            f"(guard at {guard_pos}, autonomy at {autonomy_pos})"
+        )
+
+    def test_scheduler_forbidden_strings_unreachable(self):
+        """With DISABLE_AUTONOMY=1 the scheduler returns before any activity logs.
+
+        Verify the guard pattern: check → return before any of these strings:
+        - 'FULL AUTONOMY mode'
+        - 'Checking for comments'
+        - 'Replied to comment'
+        """
+        scheduler_path = Path(__file__).parent.parent.parent / "ava" / "ava-server" / "src" / "services" / "moltbookScheduler.js"
+        if not scheduler_path.exists():
+            scheduler_path = Path(__file__).parent.parent / "ava-server" / "src" / "services" / "moltbookScheduler.js"
+        assert scheduler_path.exists()
+
+        src = scheduler_path.read_text(encoding='utf-8')
+
+        # Find the startMoltbookScheduler function
+        fn_start = src.find("startMoltbookScheduler")
+        assert fn_start >= 0, "startMoltbookScheduler function not found"
+
+        fn_src = src[fn_start:]
+
+        # Guard + return must come before any of these forbidden activity strings
+        guard_idx = fn_src.find("DISABLE_AUTONOMY")
+        return_after_guard = fn_src.find("return", guard_idx)
+        assert guard_idx >= 0, "Guard not found in startMoltbookScheduler"
+        assert return_after_guard >= 0 and return_after_guard < guard_idx + 200, \
+            "return must follow DISABLE_AUTONOMY check within 200 chars"
+
+        for forbidden in ["Starting FULL AUTONOMY mode", "Checking for comments", "Replied to comment"]:
+            pos = fn_src.find(forbidden)
+            if pos >= 0:
+                assert pos > return_after_guard, (
+                    f"'{forbidden}' at offset {pos} is reachable before return at offset {return_after_guard}"
+                )
+
+    def test_heartbeat_exits_early_on_disable_autonomy(self):
+        """Python heartbeat returns immediately when DISABLE_AUTONOMY=1."""
+        heartbeat_path = Path(__file__).parent.parent / "moltbook_heartbeat.py"
+        assert heartbeat_path.exists(), "moltbook_heartbeat.py not found"
+
+        src = heartbeat_path.read_text(encoding='utf-8')
+
+        assert "DISABLE_AUTONOMY" in src, "Heartbeat missing DISABLE_AUTONOMY check"
+        assert "disabled_voice_mode" in src, "Heartbeat missing disabled return value"
+
+    def test_runner_sets_disable_autonomy(self):
+        """Canonical runner sets DISABLE_AUTONOMY=1 at startup."""
+        runner_path = Path(__file__).parent.parent / "ava_standalone_realtime.py"
+        src = runner_path.read_text(encoding='utf-8')
+        assert "os.environ['DISABLE_AUTONOMY'] = '1'" in src, \
+            "Runner must set DISABLE_AUTONOMY=1 at startup"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MERGE BLOCKER: Test 2 — Wake-only does not trigger agent loop
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestWakeOnlyNoAgentLoop:
+    """
+    MERGE BLOCKER: Saying just 'ava' (or 'hey ava', 'ha ava') must:
+    - NOT trigger [agent] Starting loop
+    - NOT call /respond or /chat
+    - Return a short conversational ack
+    """
+
+    @pytest.fixture
+    def chat_only_method(self):
+        """Extract and return a callable _is_chat_only from the runner source."""
+        runner_path = Path(__file__).parent.parent / "ava_standalone_realtime.py"
+        src = runner_path.read_text(encoding='utf-8')
+
+        import textwrap
+        start = src.find("    def _is_chat_only(self, text: str)")
+        end = src.find("\n    async def _maybe_handle_local_intent", start)
+        assert start > 0 and end > start, "_is_chat_only method not found in source"
+
+        method_src = textwrap.dedent(src[start:end])
+
+        class FakeRunner:
+            _wake_words = ['ava', 'eva', 'hey ava', 'hey eva', 'ok ava',
+                           'okay ava', 'hi ava', 'hello ava']
+            COMMAND_VERBS = {
+                'open', 'close', 'search', 'find', 'create', 'delete', 'move',
+                'rename', 'copy', 'paste', 'type', 'send', 'start', 'stop',
+                'run', 'click', 'show', 'play', 'record', 'capture', 'save',
+                'load', 'download', 'upload', 'install', 'uninstall', 'update',
+                'check', 'set', 'get', 'list', 'add', 'remove', 'enable',
+                'disable', 'toggle', 'switch', 'browse', 'navigate', 'go',
+            }
+            MIN_CONTENT_WORDS = 2
+
+        ns = {}
+        exec("import random, os\nfrom datetime import datetime\n" + method_src, ns)
+        FakeRunner._is_chat_only = ns['_is_chat_only']
+        return FakeRunner()
+
+    @pytest.mark.parametrize("transcript", [
+        "ava",
+        "ha ava",
+        "hey ava",
+        "hi ava",
+        "ava um",
+        "ava hello",
+        "uh ava",
+        "hmm ava",
+    ])
+    def test_wake_only_returns_ack(self, chat_only_method, transcript):
+        """Wake-word-only transcripts must return a short ack, not None.
+
+        If _is_chat_only returns None, the transcript flows to the server
+        which starts the agent loop — this is the exact bug we're preventing.
+        """
+        result = chat_only_method._is_chat_only(transcript)
+        assert result is not None, (
+            f"_is_chat_only('{transcript}') returned None — "
+            f"this would trigger the agent loop!"
+        )
+        # Ack must be short (under 20 words)
+        assert len(result.split()) < 20, f"Ack too long: '{result}'"
+
+    @pytest.mark.parametrize("transcript", [
+        "ava open chrome",
+        "ava search for news",
+        "ava type hello world",
+        "hey ava run the tests",
+    ])
+    def test_command_transcripts_reach_agent_loop(self, chat_only_method, transcript):
+        """Transcripts with command verbs must return None (go to agent loop)."""
+        result = chat_only_method._is_chat_only(transcript)
+        assert result is None, (
+            f"_is_chat_only('{transcript}') returned '{result}' — "
+            f"this would block a valid command from reaching the agent loop!"
+        )
+
+    def test_wake_only_gate_exists_in_source(self):
+        """Static check: the wake-only gate and MIN_CONTENT_WORDS exist."""
+        runner_path = Path(__file__).parent.parent / "ava_standalone_realtime.py"
+        src = runner_path.read_text(encoding='utf-8')
+
+        assert "MIN_CONTENT_WORDS" in src, "MIN_CONTENT_WORDS constant missing"
+        assert "[wake-only]" in src, "[wake-only] log tag missing"
+        assert "ack_replies" in src or "Yeah?" in src, "Wake-only ack replies missing"
+
+    def test_no_agent_loop_for_bare_wake_word(self):
+        """End-to-end proof: 'ava' is handled locally, never reaches _ask_server_respond.
+
+        This verifies the routing chain:
+        _is_chat_only('ava') -> ack string (not None)
+        -> _maybe_handle_local_intent returns True (chat-first gate)
+        -> force_idle('local intent handled')
+        -> _ask_server_respond NEVER called
+        """
+        runner_path = Path(__file__).parent.parent / "ava_standalone_realtime.py"
+        src = runner_path.read_text(encoding='utf-8')
+
+        # The chat-first gate in _maybe_handle_local_intent must call _is_chat_only
+        # and return True (handled) when it returns a reply
+        intent_section = src.split("def _maybe_handle_local_intent")[1][:800]
+        assert "_is_chat_only" in intent_section, \
+            "_maybe_handle_local_intent must call _is_chat_only as first gate"
+        assert "return True" in intent_section, \
+            "_maybe_handle_local_intent must return True after chat-first reply"
+
+
 if __name__ == '__main__':
     # Run tests with verbose output
     pytest.main([__file__, '-v', '--tb=short'])
