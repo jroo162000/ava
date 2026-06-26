@@ -183,12 +183,12 @@ AVA: [understands you mean weather tomorrow]
 
 ### Option 1: Console Mode
 ```batch
-python "C:\Users\USER 1\ava-integration\ava_standalone.py"
+python "C:\Users\USER 1\ava\ava-integration\ava_standalone.py"
 ```
 
 ### Option 2: System Tray Mode
 ```batch
-pythonw "C:\Users\USER 1\ava-integration\ava_tray.pyw"
+pythonw "C:\Users\USER 1\ava\ava-integration\ava_tray.pyw"
 ```
 
 ### Option 3: Quick Start (Recommended)

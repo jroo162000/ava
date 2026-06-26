@@ -18,6 +18,7 @@ import sys
 import os
 import time
 import json
+import numpy as np
 from pathlib import Path
 from unittest.mock import MagicMock, patch, Mock, AsyncMock
 import asyncio
@@ -1097,11 +1098,22 @@ class TestSchedulerDisabledInVoiceMode:
     no "Checking for comments", no "Replied to comment" in logs.
     """
 
+    @staticmethod
+    def _scheduler_path() -> Path:
+        root = Path(__file__).parent.parent
+        candidates = [
+            root.parent / "ava-server" / "src" / "services" / "moltbookScheduler.js",
+            root / "ava-server" / "src" / "services" / "moltbookScheduler.js",
+            root.parent / "ava" / "ava-server" / "src" / "services" / "moltbookScheduler.js",
+        ]
+        for path in candidates:
+            if path.exists():
+                return path
+        return candidates[0]
+
     def test_scheduler_exits_early_on_disable_autonomy(self):
         """Scheduler function returns immediately when DISABLE_AUTONOMY=1."""
-        scheduler_path = Path(__file__).parent.parent.parent / "ava" / "ava-server" / "src" / "services" / "moltbookScheduler.js"
-        if not scheduler_path.exists():
-            scheduler_path = Path(__file__).parent.parent / "ava-server" / "src" / "services" / "moltbookScheduler.js"
+        scheduler_path = self._scheduler_path()
         assert scheduler_path.exists(), f"moltbookScheduler.js not found"
 
         src = scheduler_path.read_text(encoding='utf-8')
@@ -1112,9 +1124,7 @@ class TestSchedulerDisabledInVoiceMode:
 
     def test_scheduler_no_full_autonomy_after_guard(self):
         """'Starting FULL AUTONOMY mode' log must appear AFTER the DISABLE_AUTONOMY guard."""
-        scheduler_path = Path(__file__).parent.parent.parent / "ava" / "ava-server" / "src" / "services" / "moltbookScheduler.js"
-        if not scheduler_path.exists():
-            scheduler_path = Path(__file__).parent.parent / "ava-server" / "src" / "services" / "moltbookScheduler.js"
+        scheduler_path = self._scheduler_path()
         assert scheduler_path.exists(), f"moltbookScheduler.js not found"
 
         src = scheduler_path.read_text(encoding='utf-8')
@@ -1137,9 +1147,7 @@ class TestSchedulerDisabledInVoiceMode:
         - 'Checking for comments'
         - 'Replied to comment'
         """
-        scheduler_path = Path(__file__).parent.parent.parent / "ava" / "ava-server" / "src" / "services" / "moltbookScheduler.js"
-        if not scheduler_path.exists():
-            scheduler_path = Path(__file__).parent.parent / "ava-server" / "src" / "services" / "moltbookScheduler.js"
+        scheduler_path = self._scheduler_path()
         assert scheduler_path.exists()
 
         src = scheduler_path.read_text(encoding='utf-8')
@@ -1271,6 +1279,8 @@ class TestWakeOnlyNoAgentLoop:
         assert "MIN_CONTENT_WORDS" in src, "MIN_CONTENT_WORDS constant missing"
         assert "[wake-only]" in src, "[wake-only] log tag missing"
         assert "ack_replies" in src or "Yeah?" in src, "Wake-only ack replies missing"
+        assert "_wake_followup_until" in src
+        assert "followup_window=" in src
 
     def test_no_agent_loop_for_bare_wake_word(self):
         """End-to-end proof: 'ava' is handled locally, never reaches _ask_server_respond.
@@ -1291,6 +1301,808 @@ class TestWakeOnlyNoAgentLoop:
             "_maybe_handle_local_intent must call _is_chat_only as first gate"
         assert "return True" in intent_section, \
             "_maybe_handle_local_intent must return True after chat-first reply"
+
+class TestUnifiedHybridVoiceGuards:
+    """Regression checks for the unified local hybrid voice path."""
+
+    def test_unified_provider_receives_validation_wake_words(self):
+        runner_path = Path(__file__).parent.parent / "ava_standalone_realtime.py"
+        src = runner_path.read_text(encoding='utf-8')
+
+        assert "wake_words = self._wake_words if self._validation_mode else None" in src
+        assert "wake_words=wake_words" in src
+        assert "use_vosk_final_direct=False" in src
+
+    def test_validation_mode_ignores_no_wake_transcripts_before_decide(self):
+        runner_path = Path(__file__).parent.parent / "ava_standalone_realtime.py"
+        src = runner_path.read_text(encoding='utf-8')
+
+        marker = "# VALIDATION MODE: Filter transcripts by wake word and minimum words"
+        assert marker in src, "Unified validation gate missing"
+        validation_section = src.split(marker, 1)[1]
+        assert "print(f\"[FINAL -> DECIDE]" in validation_section, "FINAL -> DECIDE marker missing"
+        gated_section = validation_section.split("print(f\"[FINAL -> DECIDE]", 1)[0]
+
+        assert "has_wake_word = _transcript_has_wake_phrase(txt, self._wake_words)" in gated_section, "Normalized wake matching missing"
+        assert "wake_followup_active" in gated_section, "Wake follow-up window missing"
+        assert "if not has_wake_word and not soft_wake_rescue and not wake_followup_active:" in gated_section, "No-wake branch missing"
+        assert "self._store_overheard(txt, responded=False)" in gated_section, "No-wake transcripts should be stored as overheard"
+        assert "return" in gated_section.split("if not has_wake_word and not soft_wake_rescue and not wake_followup_active:", 1)[1], "No-wake branch must return before reaching DECIDE"
+
+    def test_unified_voice_ranks_all_mics_before_fallback(self):
+        runner_path = Path(__file__).parent.parent / "ava_standalone_realtime.py"
+        src = runner_path.read_text(encoding='utf-8')
+
+        assert "def _preferred_input_device_terms" in src
+        assert "def _avoided_input_device_terms" in src
+        assert "def _score_input_candidate" in src
+        assert "input_device_preferences" in src
+        assert "input_device_avoid" in src
+        assert "sorted(candidates, key=self._candidate_sort_key)" in src
+        assert "_open_ranked_input_stream(" in src
+        assert "selected_tag = 'Selected input'" in src
+        assert "self.input_device_index = idx" in src
+
+    def test_voice_config_exposes_ranked_input_preferences(self):
+        config_path = Path(__file__).parent.parent / "ava_voice_config.json"
+        cfg = json.loads(config_path.read_text(encoding='utf-8'))
+        audio = cfg.get('audio') or {}
+
+        assert audio.get('max_idle_rms') == 1000
+        assert audio.get('input_device_preferences') == ["headset", "usb", "microphone"]
+        assert audio.get('calibration', {}).get('state_path') == 'logs/voice_calibration.json'
+        assert audio.get('calibration', {}).get('prefer_saved_pair') is True
+        assert "microsoft sound mapper" in [str(x).lower() for x in audio.get('input_device_avoid') or []]
+        assert "webcam" in [str(x).lower() for x in audio.get('input_device_blocklist') or []]
+
+    def test_unified_mic_loop_resamples_input_before_asr_push(self):
+        runner_path = Path(__file__).parent.parent / "ava_standalone_realtime.py"
+        src = runner_path.read_text(encoding='utf-8')
+        section = src.split("def _mic_loop():", 1)[1]
+        section = section.split("# Start microphone capture loop", 1)[0]
+
+        assert "asr_data = _resample_audio(data, actual_mic_rate, 16000) if _need_mic_resample else data" in section
+        assert "self._voice_session.push_audio(asr_data)" in section
+        assert "Suppressing mic->ASR during playback/blackout" in section
+        assert "or getattr(self, '_awaiting_playback_end', False)" in section
+        assert "or now < float(getattr(self, '_asr_blackout_until', 0.0) or 0.0)" in section
+        assert "[wake-followup] Follow-up window expired; ASR capture gate re-armed" in section
+
+    def test_unified_tts_uses_single_lifecycle_and_playback_owned_unmute(self):
+        runner_path = Path(__file__).parent.parent / "ava_standalone_realtime.py"
+        src = runner_path.read_text(encoding='utf-8')
+        segmenter = src.split("def _segment_text_for_tts", 1)[1].split("def run_unified_voice", 1)[0]
+        bus_handler = src.split("def _bus_handler(ev):", 1)[1].split("self._voice_bus.subscribe", 1)[0]
+        playback = src.split("def _audio_playback_worker", 1)[1].split("def _set_output_device", 1)[0]
+
+        assert 'os.environ.get("AVA_TTS_SEGMENTING", "0")' in segmenter
+        assert "return [txt]" in segmenter
+        assert "self.tts_active.is_set() or getattr(self, '_awaiting_playback_end', False)" in src
+        assert "self._tts_synthesis_active = True" in bus_handler
+        assert "self._tts_synthesis_active = False" in bus_handler
+        assert "playback finished (empty queue)" in bus_handler
+        assert "synthesis_active = bool(getattr(self, '_tts_synthesis_active', False))" in playback
+        assert "self.tts_active.clear()" in playback
+
+    def test_ranked_input_selector_rejects_flatline_probe_and_reopens_via_shared_selector(self):
+        runner_path = Path(__file__).parent.parent / "ava_standalone_realtime.py"
+        src = runner_path.read_text(encoding='utf-8')
+
+        assert "def _probe_input_stream_health" in src
+        assert "Rejecting flatline input" in src
+        assert "Rejecting flatline reopen" in src
+        assert "if forced_rate is not None and (forced_idx is not None or forced_name):" in src
+        assert "def _open_mic_with_fallback():" in src
+        assert "mic_stream, sel_idx, actual_mic_rate, chunk_frames = _open_mic_with_fallback()" in src
+        assert "mic flatline detected identical_run=" in src
+        assert "identical_run={identical_frame_run} flatline_rms_run={flatline_rms_run}" in src
+
+    def test_wake_only_followup_uses_silent_local_ack_when_window_is_open(self):
+        runner_path = Path(__file__).parent.parent / "ava_standalone_realtime.py"
+        src = runner_path.read_text(encoding='utf-8')
+
+        assert "self._wake_followup_silent_reply = '__AVA_WAKE_FOLLOWUP_SILENT__'" in src
+        assert "silent followup_window={followup_window}s" in src
+        assert "return getattr(self, '_wake_followup_silent_reply', '__AVA_WAKE_FOLLOWUP_SILENT__')" in src
+        assert "if chat_reply == getattr(self, '_wake_followup_silent_reply', '__AVA_WAKE_FOLLOWUP_SILENT__'):" in src
+        assert "Silent wake follow-up armed (no TTS)" in src
+        assert "asr_engine.set_capture_enabled(True)" in src
+        assert "[wake-followup] ASR capture gate opened for follow-up command" in src
+
+    def test_unified_voice_tts_routes_through_selected_local_session(self):
+        runner_path = Path(__file__).parent.parent / "ava_standalone_realtime.py"
+        src = runner_path.read_text(encoding='utf-8')
+
+        assert "self.voice_selected = self._select_voice_mode()" in src
+        assert "if getattr(self, '_voice_session', None) and getattr(self, 'voice_selected', None) == 'unified':" in src
+        assert "[tts-route] Unified mode -> local TTS" in src
+
+    def test_voice_runner_supports_env_input_device_overrides(self):
+        runner_path = Path(__file__).parent.parent / "ava_standalone_realtime.py"
+        src = runner_path.read_text(encoding='utf-8')
+
+        assert "AVA_INPUT_DEVICE_NAME" in src
+        assert "AVA_INPUT_DEVICE_INDEX" in src
+        assert "AVA_INPUT_SAMPLE_RATE" in src
+        assert "AVA_OUTPUT_DEVICE_NAME" in src
+        assert "AVA_OUTPUT_DEVICE_INDEX" in src
+        assert "AVA_OUTPUT_SAMPLE_RATE" in src
+        assert "Overriding input device name from AVA_INPUT_DEVICE_NAME" in src
+        assert "Overriding input device index from AVA_INPUT_DEVICE_INDEX" in src
+        assert "Overriding input sample rate from AVA_INPUT_SAMPLE_RATE" in src
+        assert "Overriding output device name from AVA_OUTPUT_DEVICE_NAME" in src
+        assert "Overriding output device index from AVA_OUTPUT_DEVICE_INDEX" in src
+        assert "Overriding output sample rate from AVA_OUTPUT_SAMPLE_RATE" in src
+        assert "self._forced_input_device_name = str(env_input_name).strip() if env_input_name else None" in src
+        assert "self._forced_input_device_index = None" in src
+        assert "self._forced_input_sample_rate = None" in src
+        assert "self._forced_output_device_name = str(env_output_name).strip() if env_output_name else None" in src
+        assert "self._forced_output_device_index = None" in src
+        assert "self._forced_output_sample_rate = None" in src
+        assert "forced_override_active = bool(forced_name) or (forced_idx is not None)" in src
+        assert "device_indices = [target_idx] if forced_override_active else list(range(device_count))" in src
+        assert "if near_silent and has_live_alternative and not forced_override_active and not bool(candidate.get('configured_input_match')):" in src
+        assert "Explicit {mode_label} override could not be resolved; refusing ranked fallback" in src
+
+    def test_ranked_input_selector_is_shared_by_legacy_voice_paths(self):
+        runner_path = Path(__file__).parent.parent / "ava_standalone_realtime.py"
+        src = runner_path.read_text(encoding='utf-8')
+
+        assert "def _open_ranked_input_stream" in src
+        assert "mode_label='DG mic'" in src
+        assert "mode_label='Agent mic'" in src
+        assert "mic_stream = _open_agent_mic()" in src
+
+    def test_ranked_input_selector_supports_hard_input_blocklist(self):
+        runner_path = Path(__file__).parent.parent / "ava_standalone_realtime.py"
+        src = runner_path.read_text(encoding='utf-8')
+
+        assert "input_device_blocklist" in src
+        assert "Skipping blocked input device" in src
+        assert "any(term in label_lower for term in blocklist_terms)" in src
+        assert "not forced_override_active" in src
+
+        cfg_path = Path(__file__).parent.parent / "ava_voice_config.json"
+        cfg = json.loads(cfg_path.read_text(encoding='utf-8'))
+        audio_cfg = cfg.get("audio") or {}
+        assert "webcam" in [str(term).strip().lower() for term in (audio_cfg.get("input_device_blocklist") or [])]
+        assert "webcam" not in [str(term).strip().lower() for term in (audio_cfg.get("input_device_preferences") or [])]
+
+    def test_voice_runner_supports_deterministic_input_wav(self):
+        runner_path = Path(__file__).parent.parent / "ava_standalone_realtime.py"
+        src = runner_path.read_text(encoding='utf-8')
+
+        assert "class _DeterministicInputStream" in src
+        assert "AVA_INPUT_WAV" in src
+        assert "def _open_deterministic_input_stream" in src
+        assert "Deterministic input file:" in src
+
+    def test_voice_lab_includes_deterministic_validation_runner(self):
+        tool_path = Path(__file__).parent.parent / "tools" / "voice_lab" / "08_deterministic_validation_runner.py"
+        src = tool_path.read_text(encoding='utf-8')
+
+        assert tool_path.exists(), "Deterministic validator missing"
+        assert "AVA_INPUT_WAV" in src
+        assert "AVA_HARNESS" in src
+        assert "AVA_ASR_FINAL_TIMEOUT_SEC" in src
+        assert "llm_done" in src
+        assert "PiperBinTTS" in src
+        assert "--prompt-matrix" in src
+        assert "--input-wav" in src
+        assert "input_wav_source" in src
+        assert "validation_mode" in src
+        assert "wake_words" in src
+        assert "matrix_summary.json" in src
+
+    def test_voice_lab_includes_live_calibration_tool(self):
+        tool_path = Path(__file__).parent.parent / "tools" / "voice_lab" / "09_voice_calibration.py"
+        src = tool_path.read_text(encoding='utf-8')
+
+        assert tool_path.exists(), "Live calibration tool missing"
+        assert "def _record_reference_sample" in src
+        assert "run_calibration(" in src
+        assert "--input-wav" in src
+        assert "--record-sample" in src
+        assert "--record-seconds" in src
+        assert "--record-input-index" in src
+        assert "--record-input-name" in src
+        assert "--preflight-only" in src
+        assert "--list-input-devices" in src
+        assert "--expected-text" in src
+        assert "--max-output-candidates" in src
+        assert "--no-save" in src
+        assert "recorded_reference.wav" in src
+        assert "reference_probe.wav" in src
+        assert "voice_calibration.json" in src
+        assert "_open_ranked_input_stream" in src
+        assert "def _list_input_devices" in src
+        assert "def _resolve_input_device_override" in src
+        assert "def _open_record_input_stream" in src
+        assert "INPUT_DEVICE idx=" in src
+        assert "_save_voice_calibration_state" in src
+        assert "probe_expected_text" in src
+        assert "transcription_score" in src
+        assert "transcription_accepted" in src
+        assert "PREFLIGHT_ONLY=1" in src
+        assert "Recorded reference sample did not match expected phrase strongly enough" in src
+        assert "one of --input-wav or --record-sample is required" in src
+        assert "--record-input-index and --record-input-name require --record-sample" in src
+        assert "--preflight-only requires --record-sample" in src
+        assert "Requested record input name is ambiguous" in src
+        assert "use --record-input-index" in src
+
+    def test_saved_calibration_pair_restores_rates_on_config_load(self):
+        runner_path = Path(__file__).parent.parent / "ava_standalone_realtime.py"
+        src = runner_path.read_text(encoding='utf-8')
+
+        assert "saved_out_rate" in src
+        assert "saved_in_rate" in src
+        assert "aud['playback_rate'] = saved_out_rate" in src
+        assert "aud['input_sample_rate'] = saved_in_rate" in src
+        assert "Preferring calibrated output rate" in src
+        assert "Preferring calibrated input rate" in src
+
+    def test_ranked_input_selector_prefers_exact_target_not_same_named_duplicates(self):
+        runner_path = Path(__file__).parent.parent / "ava_standalone_realtime.py"
+        src = runner_path.read_text(encoding='utf-8')
+
+        assert "target_bonus = -120.0 if target_idx is not None and idx == target_idx else 0.0" in src
+        assert "if idle_rms == 0.0:" in src
+        assert "elif idle_rms < 20.0:" in src
+        assert "elif 'sound mapper' in label_l:" in src
+        assert "if 'webcam' in label_l:" in src
+        assert "penalty += 800.0" in src
+        assert "near_silent = candidate['idle_rms'] < min_live_rms and reopen_rms < min_live_rms" in src
+        assert "has_live_alternative = any(" in src
+        assert "Skipping near-silent candidate" in src
+        assert "_append(aud_cfg.get('input_device_name'))" not in src
+
+    def test_validation_mode_selector_can_run_loopback_probe(self):
+        runner_path = Path(__file__).parent.parent / "ava_standalone_realtime.py"
+        cfg_path = Path(__file__).parent.parent / "ava_voice_config.json"
+        src = runner_path.read_text(encoding='utf-8')
+        cfg_src = cfg_path.read_text(encoding='utf-8')
+        cfg = json.loads(cfg_src)
+
+        assert "def _should_run_loopback_probe" in src
+        assert "def _normalize_probe_text" in src
+        assert "def _synthesize_loopback_probe_speech" in src
+        assert "def _transcribe_loopback_probe_capture" in src
+        assert "def _score_loopback_probe_transcript" in src
+        assert "def _probe_input_loopback_candidate" in src
+        assert "def _apply_input_loopback_probe" in src
+        assert "AVA_LOOPBACK_PROBE" in src
+        assert "seen_devices = set()" in src
+        assert "probe_calibrated" in src
+        assert "def _voice_calibration_state_path" in src
+        assert "def _load_voice_calibration_state" in src
+        assert "def _save_voice_calibration_state" in src
+        assert "Saved calibrated voice pair" in src
+        assert "Preferring calibrated input device" in src
+        assert "probe_text_score = float(candidate.get('probe_text_score', 0.0))" in src
+        assert "require_probe_calibration = bool(probe_cfg.get('require_speech_calibration', False))" in src
+        assert "fail_closed_without_calibration = bool(probe_cfg.get('fail_closed_without_calibration', False))" in src
+        assert "enforce_calibration_block = bool(" in src
+        assert "if require_probe_calibration and probe_mode == 'speech':" in src
+        assert "Calibration failed: no {mode_label} candidate reproduced probe speech" in src
+        assert "Continuing with best available {mode_label} fallback after calibration miss" in src
+        assert "if any(bool(candidate.get('probe_detected')) for candidate in accepted_candidates):" in src
+        assert "if any(bool(candidate.get('probe_detected')) for candidate in hot_candidates):" in src
+        assert "[audio] {mode_label} loopback probe" in src
+        assert "loopback_probe" in cfg_src
+        assert ((cfg.get('audio') or {}).get('loopback_probe') or {}).get('enabled') is False
+        assert '"mode": "speech"' in cfg_src.lower()
+        assert '"speech_match_min": 0.45' in cfg_src.lower()
+        assert '"speech_calibration_min": 0.6' in cfg_src.lower()
+        assert '"require_speech_calibration": true' in cfg_src.lower()
+        assert '"allow_failed_calibration_fallback": false' in cfg_src.lower()
+        assert '"fail_closed_without_calibration": false' in cfg_src.lower()
+        assert '"validation_only": true' in cfg_src.lower()
+        assert '"followup_window_sec": 6.0' in cfg_src.lower()
+
+    def test_local_hybrid_defaults_to_whisper_final(self):
+        provider_path = Path(__file__).parent.parent / "voice" / "providers" / "local_hybrid.py"
+        asr_path = Path(__file__).parent.parent / "ava_hybrid_asr.py"
+        provider_src = provider_path.read_text(encoding='utf-8')
+        asr_src = asr_path.read_text(encoding='utf-8')
+
+        assert "use_vosk_final_direct: bool = False" in provider_src
+        assert "use_vosk_final_direct=self.use_vosk_final_direct" in provider_src
+        assert "if self.use_vosk_final_direct:" in asr_src
+        assert "Ignoring ungated VOSK final" in asr_src
+
+
+    def test_local_voice_engine_preserves_feed_audio_final_before_polling(self):
+        runner_path = Path(__file__).parent.parent / "ava_standalone_realtime.py"
+        src = runner_path.read_text(encoding='utf-8')
+        section = src.split("# Hybrid ASR path: feed streaming engine and handle finalization", 1)[1]
+        section = section.split("if transcript:", 1)[0]
+
+        assert 'transcript = self.hybrid_asr.feed_audio(audio_data) or ""' in section
+        assert "if (not transcript) and (not self.hybrid_asr.is_speaking()) and self.hybrid_asr.has_enough_audio():" in section
+    def test_hybrid_asr_buffers_prewake_audio_for_whisper_rescue(self):
+        asr_path = Path(__file__).parent.parent / "ava_hybrid_asr.py"
+        src = asr_path.read_text(encoding='utf-8')
+
+        assert "self._prewake_buffer_max_bytes" in src
+        assert "should_buffer = self.capture_enabled or bool(self._wake_words)" in src
+        assert "if (self.capture_enabled or self._wake_words) and not self._utt_start_ts:" in src
+        assert "def _transcript_has_soft_wake_hint" in src
+        assert "def _prewake_query_hint" in src
+        assert "if self._transcript_has_soft_wake_hint(partial) and not self._soft_wake_hint:" in src
+        assert "if self._transcript_has_wake_word(partial):" in src
+        assert "soft_wake_command_hint = (" in src
+        assert 'self._prewake_rescue_enabled = os.environ.get("AVA_ASR_PREWAKE_RESCUE", "0")' in src
+        assert 'self._prewake_query_rescue_enabled = os.environ.get("AVA_ASR_PREWAKE_QUERY_RESCUE", "1")' in src
+        assert "prewake_without_signal = bool(" in src
+        assert "and not self._prewake_query_hint(self._vosk_partial)" in src
+        assert "hard_cutoff_prewake_suppressed no wake/soft-wake signal" in src
+        assert "defer_prewake = bool(" in src
+        assert "self._prewake_rescue_enabled" in src
+        assert "prewake_query_hint = (" in src
+        assert "and not prewake_query_hint" in src
+        assert "and not wake_hint" in src
+        assert "and not soft_wake_command_hint" in src
+        assert "and not prewake_whisper_rescue" in src
+        assert "defer_prewake" in src
+        assert "capture_was_open = self.capture_enabled" in src
+        assert "Suppressing Whisper final without wake" in src
+        assert "Suppressing VOSK fallback without wake" in src
+
+    def test_hybrid_asr_soft_wake_hint_accepts_local_aliases_but_keeps_exact_gate(self):
+        from ava_hybrid_asr import HybridASREngine
+
+        engine = HybridASREngine(sample_rate=16000, wake_words=["hey ava", "ava", "aber"])
+
+        assert engine._transcript_has_wake_word("hey, ava say hello")
+        assert engine._transcript_has_soft_wake_hint("haber say hello")
+        assert engine._transcript_has_soft_wake_hint("hey buh say hello")
+        assert engine._transcript_has_soft_wake_hint("the able what time is it")
+        assert engine._transcript_has_soft_wake_hint("hey abel what time is it")
+        assert engine._soft_wake_result_looks_command_like("What time is it?")
+        assert engine._soft_wake_result_looks_command_like("Open YouTube")
+        assert engine._soft_wake_result_looks_command_like("the able what time is it")
+        assert engine._vosk_fallback_can_rescue("the able what time is it")
+        assert engine._vosk_fallback_can_rescue("hey abel what time is it")
+        assert not engine._vosk_fallback_can_rescue("hey abel")
+        assert not engine._vosk_fallback_can_rescue("can you")
+        assert not engine._transcript_has_wake_word("haber say hello")
+        assert not engine._transcript_has_soft_wake_hint("random speech only")
+        assert not engine._transcript_has_soft_wake_hint("hey hey mate tell me about your set")
+        assert not engine._soft_wake_result_looks_command_like("hey hey mate tell me about your set")
+        assert not engine._soft_wake_result_looks_command_like("we need to start")
+
+    def test_hybrid_asr_filters_low_signal_prewake_vosk_text(self):
+        from ava_hybrid_asr import HybridASREngine
+
+        engine = HybridASREngine(sample_rate=16000, wake_words=["hey ava", "ava", "aber"])
+        engine.capture_enabled = False
+
+        assert "def _prewake_vosk_text_has_signal" in (Path(__file__).parent.parent / "ava_hybrid_asr.py").read_text(encoding='utf-8')
+        assert "suppress_prewake_vosk_partial" in (Path(__file__).parent.parent / "ava_hybrid_asr.py").read_text(encoding='utf-8')
+        assert "suppress_prewake_vosk_final" in (Path(__file__).parent.parent / "ava_hybrid_asr.py").read_text(encoding='utf-8')
+        assert not engine._prewake_vosk_text_has_signal("huh")
+        assert not engine._prewake_vosk_text_has_signal("hello")
+        assert not engine._prewake_vosk_text_has_signal("have you heard of him")
+        assert engine._prewake_vosk_text_has_signal("hey ava")
+        assert engine._prewake_vosk_text_has_signal("aber")
+        assert engine._prewake_vosk_text_has_signal("what time is it")
+
+    def test_hybrid_asr_prepares_whisper_audio_before_transcribe(self):
+        asr_path = Path(__file__).parent.parent / "ava_hybrid_asr.py"
+        src = asr_path.read_text(encoding='utf-8')
+
+        assert "def _prepare_audio_for_whisper" in src
+        assert "vad_filter=use_vad" in src
+        assert "self._whisper_pending_response" in src
+        assert "soft_wake_hint = self._soft_wake_hint" in src
+        assert "self._last_final_meta = {}" in src
+        assert '"soft_wake_rescue": bool(allow_soft_wake_rescue)' in src
+        assert "def _soft_wake_result_looks_command_like" in src
+        assert "def _vosk_fallback_can_rescue" in src
+        assert "and self._soft_wake_result_looks_command_like(result)" in src
+        assert "Using VOSK wake rescue over Whisper" in src
+        assert "wake_soft_final_preserved" in src
+        assert "wake_final final=" in src
+        assert 'trace_reason in {"hard_cutoff", "just_stopped_speaking"}' in src
+        assert "if not vosk_fallback and self._vosk_fallback_can_rescue(self._vosk_partial):" in src
+        assert '"source": "vosk_rescue"' in src
+        assert '"whisper_result": result' in src
+        assert "get_final_result vosk_wake_rescue" in src
+        assert "get_final_result soft_wake_rescue" in src
+        assert "get_final_result superseded" in src
+        assert "whisper_worker discard_cancelled" in src
+
+    def test_hybrid_asr_trimmed_whisper_audio_is_shorter_and_louder(self):
+        from ava_hybrid_asr import HybridASREngine
+
+        engine = HybridASREngine(sample_rate=16000)
+        t = np.arange(int(engine.sample_rate * 0.45), dtype=np.float32) / engine.sample_rate
+        speech = 0.08 * np.sin(2 * np.pi * 220 * t)
+        audio = np.concatenate([
+            np.zeros(int(engine.sample_rate * 0.35), dtype=np.float32),
+            speech.astype(np.float32),
+            np.zeros(int(engine.sample_rate * 0.35), dtype=np.float32),
+        ])
+
+        prepared, stats = engine._prepare_audio_for_whisper(audio)
+
+        assert stats["trimmed"] is True
+        assert prepared.size < audio.size
+        assert stats["prepared_sec"] < stats["raw_sec"]
+        assert stats["prepared_sec"] > 0.45
+        assert stats["prepared_rms"] > stats["raw_rms"]
+
+class TestPersistentPiperWorker:
+    """Regression checks for the warm local Piper TTS worker."""
+
+    def test_piper_tts_keeps_a_persistent_process(self):
+        piper_path = Path(__file__).parent.parent / "voice" / "tts" / "piper_bin.py"
+        src = piper_path.read_text(encoding='utf-8')
+
+        assert "def warmup" in src
+        assert "self._proc and self._proc.poll() is None" in src
+        assert "self._proc = proc" in src
+        assert 'event_queue.put(("utterance_done", None))' in src
+
+    def test_voice_session_chunks_local_piper_responses(self):
+        session_path = Path(__file__).parent.parent / "voice" / "session.py"
+        chunker_path = Path(__file__).parent.parent / "voice" / "tts" / "chunker.py"
+        src = session_path.read_text(encoding='utf-8')
+
+        assert chunker_path.exists(), "Local TTS chunker missing"
+        assert "chunk_text_for_tts" in src
+        assert "engine == 'piper'" in src
+    def test_voice_session_warms_and_stops_tts_backend(self):
+        session_path = Path(__file__).parent.parent / "voice" / "session.py"
+        src = session_path.read_text(encoding='utf-8')
+
+        assert "warmup = getattr(self.tts, 'warmup', None)" in src
+        assert "if callable(warmup):" in src
+        assert "if self.tts:" in src
+        assert "self.tts.stop()" in src
+
+class TestVoiceBargeInAndReplyBudgets:
+    """Regression checks for soft cancel and short spoken replies."""
+
+    def test_piper_supports_non_destructive_cancel(self):
+        piper_path = Path(__file__).parent.parent / "voice" / "tts" / "piper_bin.py"
+        src = piper_path.read_text(encoding='utf-8')
+
+        assert "def cancel_current_utterance" in src
+        assert "self._cancel_requested = threading.Event()" in src
+        assert "self._utterance_idle = threading.Event()" in src
+        assert "self._start_cancel_drain(proc)" in src
+        assert 'self._event_queue.put_nowait(("cancel", None))' in src
+
+    def test_voice_session_prefers_soft_cancel_and_stops_chunk_loop(self):
+        session_path = Path(__file__).parent.parent / "voice" / "session.py"
+        src = session_path.read_text(encoding='utf-8')
+
+        assert "self._stop_speaking_requested = threading.Event()" in src
+        assert "cancel_current_utterance = getattr(self.tts, 'cancel_current_utterance', None)" in src
+        assert "if callable(cancel_current_utterance):" in src
+        assert "self._stop_speaking_requested.is_set()" in src
+
+    def test_voice_session_soft_cancel_stops_after_current_chunk(self, monkeypatch):
+        from voice.session import VoiceSession
+        from voice.tts import chunker as chunker_mod
+
+        class FakeBus:
+            def __init__(self):
+                self.subscribers = []
+                self.events = []
+
+            def subscribe(self, cb):
+                self.subscribers.append(cb)
+
+            def emit(self, ev):
+                self.events.append(getattr(ev, 'type', None))
+                for cb in list(self.subscribers):
+                    cb(ev)
+
+        class FakeProvider:
+            def __init__(self):
+                self.bus = FakeBus()
+
+            def start(self):
+                return None
+
+            def stop(self):
+                return None
+
+            def push_audio(self, pcm16):
+                return None
+
+        class FakeTTS:
+            engine = "piper"
+            name = "piper"
+
+            def __init__(self):
+                self.calls = []
+                self.cancel_calls = 0
+                self.stop_calls = 0
+                self.session = None
+
+            def speak(self, text, playback_cb):
+                self.calls.append(text)
+                if len(self.calls) == 1 and self.session is not None:
+                    self.session.stop_speaking()
+
+            def cancel_current_utterance(self):
+                self.cancel_calls += 1
+
+            def stop(self):
+                self.stop_calls += 1
+
+        provider = FakeProvider()
+        session = VoiceSession(provider)
+        tts = FakeTTS()
+        tts.session = session
+        session.set_tts(tts, lambda _: None)
+        session.tts_chunking_cfg = {"enabled": True, "max_words": 1, "max_chars": 8, "min_words": 1}
+        monkeypatch.setenv("AVA_TTS_CHUNKING", "1")
+
+        original_chunker = chunker_mod.chunk_text_for_tts
+        chunker_mod.chunk_text_for_tts = lambda *args, **kwargs: ["one", "two", "three"]
+        try:
+            session.speak("one two three")
+        finally:
+            chunker_mod.chunk_text_for_tts = original_chunker
+
+        assert tts.calls == ["one"]
+        assert tts.cancel_calls == 1
+        assert tts.stop_calls == 0
+
+    def test_voice_session_piper_chunking_requires_env_opt_in(self, monkeypatch):
+        from voice.session import VoiceSession
+        from voice.tts import chunker as chunker_mod
+
+        class FakeBus:
+            def __init__(self):
+                self.subscribers = []
+
+            def subscribe(self, cb):
+                self.subscribers.append(cb)
+
+            def emit(self, ev):
+                return None
+
+        class FakeProvider:
+            def __init__(self):
+                self.bus = FakeBus()
+
+        class FakeTTS:
+            engine = "piper"
+            name = "piper"
+
+            def __init__(self):
+                self.calls = []
+
+            def speak(self, text, playback_cb):
+                self.calls.append(text)
+
+        monkeypatch.delenv("AVA_TTS_CHUNKING", raising=False)
+        provider = FakeProvider()
+        session = VoiceSession(provider)
+        tts = FakeTTS()
+        session.set_tts(tts, lambda _: None)
+        session.tts_chunking_cfg = {"enabled": True, "max_words": 1, "max_chars": 8, "min_words": 1}
+
+        original_chunker = chunker_mod.chunk_text_for_tts
+        chunker_mod.chunk_text_for_tts = lambda *args, **kwargs: ["one", "two", "three"]
+        try:
+            session.speak("one two three")
+        finally:
+            chunker_mod.chunk_text_for_tts = original_chunker
+
+        assert tts.calls == ["one two three"]
+
+    def test_voice_requests_and_server_enforce_spoken_reply_budget(self):
+        runner_path = Path(__file__).parent.parent / "ava_standalone_realtime.py"
+        api_path = Path(__file__).parent.parent.parent / "ava-server" / "src" / "routes" / "api.js"
+        runner_src = runner_path.read_text(encoding='utf-8')
+        api_src = api_path.read_text(encoding='utf-8')
+
+        assert '"voice_mode": "spoken"' in runner_src
+        assert '"spoken_reply_budget": spoken_reply_budget' in runner_src
+        assert "function normalizeSpokenReplyBudget" in api_src
+        assert "function shapeSpokenReply" in api_src
+        assert api_src.count("shapeSpokenReply(finalText, req.body || {})") >= 3
+
+    def test_live_voice_forces_respond_route(self):
+        runner_path = Path(__file__).parent.parent / "ava_standalone_realtime.py"
+        runner_src = runner_path.read_text(encoding='utf-8')
+        method_src = runner_src.split('    async def _ask_server_respond(self, text: str) -> str:', 1)[1]
+        method_src = method_src.split('    def _is_step_status_message', 1)[0]
+
+        assert "configured_route != 'respond'" in method_src
+        assert "configured_url.rstrip('/').endswith('/chat')" in method_src
+        assert "Live voice forcing /respond" in method_src
+        assert "url = self._voice_server_endpoint('respond')" in method_src
+        assert "_voice_server_endpoint('chat')" not in method_src
+
+    def test_canonical_launchers_do_not_jump_to_shadow_tree(self):
+        root = Path(__file__).parent.parent
+        validation_src = (root / "start_validation_mode.bat").read_text(encoding='utf-8')
+        background_src = (root / "start_ava_background.bat").read_text(encoding='utf-8')
+        startup_src = (root / "install_ava_startup.bat").read_text(encoding='utf-8')
+        moltbook_src = (root / "start_ava_with_moltbook.bat").read_text(encoding='utf-8')
+        realtime_src = (root / "start_realtime_voice.bat").read_text(encoding='utf-8')
+
+        shadow_path = r"C:\Users\USER 1\ava-integration"
+        for src in (validation_src, background_src, startup_src, moltbook_src, realtime_src):
+            assert shadow_path not in src
+
+        assert 'cd /d "%~dp0"' in validation_src
+        assert 'python ava_standalone_realtime.py' in validation_src
+        assert 'set "SCRIPT_DIR=%~dp0"' in background_src
+        assert 'pythonw "%SCRIPT_DIR%ava_tray.pyw"' in background_src
+        assert 'set "SCRIPT_DIR=%~dp0"' in startup_src
+        assert r'set "AVA_PATH=%SCRIPT_DIR%\ava_tray.pyw"' in startup_src
+        assert 'cd /d "%~dp0"' in moltbook_src
+        assert 'python ava_standalone_realtime.py' in moltbook_src
+        assert 'cd /d "%~dp0"' in realtime_src
+        assert 'python ava_realtime_ui.py' in realtime_src
+
+    def test_voice_watchdog_uses_repo_local_working_dir(self):
+        root = Path(__file__).parent.parent
+        watchdog_src = (root / "voice_watchdog.py").read_text(encoding='utf-8')
+
+        assert r"C:\Users\USER 1\ava-integration" not in watchdog_src
+        assert "Path(__file__).resolve().parent" in watchdog_src
+        assert "cwd=str(script_dir)" in watchdog_src
+
+
+class TestVoiceLatencyTuning:
+    """Regression checks for low-latency local voice tuning."""
+
+    def test_runner_resolves_audio_devices_by_name(self):
+        runner_path = Path(__file__).parent.parent / "ava_standalone_realtime.py"
+        src = runner_path.read_text(encoding='utf-8')
+
+        assert "def _resolve_audio_device_index" in src
+        assert "output_device_name" in src
+        assert "input_device_name" in src
+        assert "resolved_out = self._resolve_audio_device_index('output'" in src
+        assert "resolved_in = self._resolve_audio_device_index('input'" in src
+
+    def test_config_prefers_realtek_voice_path(self):
+        config_path = Path(__file__).parent.parent / "ava_voice_config.json"
+        cfg = json.loads(config_path.read_text(encoding='utf-8'))
+        audio = cfg.get('audio') or {}
+
+        assert audio.get('input_device') == 2
+        assert audio.get('output_device') is None
+        assert audio.get('input_backend') == 'mme'
+        assert audio.get('input_sample_rate') == 44100
+        assert audio.get('playback_rate') == 44100
+        assert 'Realtek' in str(audio.get('input_device_name', ''))
+        assert 'Microsoft Sound Mapper' in str(audio.get('output_device_name', ''))
+        assert 'primary sound capture driver' in [str(x).lower() for x in audio.get('input_device_avoid', [])]
+        assert (cfg.get('local_fallback') or {}).get('whisper_model') == 'tiny.en'
+        assert ((cfg.get('asr') or {}).get('utterance') or {}).get('end_silence_ms') == 900
+
+    def test_resolve_audio_device_index_validates_direction_before_using_configured_idx(self):
+        runner_path = Path(__file__).parent.parent / "ava_standalone_realtime.py"
+        src = runner_path.read_text(encoding='utf-8')
+
+        assert "Ignoring configured {kind} device index {idx}: {channel_key}=0" in src
+        assert "info = pa.get_device_info_by_index(idx)" in src
+        assert "if int(info.get(channel_key, 0)) > 0:" in src
+
+    def test_ranked_input_selector_prefers_configured_target_rate(self):
+        runner_path = Path(__file__).parent.parent / "ava_standalone_realtime.py"
+        src = runner_path.read_text(encoding='utf-8')
+
+        assert "target_config_rate_match" in src
+        assert "configured_input_match" in src
+        assert "configured_name_match" in src
+        assert "rate == config_sr and bool(candidate.get('configured_input_match'))" in src
+        assert "not bool(candidate.get('configured_input_match'))" in src
+        assert "0 if bool(candidate.get('target_config_rate_match')) else 1" in src
+
+    def test_server_readiness_does_not_block_on_response_body(self):
+        runner_path = Path(__file__).parent.parent / "ava_standalone_realtime.py"
+        src = runner_path.read_text(encoding='utf-8')
+        server_up_body = src.split("def _server_up", 1)[1].split("def _server_base", 1)[0]
+
+        assert "resp.read(" not in server_up_body
+        assert "return 200 <= code < 500" in server_up_body
+
+    def test_validation_mode_banner_matches_local_voice_runtime(self):
+        runner_path = Path(__file__).parent.parent / "ava_standalone_realtime.py"
+        src = runner_path.read_text(encoding='utf-8')
+
+        assert 'Wake word required before commands' in src
+        assert 'silent follow-up window after wake' in src
+        assert 'Half-duplex local voice conversation' in src
+        assert 'Half-duplex playback (barge-in disabled)' in src
+        assert 'Local AVA Server brain over /respond' in src
+        assert 'Microphone active - wake word required in validation mode' in src
+
+    def test_local_hybrid_turn_latency_is_tuned_down(self):
+        provider_path = Path(__file__).parent.parent / "voice" / "providers" / "local_hybrid.py"
+        src = provider_path.read_text(encoding='utf-8')
+
+        assert 'whisper_model: str = "tiny.en"' in src
+        assert "silence_duration=0.35" in src
+        assert "min_audio_length=0.45" in src
+        assert "max_utterance_sec=4.5" in src
+        assert ">= 0.35" in src
+
+    def test_whisper_final_path_prefers_speed_for_short_turns(self):
+        asr_path = Path(__file__).parent.parent / "ava_hybrid_asr.py"
+        src = asr_path.read_text(encoding='utf-8')
+
+        assert "silence_duration: float = 0.35" in src
+        assert "min_audio_length: float = 0.45" in src
+        assert 'whisper_model: str = "tiny.en"' in src
+        assert "max_utterance_sec: float = 4.5" in src
+        assert "self._final_timeout_sec = self._recommended_final_timeout(self.whisper_model_name)" in src
+        assert "def _recommended_final_timeout" in src
+        assert "return 7.5" in src
+        assert "beam_size=1" in src
+        assert "condition_on_previous_text=False" in src
+        assert "min_silence_duration_ms=160" in src
+        assert "speech_pad_ms=120" in src
+        assert "def warmup" in src
+        assert "self.warmup()" in src
+        assert "self._last_rms_speech_time = 0.0" in src
+        assert "self._last_partial_activity_time = 0.0" in src
+        assert "def request_final_result" in src
+        assert "HybridASR-Finalize" in src
+
+    def test_live_loopback_benchmark_uses_adaptive_threshold_and_cooldown(self):
+        bench_path = Path(__file__).parent.parent / "tools" / "voice_lab" / "03_live_loopback_benchmark.py"
+        src = bench_path.read_text(encoding='utf-8')
+
+        assert "--cooldown-sec" in src
+        assert "baseline_med = statistics.median" in src
+        assert "baseline_std = statistics.pstdev" in src
+        assert "baseline_rms + max(1200.0, baseline_std * 0.25)" in src
+
+    def test_hard_cutoff_uses_buffered_audio_age_while_wake_gated(self):
+        src = (Path(__file__).parent.parent / "ava_hybrid_asr.py").read_text(encoding="utf-8")
+
+        assert "def _buffered_audio_sec(self) -> float:" in src
+        assert "audio_age = self._buffered_audio_sec()" in src
+        assert "use_buffered_age = bool(self._wake_words and not self.capture_enabled)" in src
+        assert "cutoff_age = audio_age if use_buffered_age else utt_age" in src
+
+    def test_live_selector_skips_near_silent_candidates_when_alternatives_exist(self):
+        runtime_src = (Path(__file__).parent.parent / "ava_standalone_realtime.py").read_text(encoding='utf-8')
+        cfg_src = (Path(__file__).parent.parent / "ava_voice_config.json").read_text(encoding='utf-8')
+
+        assert "min_live_rms" in cfg_src
+        assert "near_silent = candidate['idle_rms'] < min_live_rms and reopen_rms < min_live_rms" in runtime_src
+        assert "Skipping near-silent candidate" in runtime_src
+        assert "has_live_alternative = any(" in runtime_src
+
+    def test_voice_session_stashes_final_meta_before_runtime_callback(self):
+        session_src = (Path(__file__).parent.parent / "voice" / "session.py").read_text(encoding='utf-8')
+        runtime_src = (Path(__file__).parent.parent / "ava_standalone_realtime.py").read_text(encoding='utf-8')
+
+        assert "self._last_user_final_meta = getattr(ev, 'meta', None) or {}" in session_src
+        assert "getattr(getattr(self, '_voice_session', None), '_last_user_final_meta', None) or self._last_asr_final_meta or {}" in runtime_src
+
+    def test_validation_mode_accepts_asr_soft_wake_rescue(self):
+        runtime_path = Path(__file__).parent.parent / "ava_standalone_realtime.py"
+        provider_path = Path(__file__).parent.parent / "voice" / "providers" / "local_hybrid.py"
+        runtime_src = runtime_path.read_text(encoding='utf-8')
+        provider_src = provider_path.read_text(encoding='utf-8')
+
+        assert "('the able', 'hey ava')" in runtime_src
+        assert "soft_wake_rescue = bool(meta.get('soft_wake_rescue'))" in runtime_src
+        assert "Accepting transcript via ASR soft wake rescue" in runtime_src
+        assert 'final_meta.update(dict(getattr(self.asr, "_last_final_meta", {}) or {}))' in provider_src
+
+    def test_unified_runtime_logs_single_asr_and_llm_checkpoints(self):
+        runner_path = Path(__file__).parent.parent / "ava_standalone_realtime.py"
+        src = runner_path.read_text(encoding='utf-8')
+
+        assert src.count('"stage": "asr_final"') == 1
+        assert src.count('"stage": "llm_done"') == 1
 
 
 if __name__ == '__main__':

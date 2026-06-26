@@ -101,3 +101,44 @@ voice/
 *.pid.lock
 tmp/
 temp/
+
+# === Session cleanup (added 2026-06-26) ===
+# Archives & backups
+*.zip
+*.bak
+*.bak_*
+*.pass1bak
+*.pass2bak
+*.manual_recovery_backup_*
+
+# Audio & training datasets (regenerable / large binaries)
+*.wav
+vella_dataset/
+vendor/piper/models/
+
+# Latency / trace / run logs
+*.jsonl
+latency.jsonl
+run_out.txt
+gen_log.txt
+gen_err.txt
+
+# Throwaway trace & scratch dirs
+tmp_*/
+tmp_*
+ava_test_tmp/
+ava_session_helpers/
+sandbox/
+
+# Test output
+jest-results.json
+
+# Stray artifacts
+nul
+.write_test_tmp
+
+# Auto-agent runtime state (regenerated each run)
+ava-integration/training/
+
+# Separate sub-app (its own project; contains its own .env)
+AVa's reasoning/

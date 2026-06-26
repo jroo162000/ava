@@ -190,6 +190,30 @@ class ConversationLogger {
     }
   }
 
+  // Recent message history spanning MULTIPLE day-files (newest backward), so she can
+  // "pick up where we left off" across sessions, not just within today.
+  getRecentHistoryAcrossDays(limit = 12) {
+    try {
+      if (!fs.existsSync(this.logsDir)) return [];
+      const files = fs.readdirSync(this.logsDir)
+        .filter(f => f.startsWith('conversation-') && f.endsWith('.jsonl'))
+        .sort(); // ascending by YYYY-MM-DD
+      let collected = [];
+      for (let i = files.length - 1; i >= 0; i--) {
+        const content = fs.readFileSync(path.join(this.logsDir, files[i]), 'utf8');
+        const msgs = content.trim().split('\n').filter(l => l.trim())
+          .map(l => { try { return JSON.parse(l); } catch { return null; } })
+          .filter(e => e && e.type === 'message');
+        collected = msgs.concat(collected); // older file's messages go before newer
+        if (collected.length >= limit) break;
+      }
+      return collected.slice(-limit);
+    } catch (error) {
+      logger.error('Failed to read cross-day history', { error: error.message });
+      return [];
+    }
+  }
+
   // Search conversations by content
   searchConversations(query, days = 7) {
     const results = [];

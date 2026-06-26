@@ -5,6 +5,7 @@ import sys
 import os
 import time
 import json
+from pathlib import Path
 
 # Test 1: Verify VOSK loads
 print("=" * 50)
@@ -15,7 +16,7 @@ try:
     from vosk import Model, KaldiRecognizer, SetLogLevel
     SetLogLevel(-1)  # Suppress logs
     
-    vosk_model_path = r"C:\Users\USER 1\ava-integration\vosk-models\vosk-model-small-en-us-0.15"
+    vosk_model_path = str(Path(__file__).resolve().parent / "vosk-models" / "vosk-model-small-en-us-0.15")
     
     if os.path.exists(vosk_model_path):
         print(f"✅ Model path exists: {vosk_model_path}")
@@ -67,7 +68,7 @@ print("\n" + "=" * 50)
 print("TEST 3: Config Check")
 print("=" * 50)
 
-config_path = r"C:\Users\USER 1\ava-integration\ava_voice_config.json"
+config_path = str(Path(__file__).resolve().parent / "ava_voice_config.json")
 try:
     with open(config_path, 'r') as f:
         cfg = json.load(f)

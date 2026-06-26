@@ -26,9 +26,25 @@ except Exception as e:
 
 
 class LocalHybridProvider(VoiceProvider):
-    def __init__(self, bus: EventBus, whisper_model: str = "small"):
+    def __init__(
+        self,
+        bus: EventBus,
+        whisper_model: str = "tiny.en",
+        wake_words: Optional[list[str]] = None,
+        use_vosk_final_direct: bool = False,
+        silence_threshold: float = 600,
+        silence_duration: float = 0.35,
+        min_audio_length: float = 0.45,
+        max_utterance_sec: float = 4.5,
+    ):
         super().__init__(bus)
         self.whisper_model = whisper_model
+        self.wake_words = [w.lower() for w in (wake_words or [])]
+        self.use_vosk_final_direct = bool(use_vosk_final_direct)
+        self.silence_threshold = float(silence_threshold)
+        self.silence_duration = float(silence_duration)
+        self.min_audio_length = float(min_audio_length)
+        self.max_utterance_sec = float(max_utterance_sec)
         self.asr: Optional[HybridASREngine] = None  # type: ignore
         self._running = False
         self._speak_thread: Optional[threading.Thread] = None
@@ -78,7 +94,7 @@ class LocalHybridProvider(VoiceProvider):
                 
                 # Only early-commit very short phrases (1-3 words) after longer stability
                 # This prevents false activations from garbled Vosk transcriptions
-                if not self._early_final_sent and (now - (self._last_partial_ts or now)) >= 0.5:  # was 0.3
+                if not self._early_final_sent and (now - (self._last_partial_ts or now)) >= 0.35:  # tuned for faster short-command commits
                     # Only very short phrases to reduce false positives
                     if word_count <= 3:  # was 8
                         # Additional safety: require minimum confidence or common command words
@@ -101,22 +117,31 @@ class LocalHybridProvider(VoiceProvider):
         def on_final(txt: str):
             if not txt:
                 return
-            self.bus.emit(VoiceEvent(type="asr.final", text=txt, is_final=True, meta={
+            final_meta = {
                 "utterance_id": self._current_utt_id,
                 "early": False,
-            }))
+            }
+            if self.asr is not None:
+                try:
+                    final_meta.update(dict(getattr(self.asr, "_last_final_meta", {}) or {}))
+                except Exception:
+                    pass
+            self.bus.emit(VoiceEvent(type="asr.final", text=txt, is_final=True, meta=final_meta))
             # Reset utterance state
             self._in_utt = False
             self._current_utt_id = None
 
-        # Use slightly lower silence threshold to improve stop detection on typical mics
         self.asr = HybridASREngine(
             whisper_model=self.whisper_model,
             on_partial=on_partial,
             on_final=on_final,
             sample_rate=16000,
-            silence_threshold=300,
-            silence_duration=0.6,
+            silence_threshold=self.silence_threshold,
+            silence_duration=self.silence_duration,  # default silence_duration=0.35
+            min_audio_length=self.min_audio_length,  # default min_audio_length=0.45
+            max_utterance_sec=self.max_utterance_sec,  # default max_utterance_sec=4.5
+            wake_words=self.wake_words,
+            use_vosk_final_direct=self.use_vosk_final_direct,
         )
         ok = self.asr.start()
         if not ok:

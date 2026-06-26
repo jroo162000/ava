@@ -1,0 +1,54 @@
+{
+  "rules": [
+    {
+      "id": "g-find-read",
+      "text": "To FIND or LOCATE a file by name, use fs_find. To READ a file's contents or count its lines, use fs_read. Do not use open_item to find or read files.",
+      "added": "2026-06-24T20:30:00.000Z"
+    },
+    {
+      "id": "g-open-launch",
+      "text": "To OPEN or LAUNCH a file in its app (e.g. 'open my resume'), or to open an app or a URL, use open_item — not fs_find or fs_read.",
+      "added": "2026-06-24T20:30:00.000Z"
+    },
+    {
+      "id": "g-write-append",
+      "text": "To CREATE, WRITE, or APPEND to a file, use file_gen or fs_ops (operation=append to add a line). After writing, read the file back to confirm it changed before reporting success.",
+      "added": "2026-06-24T20:30:00.000Z"
+    },
+    {
+      "id": "g-screen-act",
+      "text": "When the user asks to describe or see what's currently on the screen, use screen_ops or vision_ops — do not ask the user to confirm or clarify.",
+      "added": "2026-06-25T04:01:09.526Z"
+    },
+    {
+      "id": "gmqu1wg2b631",
+      "text": "When the user asks to find, read, or open a file, use fs_find or fs_read — do not use fs_ops. After writing or appending, read the file back to confirm before reporting success.",
+      "added": "2026-06-25T22:05:29.555Z"
+    },
+    {
+      "id": "gmqu3z3v5274",
+      "text": "When the user asks about capabilities or what I can do, respond with a list of my functions — do not ask the user to specify a task.",
+      "added": "2026-06-25T23:03:32.945Z"
+    },
+    {
+      "id": "gmqu4bmrz694",
+      "text": "When the user asks to validate JSON, use json_ops — do not use any other tool.",
+      "added": "2026-06-25T23:13:17.327Z"
+    },
+    {
+      "id": "gmqu8t3b4691",
+      "text": "When the user asks to analyze system health or monitor performance, use proactive_ops — do not use sys_ops.",
+      "added": "2026-06-26T01:18:50.368Z"
+    },
+    {
+      "id": "gmqu946lq32",
+      "text": "When the user asks to delete a file, use fs_ops — do not use fs_find. After deletion, confirm the file is absent before reporting success.",
+      "added": "2026-06-26T01:27:27.854Z"
+    },
+    {
+      "id": "gmqucossa658",
+      "text": "When the user asks for current sports events or teams, use browser_automation — do not use net_ops.",
+      "added": "2026-06-26T03:07:28.570Z"
+    }
+  ]
+}

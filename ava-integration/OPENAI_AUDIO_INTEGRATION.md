@@ -322,7 +322,7 @@ python -c "import os; from cmpuse.secrets import load_into_env; load_into_env();
 
 ### Test Specific Voice
 ```bash
-cd "C:\Users\USER 1\ava-integration"
+cd "C:\Users\USER 1\ava\ava-integration"
 python -c "from cmpuse.tts import speak; speak('Testing sage voice')"
 ```
 
@@ -355,7 +355,7 @@ python check_audio_models.py
 1. `C:\Users\USER 1\.cmpuse\secrets.json` - Configuration
 2. `C:\Users\USER 1\cmp-use\cmpuse\tts.py` - System TTS module
 3. `C:\Users\USER 1\cmp-use\cmpuse\tools\audio_ops.py` - Audio operations tool
-4. `C:\Users\USER 1\ava-integration\test_openai_audio.py` - Test suite
+4. `C:\Users\USER 1\ava\ava-integration\test_openai_audio.py` - Test suite
 
 ### Next Steps
 1. ✅ Test AVA voice responses in production

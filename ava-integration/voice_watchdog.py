@@ -3,14 +3,18 @@ import subprocess
 import sys
 import time
 from datetime import datetime
+from pathlib import Path
+
 
 def log(msg):
     print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
+
 
 def main():
     log("AVA Voice Watchdog started")
     log("Will auto-restart voice client on crash")
 
+    script_dir = Path(__file__).resolve().parent
     restart_count = 0
     while True:
         restart_count += 1
@@ -19,7 +23,7 @@ def main():
         try:
             result = subprocess.run(
                 [sys.executable, "ava_standalone_realtime.py"],
-                cwd=r"C:\Users\USER 1\ava-integration"
+                cwd=str(script_dir)
             )
             exit_code = result.returncode
             log(f"Voice client exited with code {exit_code}")
@@ -33,6 +37,7 @@ def main():
 
         log("Restarting in 3 seconds...")
         time.sleep(3)
+
 
 if __name__ == "__main__":
     main()

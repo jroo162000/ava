@@ -7,7 +7,30 @@
 
 import fs from 'fs'
 import path from 'path'
+import { fileURLToPath } from 'url'
 import logger from './logger.js'
+
+const __filename = fileURLToPath(import.meta.url)
+const __dirname = path.dirname(__filename)
+const SERVER_ROOT = path.resolve(__dirname, '..', '..')
+
+function resolveIntegrationDir() {
+  const home = process.env.USERPROFILE || process.env.HOME || ''
+  const candidates = [
+    process.env.AVA_INTEGRATION_DIR,
+    path.resolve(SERVER_ROOT, '..', 'ava-integration'),
+    path.resolve(process.cwd(), '..', 'ava-integration'),
+    home ? path.join(home, 'ava', 'ava-integration') : '',
+    home ? path.join(home, 'ava-integration') : ''
+  ].filter(Boolean)
+
+  for (const candidate of candidates) {
+    try {
+      if (fs.existsSync(candidate)) return candidate
+    } catch {}
+  }
+  return candidates[0] || path.resolve(SERVER_ROOT, '..', 'ava-integration')
+}
 
 // Key file mappings for fallback loading (DEPRECATED)
 const KEY_FILE_MAP = {
@@ -24,6 +47,8 @@ const KEY_FILE_MAP = {
 class Config {
   constructor() {
     this.warnedFiles = new Set();
+    this.integrationDir = resolveIntegrationDir();
+    process.env.AVA_INTEGRATION_DIR = process.env.AVA_INTEGRATION_DIR || this.integrationDir;
     this.loadSecrets();
     this.loadEnvFile();
     this.loadKeyFiles();
@@ -54,7 +79,7 @@ class Config {
   loadEnvFile() {
     // Try to load .env from ava-integration directory
     const integrationPaths = [
-      path.join(process.env.USERPROFILE || process.env.HOME || '', 'ava-integration', '.env'),
+      path.join(this.integrationDir, '.env'),
       path.join(process.cwd(), '..', 'ava-integration', '.env'),
       path.join(process.cwd(), '.env')
     ];
@@ -102,7 +127,7 @@ class Config {
       logger.warn('Plaintext key file loading disabled (production or DISABLE_PLAINTEXT_KEYS=1)');
       return;
     }
-    const integrationDir = path.join(process.env.USERPROFILE || process.env.HOME || '', 'ava-integration');
+    const integrationDir = this.integrationDir;
     
     for (const [envKey, filenames] of Object.entries(KEY_FILE_MAP)) {
       // Skip if already set
@@ -208,6 +233,7 @@ export default {
   
   // Features
   RESPOND_LOCAL_FILEGEN_FALLBACK: config.getBoolean('RESPOND_LOCAL_FILEGEN_FALLBACK', false),
+  AVA_INTEGRATION_DIR: config.integrationDir,
   
   // Logging
   LOG_LEVEL: config.get('LOG_LEVEL', 'info'),

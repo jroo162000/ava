@@ -10,6 +10,9 @@ import logger from '../utils/logger.js';
 import pythonWorker from './pythonWorker.js';
 import securityService from '../utils/security.js';
 import moltbookService from './moltbook.js';
+import fileGen from './fileGen.js';
+import memorySearch from './memorySearch.js';
+import sandbox from './sandbox.js';
 
 /**
  * IdempotencyCache - Prevents duplicate tool execution within TTL window
@@ -101,12 +104,13 @@ class IdempotencyCache {
   /**
    * Record that a tool was executed
    */
-  record(toolName, args, key = null) {
+  record(toolName, args, key = null, result = null) {
     const cacheKey = key || this.generateKey(toolName, args);
     this.cache.set(cacheKey, {
       timestamp: Date.now(),
       toolName,
-      args: this.normalizeArgs(args)
+      args: this.normalizeArgs(args),
+      result   // store the result so a duplicate can be answered from cache (not blocked)
     });
 
     // Cleanup old entries periodically
@@ -150,6 +154,8 @@ class ToolsService {
   constructor() {
     this.cache = null;
     this.cacheTime = 0;
+    this.cachePythonCount = 0;
+    this.cacheWorkerReady = false;
     this.cacheTTL = 60000; // 1 minute cache
     this.initialized = false;
   }
@@ -159,18 +165,20 @@ class ToolsService {
    */
   getBuiltinTools() {
     return [
-      { 
-        name: 'file_gen', 
-        description: 'Create documents (txt, md, csv, json, html, pdf, docx, xlsx, pptx)', 
+      {
+        name: 'file_gen',
+        description: 'Create or write a file of ANY type: txt, md, csv, json, html, pdf, docx, xlsx, pptx. Provide file_path (full path, extension decides the type) or filename. To ADD a line to an existing text file instead of overwriting it, set mode to "append".',
         source: 'builtin',
         schema: {
           type: 'object',
           properties: {
-            filename: { type: 'string', description: 'Output filename with extension' },
-            content: { type: 'string', description: 'File content' },
-            format: { type: 'string', enum: ['txt', 'md', 'csv', 'json', 'html', 'pdf', 'docx', 'xlsx', 'pptx'] }
+            file_path: { type: 'string', description: 'Full path to write (preferred); the extension sets the file type, e.g. C:\\Users\\You\\Downloads\\report.docx' },
+            filename: { type: 'string', description: 'Filename with extension (saved to Downloads if no file_path given)' },
+            content: { type: 'string', description: 'Content. For xlsx use comma- or tab-separated rows; for pptx separate slides with a blank line (first line of each = slide title)' },
+            mode: { type: 'string', enum: ['write', 'append'], description: 'write = create/overwrite (default); append = add to the end of an existing text file (use this for "add a line")' },
+            format: { type: 'string', enum: ['txt', 'md', 'csv', 'json', 'html', 'pdf', 'docx', 'xlsx', 'pptx', 'rtf'] }
           },
-          required: ['filename', 'content']
+          required: ['content']
         },
         requires_confirm: false,
         risk_level: 'low'
@@ -205,8 +213,8 @@ class ToolsService {
         risk_level: 'low'
       },
       { 
-        name: 'memory_search', 
-        description: 'Search conversation memory', 
+        name: 'memory_search',
+        description: "Search AVA's saved memory and PAST CONVERSATIONS (full-text). Use for \"what did we discuss/decide about X\", \"did we talk about Y\", \"what do you have saved about Z\", or recalling anything from earlier sessions.",
         source: 'builtin',
         schema: {
           type: 'object',
@@ -330,8 +338,12 @@ class ToolsService {
   async getAllTools(forceRefresh = false) {
     const now = Date.now();
     
-    // Return cache if valid
-    if (!forceRefresh && this.cache && (now - this.cacheTime) < this.cacheTTL) {
+    const workerReady = pythonWorker.isReady();
+
+    // Return cache if valid. Do not keep serving a startup cache that was built
+    // before the Python worker became ready, because that hides dynamic tools.
+    const cacheHasFreshPythonState = this.cacheWorkerReady || !workerReady;
+    if (!forceRefresh && this.cache && cacheHasFreshPythonState && (now - this.cacheTime) < this.cacheTTL) {
       return this.cache;
     }
 
@@ -354,10 +366,13 @@ class ToolsService {
 
     this.cache = Array.from(toolMap.values());
     this.cacheTime = now;
+    this.cachePythonCount = pythonTools.length;
+    this.cacheWorkerReady = pythonWorker.isReady();
     
     logger.info('[tools] Tool cache refreshed', { 
       builtin: builtin.length, 
       python: pythonTools.length, 
+      workerReady: this.cacheWorkerReady,
       total: this.cache.length 
     });
     
@@ -409,6 +424,8 @@ class ToolsService {
   async invalidateCache() {
     this.cache = null;
     this.cacheTime = 0;
+    this.cachePythonCount = 0;
+    this.cacheWorkerReady = false;
     return this.getAllTools(true);
   }
 
@@ -435,24 +452,74 @@ class ToolsService {
         };
 
       case 'memory_search':
-        // This would typically call the memory service
-        // For now, return a placeholder
-        return {
-          ok: true,
-          result: { message: 'Use /memory/search endpoint for memory queries' }
-        };
+        // Full-text search over curated memory (USER.md/MEMORY.md) + conversation logs.
+        try {
+          const out = memorySearch.search(args.query || args.q || '', args.limit || 8);
+          return { ok: true, result: out };
+        } catch (e) {
+          return { ok: false, result: { status: 'error', message: e.message } };
+        }
 
-      case 'fs_read':
-      case 'fs_find':
       case 'file_gen':
-        // These builtins exist but need proper implementation
-        // Route to Python for now since they have implementations there
-        const response = await pythonWorker.sendCommand('execute_tool', {
-          name,
-          args,
-          dry_run: dryRun
-        }, 30000);
-        return response;
+        // All file types handled via the shared generator (text + pdf in Node;
+        // docx/xlsx/pptx via the Python helper). Accepts an absolute file_path.
+        return fileGen.generateFile(args, { dryRun });
+
+      case 'fs_read': {
+        try {
+          const home = sandbox.isEnabled() ? sandbox.deviceRoot() : os.homedir();
+          let target = args.path || args.file_path || args.filepath || '';
+          if (!target) return { ok: false, result: { status: 'error', message: 'path required' } };
+          if (!path.isAbsolute(target)) {
+            const dirs = [path.join(home, 'Downloads'), path.join(home, 'Documents'), path.join(home, 'Desktop'), home];
+            for (const d of dirs) { const c = path.join(d, target); if (fs.existsSync(c)) { target = c; break; } }
+          }
+          target = path.resolve(target);
+          if (!target.startsWith(path.resolve(home))) return { ok: false, result: { status: 'error', message: 'path not allowed' } };
+          if (!fs.existsSync(target)) return { ok: false, result: { status: 'error', message: `file not found: ${target}` } };
+          const data = fs.readFileSync(target, 'utf8');
+          return { ok: true, result: { status: 'ok', file_path: target, content: data.slice(0, 20000), bytes: Buffer.byteLength(data, 'utf8') } };
+        } catch (e) {
+          return { ok: false, result: { status: 'error', message: e.message } };
+        }
+      }
+
+      case 'fs_find': {
+        try {
+          const home = sandbox.isEnabled() ? sandbox.deviceRoot() : os.homedir();
+          const patternRaw = String(args.pattern || args.name || args.query || '').trim();
+          if (!patternRaw) return { ok: false, result: { status: 'error', message: 'pattern required' } };
+          // If no directory was given, search the user's common folders (not just Downloads).
+          let roots;
+          if (args.directory || args.dir) {
+            const baseDir = args.directory || args.dir;
+            roots = [path.isAbsolute(baseDir) ? baseDir : path.join(home, baseDir)];
+          } else {
+            roots = [
+              path.join(home, 'Downloads'), path.join(home, 'Documents'),
+              path.join(home, 'Desktop'), path.join(home, 'Pictures'),
+            ];
+          }
+          roots = roots.map((r) => path.resolve(r)).filter((r) => r.startsWith(path.resolve(home)));
+          const needle = patternRaw.toLowerCase().replace(/\*/g, '');
+          const matches = [];
+          const walk = (dir, depth) => {
+            if (depth > 4 || matches.length >= 100) return;
+            let entries = [];
+            try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+            for (const e of entries) {
+              const fp = path.join(dir, e.name);
+              if (e.isDirectory()) walk(fp, depth + 1);
+              else if (e.name.toLowerCase().includes(needle)) matches.push(fp);
+              if (matches.length >= 100) return;
+            }
+          };
+          for (const r of roots) { if (matches.length >= 100) break; walk(r, 0); }
+          return { ok: true, result: { status: 'ok', searched: roots, count: matches.length, files: matches.slice(0, 50) } };
+        } catch (e) {
+          return { ok: false, result: { status: 'error', message: e.message } };
+        }
+      }
 
       // Moltbook tools
       case 'moltbook_status':
@@ -569,14 +636,19 @@ class ToolsService {
 
           logger.info('[tools] Idempotency blocked', logEntry);
 
+          // Return the PRIOR result (not a "blocked" error) so the agent loop uses it
+          // and STOPS, instead of spinning by retrying the same call repeatedly.
+          const cached = idempotencyCheck.entry && idempotencyCheck.entry.result;
+          if (cached) {
+            return cached;
+          }
           return {
-            ok: false,
-            error: 'I already did that recently. Do you want me to do it again?',
-            status: 'blocked',
-            reason: 'idempotency_blocked',
+            ok: true,
+            status: 'ok',
+            idempotent: true,
+            message: 'Already done a moment ago (duplicate suppressed).',
             cacheKey: idempotencyCheck.key,
-            ageMs: idempotencyCheck.ageMs,
-            hint: 'Pass bypassIdempotency: true to retry'
+            ageMs: idempotencyCheck.ageMs
           };
         }
       }
@@ -644,21 +716,34 @@ class ToolsService {
 
       let response;
 
+      // SANDBOX (training mode): redirect/mocks so NO tool touches the real device.
+      try {
+        const sb = sandbox.intercept(name, args);
+        if (sb) {
+          if (sb.mode === 'mock') return sb.result;
+          if (sb.mode === 'redirect') { args = sb.args; }   // run for real, on the fake device
+          // passthrough -> continue normally
+        }
+      } catch (e) { logger.warn('[sandbox] intercept failed', { error: e.message, tool: name }); }
+
       // Handle builtin tools in Node.js
       if (tool.source === 'builtin') {
         response = await this.executeBuiltinTool(name, args, dryRun);
       } else {
-        // Execute Python tools via Python worker
+        // Execute Python tools via Python worker. Generous timeout: some tools are slow
+        // on their FIRST (cold) call — camera 'see' loads OpenCV + opens the device +
+        // calls vision; browser launch starts Chrome; etc. 30s was too tight and produced
+        // false "could not complete" timeouts.
         response = await pythonWorker.sendCommand('execute_tool', {
           name,
           args,
           dry_run: dryRun
-        }, 30000);
+        }, 120000);
       }
 
-      // Record successful execution in idempotency cache (only if not dry_run)
+      // Record successful execution + its result in the idempotency cache (not dry_run)
       if (!dryRun && response?.ok !== false) {
-        idempotencyCache.record(name, args);
+        idempotencyCache.record(name, args, null, response);
       }
 
       // Log execution result

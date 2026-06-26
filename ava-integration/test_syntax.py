@@ -1,7 +1,9 @@
 import ast
 import sys
+from pathlib import Path
 try:
-    with open(r'C:\Users\USER 1\ava-integration\ava_standalone_realtime.py', 'r', encoding='utf-8') as f:
+    target = Path(__file__).resolve().parent / 'ava_standalone_realtime.py'
+    with open(target, 'r', encoding='utf-8') as f:
         code = f.read()
     ast.parse(code)
     print("SUCCESS: Syntax OK")

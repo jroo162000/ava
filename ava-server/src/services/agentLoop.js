@@ -19,6 +19,12 @@ import digestQueue from './digestQueue.js';
 import { jaccardSim } from './curiosityScoring.js';
 import llmService from './llm.js';
 import moltbookScheduler from './moltbookScheduler.js';
+import persona from './persona.js';
+import curatedMemory from './curatedMemory.js';
+import skillStore from './skillStore.js';
+import trainingGuidance from './trainingGuidance.js';
+import skillCapture from './skillCapture.js';
+import lessonLearner from './lessonLearner.js';
 
 // Agent state constants
 const DEFAULT_STEP_LIMIT = 12;
@@ -48,8 +54,19 @@ const AgentStatus = {
 /**
  * Create initial agent state
  */
+// A goal is "multi-step" only if it clearly chains actions ("and then", "also", or
+// two different action verbs). Single-action goals stop after one successful tool so
+// the loop doesn't tack on extra unrequested actions (e.g. take screenshot THEN open).
+function isMultiStepGoal(goal) {
+  const g = String(goal || '').toLowerCase();
+  if (/\b(and then|then\b|after that|also\b|, and|and also)\b/.test(g)) return true;
+  const verbs = g.match(/\b(take|open|send|reply|create|make|find|search|read|write|save|delete|remove|cancel|update|change|move|copy|rename|turn|set|close|launch|show|play|record|capture|schedule|book|add|post|download|upload)\b/g) || [];
+  return new Set(verbs).size > 1;
+}
+
 function createAgentState(goal, options = {}) {
   return {
+    _multiStep: isMultiStepGoal(goal),
     id: `agent-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
     goal,
     status: AgentStatus.RUNNING,
@@ -69,6 +86,8 @@ function createAgentState(goal, options = {}) {
     },
     toolset: [],
     history: [],
+    recentHistory: options.recentHistory || [],  // recent conversation turns for context
+    recentArtifacts: options.recentArtifacts || [],  // exact paths/ids from recent turns
     memoryFilter: options.memoryFilter || null,
     created_at: new Date().toISOString(),
     updated_at: new Date().toISOString(),
@@ -105,11 +124,14 @@ async function observe(state) {
       state.last_result
     );
 
-    // VALIDATION MODE: restrict memory to facts only — no workflows/agent actions
+    // Only inject DURABLE context (preferences, constraints, facts) into decisions.
+    // We deliberately exclude WORKFLOW / AGENT_ACTION / WARNING: feeding "you already
+    // completed this task" or "you successfully used calendar_ops" made her STOP and
+    // claim success without actually performing the current request. Each request must
+    // be executed fresh.
     const memoryTypes = state.memoryFilter === 'facts_only'
       ? [MemoryType.FACT, MemoryType.PREFERENCE, MemoryType.CONSTRAINT]
-      : [MemoryType.PREFERENCE, MemoryType.WORKFLOW, MemoryType.CONSTRAINT,
-         MemoryType.FACT, MemoryType.WARNING, MemoryType.AGENT_ACTION];
+      : [MemoryType.PREFERENCE, MemoryType.CONSTRAINT, MemoryType.FACT];
 
     if (state.memoryFilter === 'facts_only') {
       logger.info('[agent] Memory filter: facts_only (validation mode — no workflows/warnings/agent_actions)');
@@ -172,9 +194,17 @@ async function observe(state) {
  * Phase 5: Uses formatted memory from observations
  */
 function buildDecisionPrompt(state, observations) {
-  const toolDescriptions = state.toolset.map(t => 
-    `- ${t.name}: ${t.description}${t.requires_confirm ? ' [REQUIRES confirmed:true]' : ''}${t.risk_level === 'high' ? ' [HIGH RISK]' : ''}`
-  ).join('\n');
+  const toolDescriptions = state.toolset.map(t => {
+    // Surface each tool's valid actions so the model uses real action names instead
+    // of guessing (e.g. calendar_ops "get_today", not an invented "check_today").
+    let actionsHint = '';
+    try {
+      const props = t.schema && t.schema.properties;
+      const enumVals = props && ((props.action && props.action.enum) || (props.operation && props.operation.enum));
+      if (Array.isArray(enumVals) && enumVals.length) actionsHint = ` — set args.action to one of: ${enumVals.join(', ')}`;
+    } catch (e) { /* no schema */ }
+    return `- ${t.name}: ${t.description}${actionsHint}${t.requires_confirm ? ' [REQUIRES confirmed:true]' : ''}${t.risk_level === 'high' ? ' [HIGH RISK]' : ''}`;
+  }).join('\n');
 
   const memoryContext = observations.memory_prompt || '';
 
@@ -196,9 +226,32 @@ function buildDecisionPrompt(state, observations) {
     ? `\nPENDING CONFIRMATION: Tool "${state.current_context.pending_confirmation.tool}" needs confirmed:true in args. User said: "${state.current_context.user_response || 'waiting'}"`
     : '';
 
-  return `You are AVA, an intelligent assistant executing a task step by step.
+  const _now = new Date();
+  const _tz = (Intl.DateTimeFormat().resolvedOptions().timeZone) || 'local time';
+  const _offMin = -_now.getTimezoneOffset();
+  const _sign = _offMin >= 0 ? '+' : '-';
+  const _abs = Math.abs(_offMin);
+  const _offStr = `${_sign}${String(Math.floor(_abs / 60)).padStart(2, '0')}:${String(_abs % 60).padStart(2, '0')}`;
+  const nowStr = _now.toLocaleString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric', hour: 'numeric', minute: '2-digit' });
+  const recentContext = (Array.isArray(state.recentHistory) && state.recentHistory.length)
+    ? `\nRECENT CONVERSATION (REFERENCE ONLY — use it to resolve what "yes"/"it"/"that file"/"the one you just made"/"the load" refer to; your ACTUAL task is the GOAL above, do exactly that and nothing else from here):\n${state.recentHistory.slice(-6).map(h => `${((h.direction || h.role) === 'assistant') ? 'AVA' : 'User'}: ${String(h.content || '').slice(0, 200)}`).join('\n')}\n`
+    : '';
+  const artifactContext = (Array.isArray(state.recentArtifacts) && state.recentArtifacts.length)
+    ? `\nRECENT FILES/ITEMS you just created or used — when the user refers to "it", "that file", "the screenshot/picture you just took", "the one you made", use the EXACT value below (do NOT ask the user for a name/path that's listed here):\n${state.recentArtifacts.map(a => `- ${a.kind}: ${a.value}`).join('\n')}\n`
+    : '';
+  const _mem = curatedMemory.buildMemoryBlock();
+  let _skills = '';
+  try { _skills = skillStore.buildSkillsIndex(); } catch { /* optional */ }
+  let _guide = '';
+  try { _guide = trainingGuidance.buildGuidanceBlock(); } catch { /* optional */ }
+  return `${persona.buildPersonaPreamble()}${_mem ? '\n\n' + _mem : ''}${_skills ? '\n\n' + _skills : ''}${_guide ? '\n\n' + _guide : ''}
+
+You are AVA, executing a task step by step. The personality above shapes only the words you SPEAK to the user — it never changes which tool you pick, and never lets you fake or over-claim a result.
 
 GOAL: ${state.goal}
+${recentContext}${artifactContext}
+
+CURRENT DATE & TIME: ${nowStr} (timezone ${_tz}, UTC${_offStr}). Use this to resolve "today", "tonight", "tomorrow", "this week", "next Monday", etc. — never assume a date from training data. When specifying event start/end times, use full ISO 8601 WITH this offset, e.g. ${_now.getFullYear()}-06-24T15:00:00${_offStr}.
 
 CURRENT STATE:
 - Step: ${state.step_count + 1} of ${state.step_limit}
@@ -232,7 +285,12 @@ CRITICAL RULES:
 5. **IMPORTANT**: Tools marked [REQUIRES confirmed:true] MUST have {"confirmed": true} in args
 6. If last result was "needs_confirm" and user confirmed, retry with confirmed:true in args
 7. The open_item tool uses "target" not "path" for its argument
-8. **USE MEMORY**: If RELEVANT_MEMORY contains useful info, apply it to your decision
+8. ACTION FORMAT: when a tool shows "set args.action to one of: ...", keep the tool name EXACTLY as given and put the chosen action INSIDE args, e.g. {"tool":"comm_ops","args":{"action":"read_emails"}}. NEVER append the action to the tool name (not "comm_ops.read_emails") and NEVER pass it as a boolean key (not {"get_today":true}).
+9. Do NOT repeat the same tool call with the same args. Once a tool has returned the information you need, choose "stop" and give the answer.
+10. **USE MEMORY** for preferences, constraints, and facts only. Memory is NOT proof that the current request is already done — even if you "previously" did something similar, you must actually call the tool to fulfill THIS request before you "stop".
+11. **NEVER claim success for an action you did not actually perform this turn.** To create/update/delete/send anything, you MUST call the relevant tool and see a successful result in THIS run before stopping with success:true. If you only looked something up or nothing executed, do not say you did it.
+12. **SCOPE — do ONLY what the GOAL explicitly asks; then STOP.** Do NOT add unrequested follow-up actions. If asked to "take a screenshot", do NOT also open it. If asked to "create/save a file", do NOT also open or read it. If asked to "send an email", do NOT also read the inbox. As soon as the user's explicit request is satisfied by ONE successful tool result, choose "stop" — do not keep acting "to be helpful".
+13. **RECALL — if the GOAL asks what was previously discussed/decided/said (e.g. "what did we discuss about X"), call memory_search with the key topic as the query (do NOT ask the user to narrow it down first). Only after a search returns nothing relevant should you ask for more detail.**
 
 What is your next action?`;
 }
@@ -288,9 +346,21 @@ async function decide(state, observations) {
     }
 
     const decision = JSON.parse(jsonStr);
-    
+
+    // Tolerant recovery: the model sometimes puts the TOOL NAME in `decision`
+    // (e.g. decision:"memory_search") instead of decision:"tool_call", tool:"memory_search".
+    // Coerce that into a proper tool_call rather than hard-failing the whole step.
     if (!decision.decision || !Object.values(DecisionType).includes(decision.decision)) {
-      throw new Error(`Invalid decision type: ${decision.decision}`);
+      if (decision.decision && !decision.tool && /^[a-z_][a-z0-9_]*$/i.test(decision.decision)) {
+        decision.tool = decision.decision;
+        decision.decision = DecisionType.TOOL_CALL;
+        logger.warn('[agent] Coerced tool-name decision into tool_call', { tool: decision.tool });
+      } else if (decision.tool) {
+        decision.decision = DecisionType.TOOL_CALL;
+        logger.warn('[agent] Invalid decision type but tool present; assuming tool_call', { tool: decision.tool });
+      } else {
+        throw new Error(`Invalid decision type: ${decision.decision}`);
+      }
     }
 
     logger.info('[agent] Decision made', { 
@@ -396,6 +466,24 @@ async function act(state, decision) {
           action.args.confirm = true;
         }
 
+        // Anti-spin: if this exact tool + executed args already ran this loop, reuse
+        // the prior result and stop, instead of running it again (prevents spins like
+        // open_item being executed 7+ times).
+        const _execSig = JSON.stringify(action.args || {});
+        const _priorRun = (state.history || []).find(h => {
+          const ht = h && ((h.decision && h.decision.tool) || (h.action && h.action.tool));
+          const ha = h && h.action && h.action.args;
+          return ht === decision.tool && JSON.stringify(ha || {}) === _execSig && h.result;
+        });
+        if (_priorRun) {
+          result = _priorRun.result || { status: 'ok', message: 'Already done a moment ago.' };
+          const _spinOk = String(result.status || '').toLowerCase() === 'ok';
+          state.status = _spinOk ? AgentStatus.SUCCESS : AgentStatus.FAILED;
+          state.final_result = state.final_result || result.message || (_spinOk ? 'Done.' : 'I could not complete that.');
+          logger.info('[agent] Anti-spin: repeated tool+args, reusing prior result', { tool: decision.tool });
+          break;
+        }
+
         logger.info('[agent] Executing tool', { tool: decision.tool, args: action.args });
         const toolResult = await toolsService.executeTool(decision.tool, action.args);
         result = toolResult.result || toolResult;
@@ -440,6 +528,17 @@ async function act(state, decision) {
       timestamp: new Date().toISOString()
     });
     state.consecutive_errors++;
+    // Error -> lesson: distill a preventive lesson into memory in the background
+    // (non-blocking) so the same failure doesn't recur.
+    try {
+      if (decision.tool && process.env.AVA_SANDBOX !== '1') {
+        setTimeout(() => {
+          lessonLearner.lessonFromError({
+            tool: decision.tool, args: decision.args, error: result.message, goal: state.goal,
+          }).catch(() => {});
+        }, 50);
+      }
+    } catch { /* never block */ }
   } else if (result.status !== 'needs_confirm') {
     state.consecutive_errors = 0;
   }
@@ -508,13 +607,11 @@ async function record(state, observations, decision, actionResult) {
     
     if (state.errors.length > 0 && actionResult.result?.status === 'error') {
       const lastError = state.errors[state.errors.length - 1];
-      await memoryService.store({
-        text: `Warning: ${decision.tool || 'action'} failed with: ${lastError.message}. Avoid this approach for: ${state.goal.slice(0, 50)}`,
-        type: MemoryType.WARNING,
-        priority: 4,
-        source: MemorySource.LEARNED,
-        tags: ['warning', 'error', decision.tool || 'unknown']
-      });
+      // NOTE: we deliberately do NOT store an "Avoid this approach" WARNING memory
+      // here. Doing so made transient failures (an expired token, a one-off bad arg)
+      // permanently poison future decisions, so she'd refuse tools that actually work.
+      // Failures are still tracked for diagnostics below, just not fed back as
+      // decision-blocking memory.
 
       // Track issue for Moltbook help
       try {
@@ -582,10 +679,12 @@ async function record(state, observations, decision, actionResult) {
       });
     }
 
-    // Automatic learning: store constraints on denials/whitelist/confirmation issues
-    const denialLike = status === 'denied' || /not in whitelist|requires confirmation|confirmation required|blocked|forbidden/i.test(message);
-    const errorLike = status === 'error' && /whitelist|confirm|not found|not a directory|missing/i.test(message);
-    if ((denialLike || errorLike) && toolName) {
+    // Automatic learning: only capture the genuinely useful "this tool needs
+    // confirmation" constraint. We intentionally do NOT store error / not-found /
+    // auth / missing messages as constraints — that made transient failures
+    // permanently block her from retrying tools that actually work.
+    const needsConfirmConstraint = /requires confirmation|confirmation required|confirmed:\s*true/i.test(message);
+    if (needsConfirmConstraint && toolName) {
       await memoryService.store({
         text: `Constraint detected while using ${toolName}: ${message.slice(0, 240)} (goal: ${state.goal.slice(0, 100)})`,
         type: MemoryType.CONSTRAINT,
@@ -638,8 +737,40 @@ async function runAgentLoop(goal, options = {}) {
 
       const observations = await observe(state);
       const decision = await decide(state, observations);
+
+      // Anti-spin guard: if the model picks a tool+args it ALREADY ran this loop, do
+      // NOT re-run it — stop and use the prior result. Prevents the loop from calling
+      // the same action repeatedly (e.g. open_item 7+ times) and burning all steps.
+      if (decision && decision.decision === 'tool_call' && decision.tool) {
+        const _sig = JSON.stringify(decision.args || {});
+        const _prior = [...(state.history || [])].reverse().find(h => {
+          const ht = h && ((h.decision && h.decision.tool) || (h.action && h.action.tool));
+          const ha = (h && h.action && h.action.args) || (h && h.decision && h.decision.args) || {};
+          return ht === decision.tool && JSON.stringify(ha) === _sig;
+        });
+        if (_prior && _prior.result) {
+          const _ok = String(_prior.result.status || '').toLowerCase() === 'ok';
+          state.last_result = _prior.result;
+          state.status = _ok ? AgentStatus.SUCCESS : AgentStatus.FAILED;
+          state.final_result = state.final_result || (_ok ? (_prior.result.message || 'Done.') : (_prior.result.message || 'I could not complete that.'));
+          logger.info('[agent] Anti-spin: repeated tool+args, stopping with prior result', { tool: decision.tool });
+          break;
+        }
+      }
+
       const actionResult = await act(state, decision);
       await record(state, observations, decision, actionResult);
+
+      // Scope: a single-action goal stops after the FIRST successful tool result, so the
+      // loop doesn't tack on unrequested follow-up actions (e.g. take screenshot THEN open).
+      if (!state._multiStep && decision && decision.decision === 'tool_call'
+          && actionResult && actionResult.result
+          && String(actionResult.result.status).toLowerCase() === 'ok') {
+        state.status = AgentStatus.SUCCESS;
+        if (!state.final_result) state.final_result = actionResult.result.message || 'Done.';
+        logger.info('[agent] Scope: single-action complete, stopping', { goal: String(state.goal).slice(0, 40) });
+        break;
+      }
 
       if (state.status === AgentStatus.WAITING_USER) {
         logger.info('[agent] Waiting for user input', { question: decision.question });
@@ -661,12 +792,28 @@ async function runAgentLoop(goal, options = {}) {
     });
   }
 
-  logger.info('[agent] Loop complete', { 
-    id: state.id, 
-    status: state.status, 
+  logger.info('[agent] Loop complete', {
+    id: state.id,
+    status: state.status,
     steps: state.step_count,
     errors: state.errors.length
   });
+
+  // Autonomous skill capture: after a SUCCESSFUL, multi-step task, distill a reusable
+  // skill in the background (non-blocking, guarded). Single-step tasks are too trivial.
+  try {
+    if (process.env.AVA_SKILL_CAPTURE_OFF !== '1'
+        && process.env.AVA_SANDBOX !== '1'
+        && state.status === AgentStatus.SUCCESS
+        && (state.step_count || 0) >= 3) {
+      const transcript = (state.history || [])
+        .map((h) => `${(h.type || 'step')}: ${JSON.stringify(h).slice(0, 300)}`)
+        .slice(-20).join('\n');
+      setTimeout(() => {
+        skillCapture.reviewAndCapture({ goal: state.goal, transcript }).catch(() => {});
+      }, 50);
+    }
+  } catch { /* never block the result */ }
 
   return state;
 }
@@ -698,8 +845,40 @@ async function runAgentLoopFromState(state) {
 
       const observations = await observe(state);
       const decision = await decide(state, observations);
+
+      // Anti-spin guard: if the model picks a tool+args it ALREADY ran this loop, do
+      // NOT re-run it — stop and use the prior result. Prevents the loop from calling
+      // the same action repeatedly (e.g. open_item 7+ times) and burning all steps.
+      if (decision && decision.decision === 'tool_call' && decision.tool) {
+        const _sig = JSON.stringify(decision.args || {});
+        const _prior = [...(state.history || [])].reverse().find(h => {
+          const ht = h && ((h.decision && h.decision.tool) || (h.action && h.action.tool));
+          const ha = (h && h.action && h.action.args) || (h && h.decision && h.decision.args) || {};
+          return ht === decision.tool && JSON.stringify(ha) === _sig;
+        });
+        if (_prior && _prior.result) {
+          const _ok = String(_prior.result.status || '').toLowerCase() === 'ok';
+          state.last_result = _prior.result;
+          state.status = _ok ? AgentStatus.SUCCESS : AgentStatus.FAILED;
+          state.final_result = state.final_result || (_ok ? (_prior.result.message || 'Done.') : (_prior.result.message || 'I could not complete that.'));
+          logger.info('[agent] Anti-spin: repeated tool+args, stopping with prior result', { tool: decision.tool });
+          break;
+        }
+      }
+
       const actionResult = await act(state, decision);
       await record(state, observations, decision, actionResult);
+
+      // Scope: a single-action goal stops after the FIRST successful tool result, so the
+      // loop doesn't tack on unrequested follow-up actions (e.g. take screenshot THEN open).
+      if (!state._multiStep && decision && decision.decision === 'tool_call'
+          && actionResult && actionResult.result
+          && String(actionResult.result.status).toLowerCase() === 'ok') {
+        state.status = AgentStatus.SUCCESS;
+        if (!state.final_result) state.final_result = actionResult.result.message || 'Done.';
+        logger.info('[agent] Scope: single-action complete, stopping', { goal: String(state.goal).slice(0, 40) });
+        break;
+      }
 
       state.current_context.user_response = null;
 

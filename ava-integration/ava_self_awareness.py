@@ -26,7 +26,13 @@ class AVASelfAwareness:
     
     def __init__(self):
         self.home = Path.home()
-        self.integration_path = self.home / "ava-integration"
+        # Resolve the LIVE integration dir (honor launcher env, prefer nested ~/ava/...).
+        _env_int = os.getenv("AVA_INTEGRATION_DIR")
+        _int_candidates = ([Path(_env_int)] if _env_int else []) + [
+            self.home / "ava" / "ava-integration",
+            self.home / "ava-integration",
+        ]
+        self.integration_path = next((p for p in _int_candidates if p.exists()), _int_candidates[0])
         self.cmpuse_path = self.home / ".cmpuse"
         self.memory_db = self.cmpuse_path / "ava_memory.db"
         self.learning_db = self.cmpuse_path / "learning.db"
@@ -455,6 +461,23 @@ class AVASelfAwareness:
             "ready": sum(1 for s in tool_status.values() if s == "ready"),
             "needs_config": sum(1 for s in tool_status.values() if s != "ready")
         }
+        # Plain-language summary of what AVA can actually do (for spoken diagnosis answers).
+        _cap_map = {
+            "camera_ops": "see through the camera and describe what's in front of it",
+            "vision_ops": "read your screen and images",
+            "comm_ops": "read and send email",
+            "calendar_ops": "check and manage your calendar",
+            "fs_ops": "find, read, and write files",
+            "sys_ops": "check system information",
+            "browser_automation": "browse and automate the web",
+            "iot_ops": "control smart-home devices",
+            "voice_ops": "speak aloud",
+            "open_item": "open files, apps, and websites",
+            "window_ops": "manage app windows",
+            "self_awareness": "inspect and diagnose myself",
+        }
+        _caps = [v for k, v in _cap_map.items() if k in tools]
+        diagnosis["capability_summary"] = ("I can " + "; ".join(_caps) + ".") if _caps else ""
         
         # Check databases
         if self.memory_db.exists():

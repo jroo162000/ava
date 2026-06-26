@@ -1,5 +1,9 @@
 # AVA Realtime Voice Chat - Complete Guide
 
+> Status note (March 20, 2026): This document describes the legacy OpenAI Realtime prototype in `realtime_voice_chat.py`.
+> The canonical current voice runtime in this repo is the local unified path in `C:\Users\USER 1\ava\ava-integration\ava_standalone_realtime.py`.
+> Launch from this repo with `start_ava_standalone_realtime.bat` or `start_validation_mode.bat`. Do not treat `C:\Users\USER 1\ava-integration` as the default working tree.
+
 **Date**: December 14, 2025
 **Status**: ✅ Production Ready
 **Model**: gpt-4o-realtime-preview
@@ -28,14 +32,14 @@ AVA Realtime Voice Chat enables natural, bidirectional voice conversations with 
 
 ### Method 1: Double-click Launcher
 ```
-1. Navigate to: C:\Users\USER 1\ava-integration\
+1. Navigate to: C:\Users\USER 1\ava\ava-integration\
 2. Double-click: start_realtime_voice.bat
 3. Start talking to AVA!
 ```
 
 ### Method 2: Command Line
 ```bash
-cd "C:\Users\USER 1\ava-integration"
+cd "C:\Users\USER 1\ava\ava-integration"
 python realtime_voice_chat.py
 ```
 

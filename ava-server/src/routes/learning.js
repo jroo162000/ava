@@ -136,7 +136,7 @@ router.get('/self/explain', async (_req, res) => {
     // Identity from ava_identity.json if present
     let identity = { name: 'AVA', purpose: 'personal assistant' };
     try {
-      const idPath = path.default.join(os.homedir(), 'ava-integration', 'ava_identity.json');
+      const idPath = path.default.join(config.AVA_INTEGRATION_DIR || path.default.join(os.homedir(), 'ava-integration'), 'ava_identity.json');
       if (fs.default.existsSync(idPath)) {
         identity = JSON.parse(fs.default.readFileSync(idPath, 'utf8')) || identity;
       }

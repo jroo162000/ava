@@ -13,7 +13,7 @@ import moltbookService from './moltbook.js';
 // Load AVA identity if available
 function loadIdentity() {
   try {
-    const identityPath = path.join(os.homedir(), 'ava-integration', 'ava_identity.json');
+    const identityPath = path.join(config.AVA_INTEGRATION_DIR || path.join(os.homedir(), 'ava-integration'), 'ava_identity.json');
     if (fs.existsSync(identityPath)) {
       return JSON.parse(fs.readFileSync(identityPath, 'utf8'));
     }

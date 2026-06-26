@@ -1,3 +1,5 @@
+> Historical note (March 20, 2026): absolute paths in this archive may refer to the older sibling shadow checkout. The canonical AVA tree is `C:\Users\USER 1\ava\ava-integration`.
+
 # AVA Development Session Summary
 ## Date: December 28, 2025
 ## Session Focus: Feature Integration, Local Fallback, and Bug Fixes

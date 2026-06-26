@@ -13,6 +13,7 @@ Protocol:
 
 import sys
 import json
+import os
 import traceback
 import inspect
 from pathlib import Path
@@ -20,8 +21,17 @@ from typing import Any, Dict, List, Optional
 
 # Add paths
 home = Path.home()
-sys.path.insert(0, str(home / "ava-integration"))
-sys.path.insert(0, str(home / "cmp-use"))
+integration_dir = Path(os.environ.get("AVA_INTEGRATION_DIR") or Path(__file__).resolve().parent)
+cmpuse_candidates = [
+    Path(os.environ["CMPUSE_DIR"]) if os.environ.get("CMPUSE_DIR") else None,
+    integration_dir.parent / "cmp-use",
+    home / "cmp-use",
+]
+sys.path.insert(0, str(integration_dir))
+for candidate in cmpuse_candidates:
+    if candidate and candidate.exists():
+        sys.path.insert(0, str(candidate))
+        break
 
 # Import AVA modules (do this once at startup)
 try:
@@ -43,21 +53,53 @@ except ImportError as e:
     SELF_MOD_ERROR = str(e)
 
 try:
-    from ava_passive_learning import get_passive_learning_engine
+    # Module exposes get_passive_learning(); alias to the name the worker expects.
+    from ava_passive_learning import get_passive_learning as get_passive_learning_engine
     PASSIVE_LEARNING_AVAILABLE = True
 except ImportError as e:
     PASSIVE_LEARNING_AVAILABLE = False
     PASSIVE_LEARNING_ERROR = str(e)
 
-# Import cmp-use tool registry
+# Import cmp-use tool registry SYNCHRONOUSLY, with the worker's stdout/stderr file
+# descriptors redirected to NUL during the import.
+#
+# Why: cmp-use pulls in cv2 / mediapipe / tqdm etc., which print progress to fd 1/2,
+# often with carriage returns and no newline. When this worker's stdout is a PIPE
+# read line-by-line by the Node server, that output never forms a complete line, the
+# pipe buffer fills, and the import DEADLOCKS. (It only worked standalone because
+# stdout was a file.) Redirecting the fds to NUL during the import avoids the flood.
+# The server waits for the "ready" line with no timeout and uses a long tool-fetch
+# timeout + startup pre-warm, so a slow-but-reliable synchronous import is fine.
+import os as _os_imp
+tool_registry = None
+cmpuse_tools = None
+CMPUSE_AVAILABLE = False
+CMPUSE_ERROR = ""
+_devnull_fd = _os_imp.open(_os_imp.devnull, _os_imp.O_WRONLY)
+_saved_out_fd = _os_imp.dup(1)
+_saved_err_fd = _os_imp.dup(2)
 try:
-    from cmpuse import tool_registry
-    # Import all tools to ensure they're registered
-    from cmpuse import tools as cmpuse_tools
-    CMPUSE_AVAILABLE = True
-except ImportError as e:
-    CMPUSE_AVAILABLE = False
-    CMPUSE_ERROR = str(e)
+    _os_imp.dup2(_devnull_fd, 1)
+    _os_imp.dup2(_devnull_fd, 2)
+    try:
+        from cmpuse import tool_registry as _tr
+        from cmpuse import tools as _tools  # importing registers all tools
+        tool_registry = _tr
+        cmpuse_tools = _tools
+        CMPUSE_AVAILABLE = True
+    except Exception as e:
+        CMPUSE_AVAILABLE = False
+        CMPUSE_ERROR = str(e)
+finally:
+    _os_imp.dup2(_saved_out_fd, 1)
+    _os_imp.dup2(_saved_err_fd, 2)
+    _os_imp.close(_devnull_fd)
+    _os_imp.close(_saved_out_fd)
+    _os_imp.close(_saved_err_fd)
+
+def _ensure_cmpuse(timeout=120):
+    """cmp-use is imported synchronously at startup; no-op kept for call sites."""
+    return CMPUSE_AVAILABLE
 
 
 # ========== Tool Discovery ==========
@@ -300,13 +342,39 @@ def infer_json_schema(tool_name: str) -> Dict[str, Any]:
         }
     }
     
-    # Return specific schema or generic fallback
-    return schemas.get(tool_name, {
+    # Explicit schema if we have one
+    if tool_name in schemas:
+        return schemas[tool_name]
+
+    # Otherwise auto-derive the valid 'action' values straight from the tool's source
+    # so the model uses real action names instead of guessing. General and
+    # maintenance-free: works for every cmp-use tool that branches on an action.
+    try:
+        import inspect, re as _re
+        tool = tool_registry.get_tool(tool_name) if tool_registry else None
+        run_fn = getattr(tool, 'run', None)
+        mod = inspect.getmodule(run_fn) if run_fn else None
+        src = inspect.getsource(mod) if mod else ''
+        actions = sorted(set(_re.findall(r'action\s*==\s*["\']([A-Za-z0-9_]+)["\']', src)))
+        if actions:
+            return {
+                'type': 'object',
+                'properties': {
+                    'action': {'type': 'string', 'enum': actions,
+                               'description': f'The {tool_name} action to perform'}
+                },
+                'required': ['action']
+            }
+    except Exception:
+        pass
+
+    # Generic fallback
+    return {
         'type': 'object',
         'properties': {
             'args': {'type': 'object', 'description': 'Tool-specific arguments'}
         }
-    })
+    }
 
 
 def get_tool_definitions() -> List[Dict[str, Any]]:
@@ -315,10 +383,11 @@ def get_tool_definitions() -> List[Dict[str, Any]]:
     Returns standardized tool definitions for LLM function calling.
     """
     tools = []
-    
+    _ensure_cmpuse()
+
     if not CMPUSE_AVAILABLE:
         return tools
-    
+
     try:
         registry = tool_registry.list_tools()
         
@@ -366,6 +435,7 @@ def execute_tool(name: str, args: Dict[str, Any], dry_run: bool = False) -> Dict
     INTERNAL: This is called by Node boundary layer AFTER validation.
     Python components must NOT call this directly - use Node /tools/:name/execute.
     """
+    _ensure_cmpuse()
     if not CMPUSE_AVAILABLE:
         return {'status': 'error', 'message': f'cmp-use not available: {CMPUSE_ERROR}'}
 
@@ -396,6 +466,7 @@ def handle_command(cmd_data: dict) -> dict:
             name = cmd_data.get("name", "")
             if not name:
                 return {"ok": False, "error": "Tool name required"}
+            _ensure_cmpuse()
             if not CMPUSE_AVAILABLE:
                 return {"ok": False, "error": f"cmp-use not available: {CMPUSE_ERROR}"}
             tool = tool_registry.get_tool(name)
@@ -524,13 +595,13 @@ def handle_command(cmd_data: dict) -> dict:
 
 def main():
     """Main loop - read commands from stdin, write responses to stdout"""
-    # Count tools at startup
+    # cmp-use was imported synchronously above (with fds isolated), so the registry
+    # is fully populated by the time we get here.
     tool_count = len(get_tool_definitions()) if CMPUSE_AVAILABLE else 0
-    
-    # Signal ready
+
     print(json.dumps({
-        "ok": True, 
-        "status": "ready", 
+        "ok": True,
+        "status": "ready",
         "modules": {
             "self_awareness": SELF_AWARENESS_AVAILABLE,
             "self_modification": SELF_MOD_AVAILABLE,
@@ -539,7 +610,30 @@ def main():
         },
         "tools_available": tool_count
     }), flush=True)
-    
+
+    # Background pre-warm: import the heavy Google / psutil libraries NOW so the first
+    # real calendar/email/system tool call is fast (~2-5s) and finishes within the
+    # voice runner's HTTP timeout, instead of paying a ~20-30s one-time import then.
+    # Only warms quiet libraries (NOT cv2/mediapipe), so it won't print to stdout and
+    # corrupt the JSON stdio protocol.
+    def _prewarm():
+        try:
+            reg = tool_registry.list_tools() if CMPUSE_AVAILABLE else {}
+            for _nm in ("comm_ops", "calendar_ops", "sys_ops"):
+                try:
+                    _t = reg.get(_nm)
+                    if _t:
+                        _t.run({}, True)  # dry_run=True triggers the lazy import, no real action
+                except Exception:
+                    pass
+        except Exception:
+            pass
+    try:
+        import threading as _threading
+        _threading.Thread(target=_prewarm, daemon=True).start()
+    except Exception:
+        pass
+
     # Process commands
     for line in sys.stdin:
         line = line.strip()

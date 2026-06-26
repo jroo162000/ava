@@ -7,6 +7,7 @@ import path from 'path';
 import fs from 'fs';
 import os from 'os';
 import logger from '../utils/logger.js';
+import config from '../utils/config.js';
 
 class PythonWorker {
   constructor() {
@@ -21,8 +22,8 @@ class PythonWorker {
   }
 
   spawn() {
-    const home = os.homedir();
-    const workerScript = path.join(home, 'ava-integration', 'ava_python_worker.py');
+    const integrationDir = config.AVA_INTEGRATION_DIR || path.join(os.homedir(), 'ava-integration');
+    const workerScript = path.join(integrationDir, 'ava_python_worker.py');
 
     if (!fs.existsSync(workerScript)) {
       logger.warn('[python-worker] Worker script not found', { path: workerScript });
@@ -32,7 +33,7 @@ class PythonWorker {
     try {
       this.worker = spawn('python', [workerScript], {
         stdio: ['pipe', 'pipe', 'pipe'],
-        cwd: path.join(home, 'ava-integration')
+        cwd: integrationDir
       });
 
       const rl = readline.createInterface({ input: this.worker.stdout });
@@ -43,6 +44,14 @@ class PythonWorker {
             this.ready = true;
             this.modules = response.modules || {};
             logger.info('[python-worker] Ready', { modules: Object.keys(this.modules) });
+            // Pre-warm the tool registry so the slow cmp-use import (60-90s, pulls in
+            // cv2/mediapipe/etc.) completes at startup and gets cached, instead of
+            // timing out on the user's first request and falling back to built-ins only.
+            setTimeout(() => {
+              this.listTools(true)
+                .then(t => logger.info('[python-worker] Pre-warmed tools', { count: (t || []).length }))
+                .catch(e => logger.warn('[python-worker] Pre-warm failed', { error: e.message }));
+            }, 100);
             return;
           }
           if (response._requestId !== undefined) {
@@ -138,7 +147,7 @@ class PythonWorker {
       return this.toolsCache;
     }
     try {
-      const response = await this.sendCommand('list_tools', {}, 15000);
+      const response = await this.sendCommand('list_tools', {}, 120000);
       if (response.ok && response.tools) {
         this.toolsCache = response.tools;
         this.toolsCacheTime = now;
@@ -147,14 +156,21 @@ class PythonWorker {
       }
       logger.warn('[python-worker] list_tools returned unexpected format', { response });
     } catch (e) {
+      if (String(e.message || '').includes('Python worker not ready')) {
+        logger.info('[python-worker] list_tools deferred; worker not ready');
+        return this.toolsCache || [];
+      }
       logger.warn('[python-worker] list_tools failed', { error: e.message });
     }
     return this.toolsCache || [];
   }
 
-  // Execute a tool via Python
+  // Execute a tool via Python. Timeout is generous (90s): the FIRST call to a
+  // Google-backed tool pays a one-time ~30s library import, and a too-short timeout
+  // made Node think the call failed and retry — which, for sends, fired duplicate
+  // emails. Better to wait once than to send twice.
   async executeTool(name, args, dryRun = false) {
-    return this.sendCommand('execute_tool', { name, args, dry_run: dryRun }, 30000);
+    return this.sendCommand('execute_tool', { name, args, dry_run: dryRun }, 90000);
   }
 
   // Get a specific tool definition

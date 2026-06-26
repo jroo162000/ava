@@ -125,7 +125,7 @@ AVA's `calendar_ops` and `comm_ops` tools require Google OAuth 2.0 credentials t
 
 1. Run the test script:
    ```batch
-   cd "C:\Users\USER 1\ava-integration"
+   cd "C:\Users\USER 1\ava\ava-integration"
    python test_google_services.py
    ```
 
@@ -202,7 +202,7 @@ The Calendar credentials can be used for both APIs:
 
 1. Run the test script:
    ```batch
-   cd "C:\Users\USER 1\ava-integration"
+   cd "C:\Users\USER 1\ava\ava-integration"
    python test_google_services.py
    ```
 
@@ -344,7 +344,7 @@ comm_ops → action: mark_read, message_id: "..."
 
 **Test Command**:
 ```batch
-cd "C:\Users\USER 1\ava-integration"
+cd "C:\Users\USER 1\ava\ava-integration"
 python test_google_services.py
 ```
 

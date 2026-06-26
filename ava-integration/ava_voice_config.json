@@ -7,11 +7,58 @@
   "audio": {
     "playback_rate": 44100,
     "output_device": null,
-    "input_device": null,
-    "input_device_name": "Microphone (2- iTalk-02)",
-    "input_backend": "wasapi",
-    "input_sample_rate": 48000,
-    "input_channels": 1
+    "input_device": 1,
+    "input_device_name": "Headset Microphone (Logitech H5)",
+    "input_backend": "mme",
+    "input_sample_rate": 44100,
+    "input_channels": 1,
+    "output_device_name": "Microsoft Sound Mapper - Output",
+    "input_device_preferences": [
+      "headset",
+      "usb",
+      "microphone"
+    ],
+    "input_device_avoid": [
+      "microsoft sound mapper",
+      "primary sound capture driver",
+      "stereo mix",
+      "what u hear",
+      "loopback",
+      "webcam",
+      "c920e"
+    ],
+    "max_idle_rms": 1000,
+    "min_live_rms": 20,
+    "calibration": {
+      "state_path": "logs/voice_calibration.json",
+      "prefer_saved_pair": true
+    },
+    "loopback_probe": {
+      "enabled": false,
+      "validation_only": true,
+      "input_only": true,
+      "top_candidates": 4,
+      "tone_hz": 880.0,
+      "tone_ms": 180,
+      "amplitude": 18000,
+      "pre_roll_sec": 0.1,
+      "post_roll_sec": 0.25,
+      "min_peak_rms": 1200,
+      "cooldown_sec": 0.08,
+      "mode": "speech",
+      "speech_text": "Hey Ava say hello there",
+      "speech_match_min": 0.45,
+      "speech_calibration_min": 0.6,
+      "require_speech_calibration": true,
+      "allow_failed_calibration_fallback": false,
+      "fail_closed_without_calibration": false,
+      "speech_model": "tiny.en",
+      "speech_frame_ms": 20
+    },
+    "input_device_blocklist": [
+      "webcam",
+      "c920e"
+    ]
   },
   "vad": {
     "start_rms": 60,
@@ -22,19 +69,31 @@
   "local_fallback": {
     "tts_engine": "piper",
     "edge_voice": "en-US-MichelleNeural",
-    "whisper_model": "small",
+    "whisper_model": "tiny.en",
     "auto_switch": true,
     "force_local": true,
     "piper": {
       "exe": "C:/Users/USER 1/ava/ava-integration/vendor/piper/piper.exe",
-      "model": "C:/Users/USER 1/ava/ava-integration/vendor/piper/models/en_US-lessac-medium.onnx"
+      "model": "C:/Users/USER 1/ava/ava-integration/vendor/piper/models/ava_vella.onnx"
     }
+  },
+  "elevenlabs": {
+    "enabled": true,
+    "voice_id": "C87xFko6mfAf2uYY3Rdr",
+    "api_key_env": "ELEVENLABS_API_KEY",
+    "model_id": "eleven_flash_v2_5",
+    "output_format": "pcm_24000",
+    "stability": 0.5,
+    "similarity_boost": 0.75,
+    "style": 0.0,
+    "comment": "PRIMARY voice = 'Vella' instant clone (ElevenLabs). Used first when the ELEVENLABS_API_KEY env var is set; the offline fallback is now the locally-trained Piper 'Vella' (ava_vella.onnx, 295-epoch fine-tune). voice_id from the ElevenLabs dashboard."
   },
   "asr": {
     "utterance": {
-      "max_utterance_sec": 6,
-      "end_silence_ms": 300,
-      "min_speech_ms": 250
+      "max_utterance_sec": 300,
+      "end_silence_ms": 1500,
+      "min_speech_ms": 250,
+      "comment": "max_utterance_sec is a safety cap only; your turn ends naturally when you stop talking for end_silence_ms. Raised so the mic does not cut you off mid-sentence."
     },
     "early_commit": {
       "enabled": true,
@@ -130,6 +189,7 @@
     "disable_proactive": true,
     "disable_passive_learning": true,
     "require_wake_for_tools": true,
+    "followup_window_sec": 6.0,
     "comment": "Validation mode for human testing - requires wake word, disables autonomy."
   }
 }

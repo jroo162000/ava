@@ -32,27 +32,48 @@ from typing import Dict, List, Any, Optional, Tuple
 # PATHS - AVA's self-knowledge of her codebase
 # =============================================================================
 
-AVA_CODEBASE = {
-    "integration": Path(os.path.expanduser("~")) / "ava-integration",
-    "server": Path(os.path.expanduser("~")) / "ava-server",
-    "cmpuse": Path(os.path.expanduser("~")) / "cmp-use",
-    "config": Path(os.path.expanduser("~")) / ".cmpuse",
-}
+def _detect_codebase() -> Dict[str, Path]:
+    """Locate AVA's *live* code tree.
+
+    Honors AVA_INTEGRATION_DIR (set by the launcher .bat), prefers the nested
+    ~/ava/... layout that is actually running, and falls back to top-level copies.
+    This prevents diagnosis from inspecting stale/parallel trees.
+    """
+    home = Path(os.path.expanduser("~"))
+
+    int_candidates: List[Path] = []
+    env_int = os.getenv("AVA_INTEGRATION_DIR")
+    if env_int:
+        int_candidates.append(Path(env_int))
+    int_candidates += [home / "ava" / "ava-integration", home / "ava-integration"]
+    integration = next((p for p in int_candidates if p.exists()), int_candidates[0])
+
+    srv_candidates = [integration.parent / "ava-server", home / "ava" / "ava-server", home / "ava-server"]
+    server = next((p for p in srv_candidates if p.exists()), srv_candidates[0])
+
+    cmp_candidates = [home / "cmp-use", integration.parent / "cmp-use"]
+    cmpuse = next((p for p in cmp_candidates if p.exists()), cmp_candidates[0])
+
+    return {"integration": integration, "server": server, "cmpuse": cmpuse, "config": home / ".cmpuse"}
+
+
+AVA_CODEBASE = _detect_codebase()
 
 CORE_FILES = {
-    # Voice/Realtime
-    "voice_main": AVA_CODEBASE["integration"] / "ava_standalone_realtime.py",
+    # Integration (Python)
+    "voice_main": AVA_CODEBASE["integration"] / "ava_local_voice.py",
     "voice_config": AVA_CODEBASE["integration"] / "ava_voice_config.json",
     "identity": AVA_CODEBASE["integration"] / "ava_identity.json",
     "self_awareness": AVA_CODEBASE["integration"] / "ava_self_awareness.py",
-    "tool_definitions": AVA_CODEBASE["integration"] / "corrected_tool_definitions.py",
-    
-    # Server
-    "server_main": AVA_CODEBASE["server"] / "server.js",
-    "router": AVA_CODEBASE["server"] / "router.js",
-    
-    # This file
     "self_mod": AVA_CODEBASE["integration"] / "ava_self_modification.py",
+    "worker": AVA_CODEBASE["integration"] / "ava_python_worker.py",
+
+    # Server (Node, modular src/ layout)
+    "server_main": AVA_CODEBASE["server"] / "src" / "server.js",
+    "api_routes": AVA_CODEBASE["server"] / "src" / "routes" / "api.js",
+    "agent_loop": AVA_CODEBASE["server"] / "src" / "services" / "agentLoop.js",
+    "tools_service": AVA_CODEBASE["server"] / "src" / "services" / "tools.js",
+    "llm_service": AVA_CODEBASE["server"] / "src" / "services" / "llm.js",
 }
 
 BACKUP_DIR = AVA_CODEBASE["integration"] / "backups"
@@ -578,6 +599,233 @@ def diagnose_error(error_message: str, file_hint: str = None) -> Dict[str, Any]:
     return diagnosis
 
 # =============================================================================
+# PER-TOOL RUNTIME DIAGNOSIS  ("why isn't tool X working?")
+# =============================================================================
+
+_TOOL_ALIASES = {
+    "email": "comm_ops", "gmail": "comm_ops", "mail": "comm_ops", "send email": "comm_ops",
+    "calendar": "calendar_ops", "schedule": "calendar_ops", "events": "calendar_ops",
+    "camera": "camera_ops", "webcam": "camera_ops", "see": "camera_ops",
+    "screenshot": "vision_ops", "screen": "vision_ops", "vision": "vision_ops",
+    "browser": "browser_automation", "web": "browser_automation",
+    "voice": "voice_ops", "speak": "voice_ops", "tts": "voice_ops",
+    "system": "sys_ops",
+}
+
+
+def _ensure_cmpuse_on_path() -> bool:
+    try:
+        import cmpuse  # noqa
+        return True
+    except Exception:
+        for p in [AVA_CODEBASE["cmpuse"], Path(os.path.expanduser("~")) / "cmp-use"]:
+            sp = str(p)
+            if p.exists() and sp not in sys.path:
+                sys.path.insert(0, sp)
+        try:
+            import cmpuse  # noqa
+            return True
+        except Exception:
+            return False
+
+
+def _resolve_tool_name(requested: str, available: List[str]) -> Optional[str]:
+    r = (requested or "").strip().lower()
+    if not r:
+        return None
+    if r in available:
+        return r
+    if r in _TOOL_ALIASES and _TOOL_ALIASES[r] in available:
+        return _TOOL_ALIASES[r]
+    for k, v in _TOOL_ALIASES.items():
+        if k in r and v in available:
+            return v
+    for name in available:
+        if r == name or r in name or name in r:
+            return name
+    rtokens = set(t for t in re.split(r"[^a-z0-9]+", r) if t)
+    best, score = None, 0
+    for name in available:
+        ntokens = set(t for t in re.split(r"[^a-z0-9]+", name) if t)
+        ov = len(rtokens & ntokens)
+        if ov > score:
+            best, score = name, ov
+    return best
+
+
+def _tool_config_status(tool_name: str) -> List[tuple]:
+    """Return [(item, ok, fix), ...] of credential/config requirements for a tool."""
+    cfg = AVA_CODEBASE["config"]
+    out = []
+
+    def has(*names):
+        return any((cfg / n).exists() for n in names)
+
+    if tool_name == "comm_ops":
+        ok = has("gmail_token.json", "token.json")
+        out.append(("Gmail OAuth token", ok, "" if ok else "Run the Google re-auth helper to sign in to Gmail"))
+    if tool_name == "calendar_ops":
+        ok = has("calendar_token.json", "token.json")
+        out.append(("Calendar OAuth token", ok, "" if ok else "Run the Google re-auth helper to sign in to Calendar"))
+    if tool_name in ("vision_ops", "camera_ops", "audio_ops"):
+        try:
+            from cmpuse.secrets import load_into_env as _ls
+            _ls()
+        except Exception:
+            pass
+        ok = bool(os.getenv("OPENAI_API_KEY"))
+        out.append(("OPENAI_API_KEY", ok, "" if ok else "Add OPENAI_API_KEY to ~/.cmpuse/secrets.json"))
+    return out
+
+
+def _scan_logs_for_tool(name: str, max_hits: int = 5) -> List[str]:
+    hits = []
+    logs = [AVA_CODEBASE["integration"] / "ava_session_helpers" / "server_boot.log"]
+    conv_dir = AVA_CODEBASE["server"] / "logs" / "conversations"
+    try:
+        if conv_dir.exists():
+            logs += sorted(conv_dir.glob("conversation-*.jsonl"), reverse=True)[:2]
+    except Exception:
+        pass
+    for lp in logs:
+        try:
+            if not lp.exists():
+                continue
+            lines = lp.read_text(encoding="utf-8", errors="ignore").splitlines()
+            for ln in reversed(lines):
+                low = ln.lower()
+                if name in ln and ("error" in low or "fail" in low or "exception" in low):
+                    hits.append(ln[:240])
+                    if len(hits) >= max_hits:
+                        return hits
+        except Exception:
+            continue
+    return hits
+
+
+def diagnose_tool(tool_name: str, sample_args: Dict[str, Any] = None) -> Dict[str, Any]:
+    """Runtime diagnosis of a single tool: find out *why* it is or isn't working.
+
+    Checks: registration, source file, import, required credentials/config,
+    a safe dry-run, and recent runtime errors in the logs. Returns a likely
+    cause and concrete suggested fixes.
+    """
+    result = {
+        "requested": tool_name,
+        "resolved_tool": None,
+        "registered": False,
+        "source_file": None,
+        "import_ok": None,
+        "import_error": None,
+        "config": [],
+        "dry_run_ok": None,
+        "dry_run_error": None,
+        "recent_log_errors": [],
+        "likely_cause": None,
+        "suggested_fixes": [],
+        "status": "ok",
+    }
+    if not _ensure_cmpuse_on_path():
+        result["status"] = "error"
+        result["likely_cause"] = "cmpuse package is not importable from the self-repair module."
+        return result
+
+    import importlib
+    import traceback
+    import cmpuse.tool_registry as tr
+    try:
+        import cmpuse.tools  # ensure tools register
+    except Exception:
+        pass
+
+    reg = tr.list_tools()
+    available = sorted(reg.keys())
+    name = _resolve_tool_name(tool_name, available)
+    result["resolved_tool"] = name
+    if not name:
+        _node_builtins = {"status", "file_gen", "fs_read", "fs_find", "memory_search",
+                          "moltbook_log", "moltbook_status"}
+        if (tool_name or "").strip().lower() in _node_builtins:
+            result["status"] = "not_found"
+            result["likely_cause"] = (f"'{tool_name}' is a server built-in (Node) tool, not a Python tool; "
+                                      "this diagnoser inspects Python tools.")
+            return result
+        result["status"] = "not_found"
+        result["likely_cause"] = f"No tool matches '{tool_name}'."
+        result["suggested_fixes"].append("Available tools: " + ", ".join(available))
+        return result
+
+    result["registered"] = name in reg
+    tool = reg.get(name)
+
+    # Resolve the REAL source file from the registered tool. The filename can differ
+    # from the tool name (e.g. web_automation.py registers the 'browser_automation' tool),
+    # so never assume tools/<name>.py.
+    src = None
+    if tool is not None:
+        modname = getattr(getattr(tool, "run", None), "__module__", None)
+        mod = sys.modules.get(modname) if modname else None
+        f = getattr(mod, "__file__", None)
+        if f:
+            src = Path(f)
+    if src is None:
+        src = AVA_CODEBASE["cmpuse"] / "cmpuse" / "tools" / f"{name}.py"
+    result["source_file"] = str(src)
+
+    if tool is not None:
+        # Already in the registry => its module imported successfully.
+        result["import_ok"] = True
+    else:
+        # Not registered: try to import a same-named module to surface the load error.
+        try:
+            importlib.import_module(f"cmpuse.tools.{name}")
+            result["import_ok"] = True
+        except Exception as e:
+            result["import_ok"] = False
+            result["import_error"] = f"{type(e).__name__}: {e}"
+
+    result["config"] = [{"item": c[0], "ok": c[1], "fix": c[2]} for c in _tool_config_status(name)]
+
+    args = sample_args or {}
+    try:
+        if getattr(tool, "plan", None):
+            tool.plan(args)
+        if getattr(tool, "run", None):
+            tool.run(args, True)  # dry_run=True
+        result["dry_run_ok"] = True
+    except Exception:
+        result["dry_run_ok"] = False
+        tb = traceback.format_exc().strip().splitlines()
+        result["dry_run_error"] = tb[-1] if tb else "unknown"
+
+    result["recent_log_errors"] = _scan_logs_for_tool(name)
+
+    fixes = result["suggested_fixes"]
+    if result["import_ok"] is False:
+        result["likely_cause"] = f"Import failure: {result['import_error']}"
+        m = re.search(r"No module named ['\"]?([\w\.]+)", result["import_error"] or "")
+        if m:
+            fixes.append(f"pip install {m.group(1).split('.')[0]} --break-system-packages")
+        else:
+            fixes.append(f"Fix the import error in {src}")
+    missing_cfg = [c for c in result["config"] if not c["ok"]]
+    if missing_cfg:
+        if not result["likely_cause"]:
+            result["likely_cause"] = "Missing configuration/credentials: " + ", ".join(c["item"] for c in missing_cfg)
+        fixes.extend(c["fix"] for c in missing_cfg if c["fix"])
+    if result["dry_run_ok"] is False and not result["likely_cause"]:
+        result["likely_cause"] = f"Tool raised during dry-run: {result['dry_run_error']}"
+        fixes.append(f"Inspect {src} around the failing action")
+    if not result["likely_cause"]:
+        if result["recent_log_errors"]:
+            result["likely_cause"] = "Tool registers, imports, and dry-runs cleanly, but recent runtime errors appear in the logs (see recent_log_errors)."
+        else:
+            result["likely_cause"] = "No problem detected: the tool is registered, imports, and dry-runs cleanly."
+            result["status"] = "healthy"
+    return result
+
+
+# =============================================================================
 # SELF-MODIFICATION (WITH APPROVAL)
 # =============================================================================
 
@@ -745,7 +993,13 @@ def self_mod_tool_handler(args: Dict[str, Any]) -> Dict[str, Any]:
     
     if action == "diagnose":
         return diagnose_codebase()
-    
+
+    elif action == "diagnose_tool":
+        return diagnose_tool(
+            args.get("tool") or args.get("name") or args.get("tool_name", ""),
+            args.get("sample_args"),
+        )
+
     elif action == "diagnose_error":
         error = args.get("error", "")
         file_hint = args.get("file_hint")

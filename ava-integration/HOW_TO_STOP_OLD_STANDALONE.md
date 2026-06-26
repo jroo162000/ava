@@ -51,12 +51,12 @@ taskkill /IM python.exe /F
 
 **Double-click this file**:
 ```
-C:\Users\USER 1\ava-integration\start_ava_standalone_realtime.bat
+C:\Users\USER 1\ava\ava-integration\start_ava_standalone_realtime.bat
 ```
 
 **Or command line**:
 ```bash
-cd "C:\Users\USER 1\ava-integration"
+cd "C:\Users\USER 1\ava\ava-integration"
 python ava_standalone_realtime.py
 ```
 
@@ -84,14 +84,14 @@ python ava_standalone_realtime.py
 Once you're sure you only want Realtime Voice, you can delete:
 
 ```
-C:\Users\USER 1\ava-integration\ava_standalone.py  ← OLD TTS version
-C:\Users\USER 1\ava-integration\ava_tray.pyw       ← OLD TTS tray version
+C:\Users\USER 1\ava\ava-integration\ava_standalone.py  ← OLD TTS version
+C:\Users\USER 1\ava\ava-integration\ava_tray.pyw       ← OLD TTS tray version
 ```
 
 **Keep these**:
 ```
-C:\Users\USER 1\ava-integration\ava_standalone_realtime.py  ✅ NEW
-C:\Users\USER 1\ava-integration\start_ava_standalone_realtime.bat  ✅
+C:\Users\USER 1\ava\ava-integration\ava_standalone_realtime.py  ✅ NEW
+C:\Users\USER 1\ava\ava-integration\start_ava_standalone_realtime.bat  ✅
 ```
 
 ---

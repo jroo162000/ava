@@ -87,5 +87,24 @@ describe('Chat API Tests', () => {
 
       expect(res.body).toBeDefined();
     });
+
+    it('should not route spoken self-description prompts to the Done fallback', async () => {
+      const res = await request(app)
+        .post('/respond')
+        .send({
+          sessionId: 'voice-test',
+          messages: [{ role: 'user', content: 'tell me about yourself' }],
+          run_tools: true,
+          voice_mode: 'spoken',
+          spoken_reply_budget: { max_sentences: 2, max_words: 28 }
+        })
+        .expect(200)
+        .expect('Content-Type', /json/);
+
+      expect(res.body.output_text).toMatch(/AVA/i);
+      expect(res.body.output_text).not.toBe('Done.');
+      expect(res.body.agent.steps).toBe(0);
+      expect(res.body.agent.status).toBe('success');
+    });
   });
 });

@@ -1,4 +1,6 @@
 @echo off
+setlocal
+
 echo ================================================================================
 echo AVA STANDALONE - VALIDATION MODE
 echo ================================================================================
@@ -19,7 +21,7 @@ echo.
 echo ================================================================================
 echo.
 
-cd "C:\Users\USER 1\ava-integration"
+cd /d "%~dp0"
 set VALIDATION_MODE=1
 python ava_standalone_realtime.py
 

@@ -19,6 +19,14 @@ from ava_python_worker import handle_command
 
 class TestCommandHandling:
     """Tests for command handling"""
+
+    def test_worker_uses_runtime_integration_dir(self):
+        """Worker must not assume the old home-level ava-integration layout."""
+        src = (Path(__file__).parent.parent / "ava_python_worker.py").read_text(encoding="utf-8")
+
+        assert "AVA_INTEGRATION_DIR" in src
+        assert "Path(__file__).resolve().parent" in src
+        assert 'home / "ava-integration"' not in src
     
     def test_ping_command(self):
         """Test ping command returns pong"""

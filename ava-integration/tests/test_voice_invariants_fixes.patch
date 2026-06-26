@@ -1,0 +1,6 @@
+--- Fix failing tests in test_voice_invariants.py
+
+1. Fix test_node_boundary_has_execute_tool: Check for IdempotencyCache class instead of direct calls
+2. Fix test_mic_ignored_during_speaking: Use valid DECIDE->SPEAK transition path
+3. Fix test_turn_state_prevents_concurrent_speaking_listening: Same fix
+4. Fix test_turn_state_machine_thread_safe: Use type name check instead of isinstance

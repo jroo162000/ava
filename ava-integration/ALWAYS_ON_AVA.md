@@ -137,13 +137,13 @@ Run `install_ava_startup.bat` - done!
 1. Open Task Scheduler
 2. Create Task: "AVA Assistant"
 3. Trigger: At logon
-4. Action: `pythonw.exe "C:\Users\USER 1\ava-integration\ava_tray.pyw"`
+4. Action: `pythonw.exe "C:\Users\USER 1\ava\ava-integration\ava_tray.pyw"`
 
 ### Method 3: Registry Run Key (Advanced)
 Add to: `HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Run`
 ```
 Name: AVA
-Value: pythonw.exe "C:\Users\USER 1\ava-integration\ava_tray.pyw"
+Value: pythonw.exe "C:\Users\USER 1\ava\ava-integration\ava_tray.pyw"
 ```
 
 ---
@@ -174,7 +174,7 @@ Value: pythonw.exe "C:\Users\USER 1\ava-integration\ava_tray.pyw"
 ## 📁 FILES CREATED
 
 ```
-C:\Users\USER 1\ava-integration\
+C:\Users\USER 1\ava\ava-integration\
   ├── ava_standalone.py          # Console mode AVA
   ├── ava_tray.pyw               # System tray AVA
   ├── start_ava_background.bat   # Quick start script

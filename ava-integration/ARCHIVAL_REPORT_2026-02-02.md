@@ -1,3 +1,5 @@
+> Historical note (March 20, 2026): absolute paths in this archive may refer to the older sibling shadow checkout. The canonical AVA tree is `C:\Users\USER 1\ava\ava-integration`.
+
 # AVA Voice Runner Archival Report
 
 **Date:** 2026-02-02

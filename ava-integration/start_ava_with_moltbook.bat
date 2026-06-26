@@ -1,10 +1,12 @@
 @echo off
+setlocal
+
 echo Starting AVA with Moltbook integration...
-cd /d "C:\Users\USER 1\ava-integration"
+cd /d "%~dp0"
 
 REM Disable autonomy in voice mode - scheduler and heartbeat will exit early
 set DISABLE_AUTONOMY=1
-echo [autonomy] disabled (voice mode) — DISABLE_AUTONOMY=1
+echo [autonomy] disabled (voice mode) - DISABLE_AUTONOMY=1
 
 REM Run Moltbook heartbeat first (will skip due to DISABLE_AUTONOMY)
 echo [Moltbook] Running heartbeat check...

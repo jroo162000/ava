@@ -1,21 +1,12 @@
 """
-AVA Standalone (Server-Assisted) with Deepgram ASR+TTS
+AVA standalone voice runtime.
 
-This version removes OpenAI Realtime usage. It:
-- Streams microphone PCM16 to Deepgram Live (ASR)
-- Sends final transcripts to the local AVA server (/respond) for the brain/tools
-- Synthesizes TTS via Deepgram Speak and plays audio locally
-- Adds simple barge-in and echo gating
+Canonical local path:
+- Hybrid local ASR (Vosk streaming + Whisper final)
+- Local AVA server (/respond) for the brain/tools
+- Local TTS playback (Piper by default)
+- Validation-mode wake gating and half-duplex echo suppression
 """
-
-# Boot diagnostics for harness/debug
-print(f"[BOOT] running file: {__file__}")
-try:
-    import subprocess, os
-    _rev = subprocess.check_output(["git", "rev-parse", "--short", "HEAD"], cwd=os.path.dirname(__file__)).decode().strip()
-    print(f"[BOOT] git head: {_rev}")
-except Exception as _e:
-    print(f"[BOOT] git head: (unavailable) {_e}")
 
 import asyncio
 import base64
@@ -25,7 +16,6 @@ import sys
 import wave
 import threading
 import queue
-import datetime
 from datetime import datetime
 from pathlib import Path
 import time
@@ -38,36 +28,74 @@ import subprocess
 import random
 import uuid
 import hashlib
+# Prosody import (works whether run as module or script)
+try:
+    from .prosody import ProsodyPreprocessor  # type: ignore
+except Exception:
+    try:
+        # When running as a script from ava-integration directory
+        from prosody import ProsodyPreprocessor  # type: ignore
+    except Exception:
+        # Fallback no-op preprocessor
+        class ProsodyPreprocessor:  # type: ignore
+            def __init__(self, cfg=None):
+                pass
+            def process(self, text: str) -> str:
+                return text
 VOICE_UNIFIED = os.getenv("VOICE_UNIFIED", "0") == "1"  # legacy override only
 
-# -------------------- Latency JSONL helpers --------------------
-def _latlog_path() -> str | None:
-    try:
-        p = os.environ.get("AVA_LATENCY_LOG")
-        return p.strip() if p else None
-    except Exception:
-        return None
+# -------------------- Latency profiler --------------------
+class _LatencyProfiler:
+    def __init__(self):
+        self._buckets = {}
+        self._last_report = 0.0
+        self._window = 200  # rolling samples per metric
+        self._interval = 30.0  # seconds
 
-def _latlog_write(rec: dict) -> None:
-    try:
-        p = _latlog_path()
-        if not p:
-            return
-        # Ensure parent exists and append JSONL
-        rec = dict(rec)
-        rec["ts"] = time.time()
-        parent = os.path.dirname(p)
-        if parent:
-            os.makedirs(parent, exist_ok=True)
-        with open(p, "a", encoding="utf-8") as f:
-            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-    except Exception:
-        pass
+    def record(self, name: str, value_ms: int):
+        try:
+            from collections import deque
+            dq = self._buckets.get(name)
+            if dq is None:
+                dq = deque(maxlen=self._window)
+                self._buckets[name] = dq
+            dq.append(int(value_ms))
+        except Exception:
+            pass
+
+    def _quantiles(self, arr):
+        if not arr:
+            return (None, None, None)
+        vals = sorted(arr)
+        n = len(vals)
+        def q(p):
+            if n == 1:
+                return vals[0]
+            idx = max(0, min(n - 1, int(round((p/100.0)*(n-1)))))
+            return vals[idx]
+        return (q(50), q(95), q(99))
+
+    def maybe_report(self):
+        try:
+            now = time.time()
+            if (now - self._last_report) < self._interval:
+                return
+            self._last_report = now
+            lines = []
+            for name, dq in self._buckets.items():
+                p50, p95, p99 = self._quantiles(list(dq))
+                if p50 is None:
+                    continue
+                lines.append(f"{name}: p50={p50}ms p95={p95}ms p99={p99}ms (n={len(dq)})")
+            if lines:
+                print("[latstats] " + " | ".join(lines))
+        except Exception:
+            pass
 try:
     # Unified voice scaffolding
     from voice.bus import EventBus as _VoiceEventBus
     from voice.session import VoiceSession as _VoiceSession
-    from voice.providers.local_hybrid import LocalHybridProvider as _LocalHybridProvider, VoiceEvent as _VoiceEvent
+    from voice.providers.local_hybrid import LocalHybridProvider as _LocalHybridProvider
     from voice.tts.edge_stream import EdgeStreamTTS as _EdgeStreamTTS
     from voice.tts.piper_bin import PiperBinTTS as _PiperBinTTS
     _VOICE_SCAFFOLD_AVAILABLE = True
@@ -87,14 +115,9 @@ if sys.platform == 'win32':
 WS_AVAILABLE = True
 try:
     import websockets
-    try:
-        # Modern versions (v13+): import exceptions from submodule
-        from websockets.exceptions import ConnectionClosedOK as WS_ClosedOK, ConnectionClosedError as WS_ClosedError, ConnectionClosed as WS_ClosedGeneral
-    except Exception:
-        # Fallback: some versions expose names at top-level or with different structure
-        WS_ClosedOK = getattr(websockets, 'ConnectionClosedOK', Exception)
-        WS_ClosedError = getattr(websockets, 'ConnectionClosedError', Exception)
-        WS_ClosedGeneral = getattr(websockets, 'ConnectionClosed', Exception)
+    WS_ClosedOK = websockets.exceptions.ConnectionClosedOK
+    WS_ClosedError = websockets.exceptions.ConnectionClosedError
+    WS_ClosedGeneral = websockets.exceptions.ConnectionClosed
 except Exception as e:
     websockets = None  # type: ignore
     WS_AVAILABLE = False
@@ -104,7 +127,7 @@ except Exception as e:
         pass
     class WS_ClosedGeneral(Exception):
         pass
-    print(f"[warning] websockets not available or incompatible: {e}")
+    print(f"[warning] websockets not available: {e}")
 
 import pyaudio
 from corrected_tool_definitions import CORRECTED_TOOLS
@@ -525,6 +548,23 @@ class LocalVoiceEngine:
             "ava activate", "ava close", "ava open", "ava turn"
         ]
 
+        # Vosk ASR frequently misrecognizes "ava" — map known aliases
+        # (pattern, replacement) applied left-to-right, first match wins
+        self._vosk_wake_aliases = [
+            ('hey we\'re', 'hey ava'),
+            ('hey we\'ll', 'hey ava'),
+            ('hey a were', 'hey ava'),
+            ('hey able', 'hey ava'),
+            ('the able', 'hey ava'),
+            ('be able', 'hey ava'),
+            ('hey uber', 'hey ava'),
+            ('however', 'hey ava'),
+            ('haber', 'ava'),
+            ('aber', 'ava'),
+            ('abba', 'ava'),
+            ('able', 'ava'),
+        ]
+
         # Audio learning - store overheard conversations for context
         from collections import deque
         self._overheard_audio = deque(maxlen=50)  # Last 50 transcriptions
@@ -532,7 +572,7 @@ class LocalVoiceEngine:
 
     def _is_addressed(self, transcript: str) -> bool:
         """Check if the user is addressing AVA (contains wake word)"""
-        lower = transcript.lower().strip()
+        lower = self._normalize_for_wake(transcript)
 
         # Check for wake words
         for wake_word in self._wake_words:
@@ -551,6 +591,63 @@ class LocalVoiceEngine:
                 return True
 
         return False
+
+    def _normalize_for_wake(self, text: str) -> str:
+        """Normalize known Vosk misrecognitions of 'ava' before wake word detection."""
+        lower = text.lower().strip()
+        # 1. Exact alias lookup
+        for alias, replacement in self._vosk_wake_aliases:
+            if lower.startswith(alias):
+                lower = replacement + lower[len(alias):]
+                print(f"[vosk-alias] '{text[:30]}' -> '{lower[:30]}' (matched '{alias}')")
+                return lower
+        # 2. Fuzzy match: if first/second word is close to 'ava'/'eva', treat as wake word
+        _ed = getattr(self, '_edit_distance', None)
+        if _ed is None:
+            return lower
+        words = lower.split()
+        if not words:
+            return lower
+        wake_targets = ['ava', 'eva']
+        for i, word in enumerate(words[:2]):
+            clean = word.strip('.,!?')
+            if len(clean) < 2 or len(clean) > 5:
+                continue
+            for target in wake_targets:
+                dist = _ed(clean, target)
+                if dist <= 1:  # 1 edit away from ava/eva
+                    words[i] = target
+                    result = ' '.join(words)
+                    print(f"[vosk-fuzzy] '{text[:30]}' -> '{result[:30]}' ('{clean}'~'{target}' dist={dist})")
+                    return result
+            # Also check "hey/ok X" where X is <=2 edits from ava/eva
+            # (looser threshold OK because "hey" prefix narrows context)
+            if i == 0 and clean in ('hey', 'ok', 'okay', 'hi', 'hello') and len(words) > 1:
+                w2 = words[1].strip('.,!?')
+                if len(w2) >= 2 and len(w2) <= 5:
+                    for target in wake_targets:
+                        dist = _ed(w2, target)
+                        if dist <= 2:
+                            words[1] = target
+                            result = ' '.join(words)
+                            print(f"[vosk-fuzzy] '{text[:30]}' -> '{result[:30]}' ('hey {w2}'~'hey {target}' dist={dist})")
+                            return result
+        return lower
+
+    @staticmethod
+    def _edit_distance(s1: str, s2: str) -> int:
+        """Levenshtein edit distance between two strings."""
+        if len(s1) < len(s2):
+            return LocalVoiceEngine._edit_distance(s2, s1)
+        if len(s2) == 0:
+            return len(s1)
+        prev = list(range(len(s2) + 1))
+        for i, c1 in enumerate(s1):
+            curr = [i + 1]
+            for j, c2 in enumerate(s2):
+                curr.append(min(prev[j + 1] + 1, curr[j] + 1, prev[j] + (0 if c1 == c2 else 1)))
+            prev = curr
+        return prev[-1]
 
     def _store_overheard(self, transcript: str, responded: bool = False):
         """Store overheard audio for context/learning"""
@@ -633,11 +730,6 @@ class LocalVoiceEngine:
             return
         # TTS SOURCE OF TRUTH: sha1 proves no hidden rewrite between /respond and TTS
         _sha1 = hashlib.sha1(text.encode()).hexdigest()[:12]
-        # HARNESS: force unified local TTS (Piper) so measurements are consistent
-        if os.environ.get("AVA_HARNESS", "").strip() == "1":
-            print(f"[HARNESS] unified Piper TTS forced (sha1={_sha1})")
-            self._voice_session.speak(text)
-            return
         print(f"[tts-in] TTS_SOURCE=local turn_id={turn_id} sha1={_sha1} preview='{text[:60]}...'")
         try:
             print(f"[local-tts] Synthesizing: {text[:50]}...")
@@ -729,7 +821,12 @@ class LocalVoiceEngine:
             traceback.print_exc()
     
     def transcribe_audio(self, audio_bytes):
-        """Transcribe audio using Whisper with hallucination filtering"""
+        """Transcribe audio using Whisper with hallucination filtering.
+
+        Phase A: Never annihilate non-empty Whisper outputs — if filtering would
+        return an empty string but the raw Whisper text is non-empty, fall back
+        to the raw text. Also relax polite filler filtering in validation mode.
+        """
         if not self.whisper_model or len(audio_bytes) < self._min_audio_length:
             return ""
         
@@ -749,7 +846,7 @@ class LocalVoiceEngine:
             
             # Transcribe
             segments, info = self.whisper_model.transcribe(audio_np, beam_size=5, language="en")
-            text = " ".join([seg.text for seg in segments]).strip()
+            raw_text = " ".join([seg.text for seg in segments]).strip()
             
             # Filter out common Whisper hallucinations
             hallucination_patterns = [
@@ -760,27 +857,53 @@ class LocalVoiceEngine:
                 "hey bob", "my house", "that's my house",
                 "www.", ".com", ".org",
             ]
-            text_lower = text.lower()
+            # In validation mode, do not treat polite fillers as annihilating patterns
+            try:
+                val_mode = bool(getattr(self.parent, '_validation_mode', False))
+            except Exception:
+                val_mode = False
+            if val_mode:
+                _polite = {"thank you", "thanks", "thanks for watching"}
+                hallucination_patterns = [p for p in hallucination_patterns if p not in _polite]
+
+            # Begin filtered text as raw_text; apply cleaning rules non-destructively
+            filtered = raw_text
+            text_lower = raw_text.lower()
             
             # If text is very short and matches hallucination patterns, skip
-            if len(text) < 30:
+            if len(raw_text) < 30:
                 for pattern in hallucination_patterns:
                     if pattern in text_lower:
-                        print(f"[local-asr] Filtered hallucination: {text}")
-                        return ""
+                        print(f"[local-asr] Filtered hallucination pattern='{pattern}': {raw_text}")
+                        filtered = ""
+                        break
             
             # Skip if text doesn't match audio characteristics
             # (e.g., very long text from short audio is suspicious)
             audio_duration = len(audio_np) / 16000  # seconds
-            words = len(text.split())
+            words = len(raw_text.split())
             words_per_second = words / max(audio_duration, 0.1)
             
             # Normal speech is 2-4 words per second, hallucinations often have many more
             if words_per_second > 6 and audio_duration < 2:
-                print(f"[local-asr] Filtered suspicious speed ({words_per_second:.1f} w/s): {text}")
-                return ""
-            
-            return text
+                print(f"[local-asr] Filtered suspicious speed ({words_per_second:.1f} w/s): {raw_text}")
+                filtered = ""
+
+            # Phase A rule: filtering can clean but must not annihilate non-empty raw
+            if (filtered or "").strip() == "" and (raw_text or "").strip() != "":
+                print(f"[whisper-final] raw='{raw_text}' filtered='' -> using RAW (fallback)")
+                return raw_text
+
+            # Log both raw and filtered for debugging
+            try:
+                if filtered != raw_text:
+                    print(f"[whisper-final] raw='{raw_text}' filtered='{filtered}'")
+                else:
+                    print(f"[whisper-final] raw=filtered='{raw_text}'")
+            except Exception:
+                pass
+
+            return filtered
         except Exception as e:
             print(f"[local-asr] Transcription error: {e}")
             return ""
@@ -875,9 +998,8 @@ class LocalVoiceEngine:
                     # Hybrid ASR path: feed streaming engine and handle finalization
                     if getattr(self, '_using_hybrid_asr', False) and getattr(self, 'hybrid_asr', None):
                         try:
-                            self.hybrid_asr.feed_audio(audio_data)
-                            transcript = ""
-                            if (not self.hybrid_asr.is_speaking()) and self.hybrid_asr.has_enough_audio():
+                            transcript = self.hybrid_asr.feed_audio(audio_data) or ""
+                            if (not transcript) and (not self.hybrid_asr.is_speaking()) and self.hybrid_asr.has_enough_audio():
                                 # Pass TTS/echo state so Whisper skips during playback
                                 _tts_up = self.parent.tts_active.is_set()
                                 _echo_up = (time.time() - getattr(self.parent, '_tts_last_active', 0)) < self.parent.cfg.get('echo_cancellation', {}).get('grace_period_sec', 3.0)
@@ -1120,6 +1242,74 @@ class VoiceEngineState:
         self.error_threshold = 3  # Switch after 3 consecutive errors
 
 
+
+
+def _normalize_transcript_words(text: str) -> list[str]:
+    text = (text or '').lower().strip()
+    text = re.sub(r"[^a-z0-9\s]+", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return [w for w in text.split() if w]
+
+
+def _normalized_transcript(text: str) -> str:
+    return ' '.join(_normalize_transcript_words(text))
+
+
+def _normalized_wake_phrases(wake_words) -> list[str]:
+    phrases = []
+    for wake in wake_words or []:
+        norm = _normalized_transcript(wake)
+        if norm:
+            phrases.append(norm)
+    return sorted(set(phrases), key=len, reverse=True)
+
+
+def _transcript_has_wake_phrase(text: str, wake_words) -> bool:
+    txt = _normalized_transcript(text)
+    if not txt:
+        return False
+    for wake in _normalized_wake_phrases(wake_words):
+        if txt == wake or txt.startswith(wake + ' ') or (' ' + wake + ' ') in (' ' + txt + ' '):
+            return True
+    return False
+
+
+class _DeterministicInputStream:
+    def __init__(self, wav_path: str, target_rate: int = 16000, channels: int = 1):
+        self.wav_path = wav_path
+        self.target_rate = int(target_rate)
+        self.channels = int(channels)
+        self._closed = False
+        with wave.open(self.wav_path, 'rb') as wf:
+            raw = wf.readframes(wf.getnframes())
+            src_rate = int(wf.getframerate())
+            src_channels = int(wf.getnchannels())
+        if src_channels > 1:
+            raw = audioop.tomono(raw, 2, 0.5, 0.5)
+        if src_rate != self.target_rate:
+            raw, _ = audioop.ratecv(raw, 2, 1, src_rate, self.target_rate, None)
+        self._pcm = raw
+        self._pos = 0
+
+    def read(self, num_frames: int, exception_on_overflow: bool = False):
+        if self._closed:
+            return b''
+        byte_count = max(1, int(num_frames)) * 2 * self.channels
+        chunk = self._pcm[self._pos:self._pos + byte_count]
+        self._pos += len(chunk)
+        if len(chunk) < byte_count:
+            chunk += b'\x00' * (byte_count - len(chunk))
+            time.sleep(0.02)
+        return chunk
+
+    def stop_stream(self):
+        self._closed = True
+
+    def close(self):
+        self._closed = True
+
+    def is_active(self):
+        return not self._closed and self._pos < len(self._pcm)
 class StandaloneRealtimeAVA:
     # Command verbs that signal "do something" — tools require at least one
     COMMAND_VERBS = {
@@ -1135,22 +1325,6 @@ class StandaloneRealtimeAVA:
 
     def __init__(self):
         load_into_env()
-
-        # Create latency log file on startup (if configured) to verify writability
-        try:
-            lp = _latlog_path()
-            if lp:
-                parent = os.path.dirname(lp)
-                if parent:
-                    os.makedirs(parent, exist_ok=True)
-                with open(lp, "a", encoding="utf-8") as _f:
-                    pass
-                try:
-                    _latlog_write({"stage": "app_start"})
-                except Exception:
-                    pass
-        except Exception:
-            pass
 
         # Load provider keys (optional; auto-select voice later)
         self.deepgram_key = os.getenv("DEEPGRAM_API_KEY") or self._read_key_file("deepgram key.txt")
@@ -1182,41 +1356,11 @@ class StandaloneRealtimeAVA:
         self.session_id = None
 
         # Audio playback queue and thread
-        # Increase playback queue size to absorb TTS burstiness and prevent clipping
-        self.audio_queue = queue.Queue(maxsize=1200)
+        self._audio_queue_maxsize = 50
+        self.audio_queue = queue.Queue(maxsize=self._audio_queue_maxsize)  # Limit queue to prevent stale audio
         self.playback_thread = None
         self.playback_stream = None
         self._playback_abort_until = 0.0
-        # End-of-utterance sentinel and playback completion tracking
-        # None is reserved as poison pill for the worker; use a unique object for utterance boundaries
-        self._UTT_END = object()
-        self.utt_playback_done = threading.Event()
-        self.utt_playback_done.set()
-        self._utt_in_progress = False
-        # Guard to avoid duplicate playback.end emissions
-        self._playback_end_fired = False
-        # ASR blackout window after playback.end to prevent tail finals
-        self._asr_blackout_until = 0.0
-
-        # -----------------------
-        # Program 3 Harness (WAV capture): user_wav + tts_wav
-        # Enable with env AVA_HARNESS=1
-        # Optional env AVA_HARNESS_DIR="C:\\path\\to\\dir"
-        # -----------------------
-        self._harness_enabled = (os.environ.get("AVA_HARNESS", "").strip() == "1")
-        self._harness_dir = os.environ.get("AVA_HARNESS_DIR", "").strip()
-        self._harness_lock = threading.Lock()
-
-        # Rolling ids/tags
-        self._harness_turn_seq = 0
-
-        # Buffers
-        self._harness_user_buf = bytearray()
-        self._harness_tts_buf = bytearray()
-
-        # Current tag for the utterance under capture
-        self._harness_user_tag = None
-        self._harness_tts_tag = None
         # Barge-in / echo gating
         self.tts_active = threading.Event()
         self.user_speaking = threading.Event()
@@ -1227,8 +1371,8 @@ class StandaloneRealtimeAVA:
         self.playback_busy = threading.Event()
         self._last_user_voice_t = 0.0
         self._loud_frames = 0
-        self.START_THRESH = 800   # ~ -28 dBFS (int16 RMS) - conservative to reduce false activations
-        self.STOP_THRESH = 500    # ~ -30 dBFS - conservative to reduce echo/feedback
+        self.START_THRESH = 180   # lower start RMS to detect normal speech more easily
+        self.STOP_THRESH = 120    # lower stop RMS for quicker end-of-speech detection
         self.SPEECH_HOLD_SEC = 1.0  # Slightly longer hold to prevent choppy audio
         self.playback_rate = PLAYBACK_RATE
         self.output_device_index = None
@@ -1265,6 +1409,9 @@ class StandaloneRealtimeAVA:
         self._min_words_without_wake = 0
         self._blocked_tools = set()
         self._require_wake_for_tools = False
+        self._wake_followup_until = 0.0
+        self._wake_followup_sec = 6.0
+        self._wake_followup_silent_reply = '__AVA_WAKE_FOLLOWUP_SILENT__'
 
         # State file for crash supervisor (written on turn state changes)
         self._state_file_path = Path(__file__).parent / 'logs' / 'runner_state.json'
@@ -1302,7 +1449,9 @@ class StandaloneRealtimeAVA:
             "speak_symbols": False,                 # if False: strip symbols/punctuation from TTS
             "server_url": "http://127.0.0.1:5051/respond",
             "server_route": "respond",  # 'chat' or 'respond'
-            "vad": {"start_rms": self.START_THRESH, "stop_rms": self.STOP_THRESH, "hold_sec": self.SPEECH_HOLD_SEC},
+            "vad": {"start_rms": self.START_THRESH, "stop_rms": self.STOP_THRESH, "hold_sec": self.SPEECH_HOLD_SEC,
+                    "calibrate_noise_floor": True, "calibration_ms": 1000, "calibration_margin_rms": 0,
+                    "calibration_scale": 2.5},
             "audio": {"playback_rate": self.playback_rate, "output_device": None, "input_device": None},
             "asr_model": "nova-2",
             "tts_model": "aura-2-andromeda-en",
@@ -1326,6 +1475,18 @@ class StandaloneRealtimeAVA:
         self._identity_mtime = 0.0
         self._load_config(silent=True)
 
+        # Optional: calibrate VAD thresholds against ambient noise at boot
+        try:
+            vad_cfg = self.cfg.get('vad') or {}
+            if bool(vad_cfg.get('calibrate_noise_floor', True)):
+                self._calibrate_noise_floor(
+                    duration_ms=int(vad_cfg.get('calibration_ms', 700)),
+                    margin_rms=int(vad_cfg.get('calibration_margin_rms', 200)),
+                    scale=float(vad_cfg.get('calibration_scale', 2.5)),
+                )
+        except Exception as e:
+            print(f"[vad-cal] Calibration skipped: {e}")
+
         # Validation mode initialization (AFTER config is loaded)
         val_cfg = self.cfg.get('validation_mode', {})
         if val_cfg.get('enabled', False):
@@ -1341,9 +1502,36 @@ class StandaloneRealtimeAVA:
             self._min_words_without_wake = val_cfg.get('min_words_without_wake', 3)
             self._blocked_tools = set(val_cfg.get('blocked_tools', ['camera_ops']))
             self._require_wake_for_tools = val_cfg.get('require_wake_for_tools', True)
+            self._wake_followup_sec = float(val_cfg.get('followup_window_sec', 6.0) or 6.0)
+            # Vosk ASR frequently misrecognizes "ava" — map known aliases
+            self._vosk_wake_aliases = [
+                ('hey we\'re', 'hey ava'),
+                ('hey we\'ll', 'hey ava'),
+                ('hey a were', 'hey ava'),
+                ('hey able', 'hey ava'),
+                ('the able', 'hey ava'),
+                ('be able', 'hey ava'),
+                ('hey uber', 'hey ava'),
+                ('however', 'hey ava'),
+                ('haber', 'ava'),
+                ('aber', 'ava'),
+                ('abba', 'ava'),
+                ('able', 'ava'),
+            ]
             print(f"  Wake words: {self._wake_words}")
             print(f"  Min words without wake: {self._min_words_without_wake}")
             print(f"  Blocked tools: {self._blocked_tools}")
+            # Phase C: ensure workable VAD in validation regardless of file config
+            try:
+                # Force calibration in validation even if config disabled
+                self._calibrate_noise_floor(duration_ms=1000, margin_rms=0, scale=2.5)
+            except Exception as e:
+                print(f"[vad-cal] Validation calibration skipped: {e}")
+            # If still too high, hard-cap to immediate workable defaults
+            if self.START_THRESH and self.START_THRESH > 300:
+                print(f"[vad-cal] Validation override: START={self.START_THRESH} too high -> setting START=200 STOP=120")
+                self.START_THRESH = 200
+                self.STOP_THRESH = 120
 
         try:
             if self.identity_path.exists():
@@ -1489,12 +1677,7 @@ class StandaloneRealtimeAVA:
         print("=" * 80)
         print(f"Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         # Decide voice mode now (auto if not set)
-        # Decide voice mode now (auto if not set)
-        # Select and store voice mode so all checks use a consistent source of truth
-        self.voice_mode = self._select_voice_mode()
-        self._voice_mode = self.voice_mode
-        # Back-compat alias if referenced elsewhere
-        self.voice_selected = self.voice_mode
+        self.voice_selected = self._select_voice_mode()
         if self.voice_selected == 'unified':
             # Determine TTS engine for banner
             lf = (self.cfg.get('local_fallback') or {})
@@ -1510,19 +1693,19 @@ class StandaloneRealtimeAVA:
         print(f"Tools Available: 20 JARVIS-level capabilities")
         print("=" * 80)
         print("Features:")
-        # Reflect actual validation mode configuration for wake words
-        try:
-            vm = self.cfg.get('validation_mode') or {}
-            wake_required = bool(vm.get('enabled', False)) and bool(vm.get('require_wake_for_tools', False))
-        except Exception:
-            wake_required = False
-        if wake_required:
-            print("  - Wake word required (e.g., 'Hey AVA')")
+        if self._validation_mode:
+            print("  - Wake word required before commands")
+            if self._wake_followup_sec > 0:
+                print(f"  - {self._wake_followup_sec:g}s silent follow-up window after wake")
+            print("  - Half-duplex local voice conversation")
         else:
             print("  - Always listening (no wake word needed)")
-        print("  - Bidirectional realtime voice conversation")
-        print("  - Sub-second response latency")
-        print("  - Can interrupt AVA mid-sentence")
+            print("  - Bidirectional realtime voice conversation")
+        if self._barge_in_enabled:
+            print("  - Can interrupt AVA mid-sentence")
+        else:
+            print("  - Half-duplex playback (barge-in disabled)")
+        print("  - Local AVA Server brain over /respond")
         print("  - Full access to all 20 AVA tools")
         print("  - Smart Voice Activity Detection")
         print("=" * 80)
@@ -1633,14 +1816,101 @@ class StandaloneRealtimeAVA:
                 self._utter_rate_checked = False
             except Exception:
                 pass
-            # Ensure completion state doesn't hang
-            try:
-                self._utt_in_progress = False
-                self.utt_playback_done.set()
-            except Exception:
-                pass
         except Exception:
             pass
+
+    def _segment_text_for_tts(self, text: str) -> list[str]:
+        """Split text into short, speech-friendly segments to enable microstreaming.
+        Prefer sentence/phrase boundaries; fall back to fixed-size chunks.
+        """
+        try:
+            # Optional prosody preprocessing before segmentation
+            cfg = getattr(self, 'cfg', {}) or {}
+            try:
+                pp = ProsodyPreprocessor(cfg)
+                txt = pp.process(text or '')
+            except Exception:
+                txt = (text or '').strip()
+            if not txt:
+                return []
+            segmenting_enabled = os.environ.get("AVA_TTS_SEGMENTING", "0").strip().lower() in {"1", "true", "on", "yes"}
+            if not segmenting_enabled:
+                return [txt]
+            # First, split on strong punctuation
+            import re as _re
+            parts = [p.strip() for p in _re.split(r"(?<=[\.!?])\s+", txt) if p and p.strip()]
+            segs: list[str] = []
+            for p in parts:
+                if len(p) <= 140:
+                    segs.append(p)
+                else:
+                    # Further split long sentences on commas/semicolons
+                    subs = [s.strip() for s in _re.split(r"(?<=[,;:])\s+", p) if s and s.strip()]
+                    for s in subs:
+                        if len(s) <= 140:
+                            segs.append(s)
+                        else:
+                            # Fixed-size fallback
+                            for i in range(0, len(s), 120):
+                                segs.append(s[i:i+120])
+            return segs
+        except Exception:
+            return [text]
+
+    def _normalize_for_wake(self, text: str) -> str:
+        """Normalize known Vosk misrecognitions of 'ava' before wake word detection."""
+        lower = text.lower().strip()
+        # 1. Exact alias lookup
+        aliases = getattr(self, '_vosk_wake_aliases', [])
+        for alias, replacement in aliases:
+            if lower.startswith(alias):
+                lower = replacement + lower[len(alias):]
+                print(f"[vosk-alias] '{text[:30]}' -> '{lower[:30]}' (matched '{alias}')")
+                return lower
+        # 2. Fuzzy match: if first/second word is close to 'ava'/'eva', treat as wake word
+        words = lower.split()
+        if not words:
+            return lower
+        wake_targets = ['ava', 'eva']
+        for i, word in enumerate(words[:2]):
+            clean = word.strip('.,!?')
+            if len(clean) < 2 or len(clean) > 5:
+                continue
+            for target in wake_targets:
+                dist = self._edit_distance(clean, target)
+                if dist <= 1:  # 1 edit away from ava/eva
+                    words[i] = target
+                    result = ' '.join(words)
+                    print(f"[vosk-fuzzy] '{text[:30]}' -> '{result[:30]}' ('{clean}'~'{target}' dist={dist})")
+                    return result
+            # Also check "hey/ok X" where X is <=2 edits from ava/eva
+            # (looser threshold OK because "hey" prefix narrows context)
+            if i == 0 and clean in ('hey', 'ok', 'okay', 'hi', 'hello') and len(words) > 1:
+                w2 = words[1].strip('.,!?')
+                if len(w2) >= 2 and len(w2) <= 5:
+                    for target in wake_targets:
+                        dist = self._edit_distance(w2, target)
+                        if dist <= 2:
+                            words[1] = target
+                            result = ' '.join(words)
+                            print(f"[vosk-fuzzy] '{text[:30]}' -> '{result[:30]}' ('hey {w2}'~'hey {target}' dist={dist})")
+                            return result
+        return lower
+
+    @staticmethod
+    def _edit_distance(s1: str, s2: str) -> int:
+        """Levenshtein edit distance between two strings."""
+        if len(s1) < len(s2):
+            return StandaloneRealtimeAVA._edit_distance(s2, s1)
+        if len(s2) == 0:
+            return len(s1)
+        prev = list(range(len(s2) + 1))
+        for i, c1 in enumerate(s1):
+            curr = [i + 1]
+            for j, c2 in enumerate(s2):
+                curr.append(min(prev[j + 1] + 1, curr[j] + 1, prev[j] + (0 if c1 == c2 else 1)))
+            prev = curr
+        return prev[-1]
 
     def _init_unified_voice(self):
         if not _VOICE_SCAFFOLD_AVAILABLE:
@@ -1650,53 +1920,113 @@ class StandaloneRealtimeAVA:
 
         # Create bus and provider
         self._voice_bus = _VoiceEventBus()
-        # Alias to match event emission style used across providers
-        self.bus = self._voice_bus
-        whisper_model = (self.cfg.get('local_fallback') or {}).get('whisper_model', 'small')
-        self._voice_provider = _LocalHybridProvider(self._voice_bus, whisper_model=whisper_model)
+        whisper_model = (self.cfg.get('local_fallback') or {}).get('whisper_model', 'tiny.en')
+        wake_words = self._wake_words if self._validation_mode else None
+        asr_silence_threshold = int(max(600, self.START_THRESH * 1.5, self.STOP_THRESH * 2.5))
+        self._voice_provider = _LocalHybridProvider(
+            self._voice_bus,
+            whisper_model=whisper_model,
+            wake_words=wake_words,
+            use_vosk_final_direct=False,
+            silence_threshold=asr_silence_threshold,
+            silence_duration=0.35,
+            min_audio_length=0.45,
+            max_utterance_sec=4.5,
+        )
+        print(f"[voice-unified] ASR silence threshold: {asr_silence_threshold}")
         # Utterance commit tracking
         self._utt_committed = set()
-        self._last_asr_final_meta = None
+        self._last_asr_final_meta = {}
 
         # Track when TTS last ended for echo grace period
         self._tts_ended_at = 0.0
-        # Configurable echo grace period (seconds)
-        try:
-            ec = (self.cfg.get('echo_cancellation') or {})
-            self._echo_grace_sec = float(ec.get('grace_period_sec', 2.0) or 2.0)
-        except Exception:
-            self._echo_grace_sec = 2.0
 
         # Bridge: on final user text -> existing respond + TTS path
         def _on_final_user_text(txt: str):
             if not txt:
                 return
-            # ECHO GATE: Ignore ASR finals while TTS is playing to prevent feedback loop
-            if self.tts_active.is_set():
-                print(f"[echo-gate] Ignoring ASR final during TTS: {txt[:30]}...")
+            # Trace setup (per-final)
+            try:
+                import uuid as _uuid
+            except Exception:
+                _uuid = None
+            _trace_id = None
+            try:
+                _trace_id = getattr(self._turn_state, 'tts_token', None)
+            except Exception:
+                _trace_id = None
+            if not _trace_id:
+                try:
+                    _trace_id = (_uuid.uuid4().hex[:8] if _uuid else f"t{int(time.time()*1000)%100000:05d}")
+                except Exception:
+                    _trace_id = "trc-unknown"
+
+            def _emit_trace(outcome: str, input_kind: str, gate=None, suppress=None, extra=None):
+                try:
+                    gate = gate or {}
+                    suppress = suppress or {}
+                    extra = extra or {}
+                    gate_s = ','.join([f"{k}={gate[k]}" for k in sorted(gate.keys())]) if gate else ''
+                    sup_s = ','.join([f"{k}={suppress[k]}" for k in sorted(suppress.keys())]) if suppress else ''
+                    ext_s = ','.join([f"{k}={extra[k]}" for k in sorted(extra.keys())]) if extra else ''
+                    line = "[trace] trc={trc} input={inp} gate={{{gate}}} suppress={{{sup}}} extra={{{ext}}} outcome={out}".format(
+                        trc=_trace_id, inp=input_kind, gate=gate_s, sup=sup_s, ext=ext_s, out=outcome
+                    )
+                    print(line)
+                except Exception:
+                    pass
+            # VOSK ALIAS NORMALIZATION: Replace known misrecognitions before any processing
+            # This ensures the corrected text is used downstream (server, LLM, TTS)
+            normalized = self._normalize_for_wake(txt)
+            if normalized != txt.lower().strip():
+                txt = normalized  # Use corrected transcript from here on
+
+            # ECHO GATE: Ignore ASR finals while TTS is being synthesized or queued playback is draining.
+            if self.tts_active.is_set() or getattr(self, '_awaiting_playback_end', False):
+                print(f"[echo-gate] Ignoring ASR final during TTS/playback: {txt[:30]}...")
+                _emit_trace(outcome="IGNORE", input_kind="unknown",
+                            gate=dict(wake_ok=None, tool_ok=None, verb_ok=None, echo_blackout=False),
+                            suppress=dict(during_tts=True))
                 return
-            # ECHO GRACE: Ignore ASR finals for a short period after TTS ends (config-driven)
+            # PLAYBACK-END BLACKOUT: authoritative tail suppression after audio finishes
             import time
-            grace_period = getattr(self, '_echo_grace_sec', 2.0) or 2.0
-            if self._tts_ended_at and (time.time() - self._tts_ended_at) < grace_period:
-                print(f"[echo-gate] Ignoring ASR final in grace period: {txt[:30]}...")
+            blackout_until = getattr(self, "_asr_blackout_until", 0.0) or 0.0
+            if time.time() < blackout_until:
+                print(f"[echo-gate] Ignoring ASR final in blackout: {txt[:30]}...")
+                _emit_trace(outcome="IGNORE", input_kind="unknown",
+                            gate=dict(wake_ok=None, tool_ok=None, verb_ok=None, echo_blackout=True),
+                            suppress=dict(blackout=True))
                 return
 
             # VALIDATION MODE: Filter transcripts by wake word and minimum words
             if self._validation_mode:
-                txt_lower = txt.lower().strip()
-                has_wake_word = any(txt_lower.startswith(w) or f" {w}" in txt_lower for w in self._wake_words)
-                word_count = len(txt.split())
-
-                if not has_wake_word:
-                    if word_count < self._min_words_without_wake:
-                        print(f"[validation-mode] Ignoring short transcript without wake word: '{txt}' ({word_count} words)")
-                        return
-                    # Even longer transcripts need wake word for tool actions
-                    print(f"[validation-mode] No wake word detected, will skip tool execution: '{txt[:30]}...'")
-
+                import time
+                meta = getattr(getattr(self, '_voice_session', None), '_last_user_final_meta', None) or self._last_asr_final_meta or {}
+                soft_wake_rescue = bool(meta.get('soft_wake_rescue'))
+                has_wake_word = _transcript_has_wake_phrase(txt, self._wake_words)
+                wake_followup_active = bool(getattr(self, '_wake_followup_until', 0.0) and time.time() < getattr(self, '_wake_followup_until', 0.0))
+                if not has_wake_word and not soft_wake_rescue and not wake_followup_active:
+                    word_count = len(_normalize_transcript_words(txt))
+                    print(f"[validation-mode] Ignoring short transcript without wake word: '{txt}' ({word_count} words)")
+                    self._store_overheard(txt, responded=False)
+                    return
+                if soft_wake_rescue:
+                    print(f"[validation-mode] Accepting transcript via ASR soft wake rescue: '{txt[:60]}'")
+                if wake_followup_active:
+                    self._wake_followup_until = 0.0
             # TURN STATE: Final transcript from unified voice session
             print(f"[FINAL -> DECIDE] '{txt[:40]}...'")
+            try:
+                # Reflect actual gate state for visibility
+                _gate_wake = True
+                try:
+                    _gate_wake = bool(locals().get('_wake_ok', True))
+                except Exception:
+                    _gate_wake = True
+                _emit_trace(outcome="DECIDE", input_kind="chat",
+                            gate=dict(wake_ok=_gate_wake, tool_ok=None, verb_ok=None, echo_blackout=False))
+            except Exception:
+                pass
             self._turn_state.transition(TurnState.LISTEN, "user speaking")
             self._turn_state.transition(TurnState.FINAL, "final transcript")
             self._turn_state.transition(TurnState.DECIDE, "processing")
@@ -1719,7 +2049,7 @@ class StandaloneRealtimeAVA:
                 if not handled:
                     enhanced = self._get_enhanced_transcript(txt)
                     # Utterance commit handling
-                    meta = self._last_asr_final_meta or {}
+                    meta = getattr(getattr(self, '_voice_session', None), '_last_user_final_meta', None) or self._last_asr_final_meta or {}
                     utt_id = meta.get('utterance_id')
                     if utt_id and utt_id in getattr(self, '_utt_committed', set()):
                         self._turn_state.force_idle("duplicate utterance")
@@ -1727,30 +2057,22 @@ class StandaloneRealtimeAVA:
                     # Mark ASR final timestamp for metrics
                     asr_final_ts = time.time()
                     self._asr_final_ts = asr_final_ts
-                    try:
-                        _latlog_write({"stage": "asr_final", "text_len": len(txt or "")})
-                    except Exception:
-                        pass
+                    self._write_latency_log_entry({
+                        "stage": "asr_final",
+                        "ts": asr_final_ts,
+                        "utterance_id": utt_id,
+                    })
                     reply = loop.run_until_complete(self._ask_server_respond(enhanced))
-                    try:
-                        # Approximate LLM latency from ASR final to now
-                        llm_ms_local = None
-                        if self._asr_final_ts:
-                            llm_ms_local = int(max(0, (time.time() - self._asr_final_ts) * 1000))
-                        _latlog_write({"stage": "llm_done", "reply_len": len(reply or ""), **({"llm_ms": llm_ms_local} if llm_ms_local is not None else {})})
-                    except Exception:
-                        pass
+                    self._write_latency_log_entry({
+                        "stage": "llm_done",
+                        "ts": time.time(),
+                        "utterance_id": utt_id,
+                    })
                     if reply:
                         # TURN STATE: Entering SPEAK phase
                         self._turn_state.transition(TurnState.SPEAK, "TTS starting")
                         # Speak via unified TTS (Edge TTS streaming)
                         try:
-                            # ASR FINAL checkpoint
-                            try:
-                                _latlog_write({"stage": "asr_final", "text_len": len(txt or "")})
-                            except Exception:
-                                pass
-
                             self._awaiting_tts_since = time.time()
                             self._tts_first_chunk_ts = 0.0
                             try:
@@ -1759,46 +2081,27 @@ class StandaloneRealtimeAVA:
                             except Exception:
                                 pass
                             print(f"[tts-debug] speak() called with: {reply[:50]}...")
-                            try:
-                                if os.environ.get("AVA_HARNESS", "").strip() == "1":
-                                    print(f"[HARNESS] speak() choke hit (sha1={hashlib.sha1((reply or '').encode()).hexdigest()[:12]})")
-                            except Exception:
-                                pass
-                            # LLM DONE checkpoint (measure LLM latency locally if possible)
-                            try:
-                                # If we have asr_final_ts and llm_end-like markers in metrics, prefer them;
-                                # otherwise estimate from await timings already completed above.
-                                llm_ms_local = None
-                                try:
-                                    _asr_ts = getattr(self, '_asr_final_ts', None)
-                                    _llm_end = time.time()
-                                    if _asr_ts:
-                                        llm_ms_local = int(max(0, (_llm_end - _asr_ts) * 1000))
-                                except Exception:
-                                    pass
-                                _latlog_write({
-                                    "stage": "llm_done",
-                                    "reply_len": len(reply or ""),
-                                    **({"llm_ms": llm_ms_local} if llm_ms_local is not None else {})
-                                })
-                            except Exception:
-                                pass
                             # TURN-SCOPED TTS GATE for unified path
                             active_token = self._turn_state.tts_token
                             if tts_token != active_token:
                                 print(f"[tts.blocked_background] Rejected (unified): turn_id={tts_token} active={active_token}")
-                                # No TTS will fire, so no tts.end event — force cleanup
+                                # No TTS will fire, so no tts.end event - force cleanup
                                 self._turn_state.force_idle("TTS blocked (unified)")
                             else:
-                                self._voice_session.speak(reply)
-                            if utt_id:
-                                self._utt_committed.add(utt_id)
-                        except Exception as e:
-                            try:
-                                _latlog_write({"stage": "tts_error", "err": repr(e)})
-                            except Exception:
-                                pass
-                            # TTS failed — force cleanup to prevent leaked SPEAK state
+                                # Phase 2: microstream gateway - split reply into short segments
+                                segs = self._segment_text_for_tts(reply)
+                                for idx, seg in enumerate(segs):
+                                    try:
+                                        if not seg.strip():
+                                            continue
+                                        # Start playing segment as soon as it is synthesized by the underlying engine
+                                        self._voice_session.speak(seg)
+                                    except Exception:
+                                        pass
+                                if utt_id:
+                                    self._utt_committed.add(utt_id)
+                        except Exception:
+                            # TTS failed - force cleanup to prevent leaked SPEAK state
                             self._turn_state.force_idle("TTS error (unified)")
                         # Note: On success, TURN STATE -> IDLE handled by voice session's tts.end event
                         # Record interaction for passive learning
@@ -1811,17 +2114,9 @@ class StandaloneRealtimeAVA:
                             pass
                     else:
                         # No reply - return to IDLE
-                        try:
-                            _latlog_write({"stage": "no_reply"})
-                        except Exception:
-                            pass
                         self._turn_state.force_idle("no reply")
                 else:
                     # Local intent handled - return to IDLE
-                    try:
-                        _latlog_write({"stage": "local_intent_handled"})
-                    except Exception:
-                        pass
                     self._turn_state.force_idle("local intent handled")
             except Exception:
                 self._turn_state.force_idle("error")
@@ -1835,6 +2130,18 @@ class StandaloneRealtimeAVA:
         self._voice_session = _VoiceSession(self._voice_provider)
         self._voice_session.on_user_final(_on_final_user_text)
 
+        # Enable barge-in in unified mode (configurable)
+        try:
+            aud_cfg = self.cfg.get('audio') or {}
+            self._barge_in_enabled = bool(aud_cfg.get('barge_in_enabled', True))
+            # Optional cancellation + cooldown defaults
+            self._barge_in_cancel_tts = bool(aud_cfg.get('barge_in_cancel_tts', True))
+            self._barge_in_cooldown_ms = int(aud_cfg.get('barge_in_cooldown_ms', 400))
+        except Exception:
+            self._barge_in_enabled = True
+            self._barge_in_cancel_tts = True
+            self._barge_in_cooldown_ms = 400
+
         # Attach TTS engine (Piper or Edge) and route chunks to playback queue
         try:
             lf = (self.cfg.get('local_fallback') or {})
@@ -1845,17 +2152,6 @@ class StandaloneRealtimeAVA:
                 model = p.get('model') or str((Path(__file__).resolve().parent / 'voices' / 'piper' / 'en_US-lessac-medium.onnx'))
                 tts = _PiperBinTTS(exe_path=exe, model_path=model)
                 self._voice_session.set_tts(tts, self._playback_enqueue_sync)
-                # Default micro-utterance chunking for Piper if not explicitly configured
-                try:
-                    if not (self.cfg.get('tts_chunking') and isinstance(self.cfg.get('tts_chunking'), dict)):
-                        self._voice_session.tts_chunking_cfg = {
-                            'enabled': True,
-                            'max_words': 6,
-                            'max_chars': 60,
-                            'min_words': 3,
-                        }
-                except Exception:
-                    pass
                 print(f"[voice-unified] TTS engine: piper (all TTS routes through local, no remote API)")
                 # Playback rate will be adjusted on first chunk via tts.current_sample_rate
             else:
@@ -1867,19 +2163,15 @@ class StandaloneRealtimeAVA:
         except Exception as e:
             print(f"[voice-unified] TTS init unavailable: {e}")
 
+        # Initialize latency profiler
+        try:
+            self._lat_prof = _LatencyProfiler()
+        except Exception:
+            self._lat_prof = None
+
         # Subscribe for barge-in / VAD and asr.final meta capture
         def _bus_handler(ev):
             try:
-                # Global latency checkpoints from voice bus
-                et = getattr(ev, 'type', None)
-                if et == 'asr.final':
-                    try:
-                        _latlog_write({
-                            "stage": "asr_final",
-                            "text_len": len(getattr(ev, 'text', '') or ''),
-                        })
-                    except Exception:
-                        pass
                 if ev.type == 'vad.start':
                     # Mark speaking; mic loop applies debounce to prevent echo loops
                     self.user_speaking.set()
@@ -1897,8 +2189,7 @@ class StandaloneRealtimeAVA:
                     if self.tts_active.is_set():
                         return
                     # ECHO GRACE: Also drop partials shortly after TTS ends
-                    grace_period = getattr(self, '_echo_grace_sec', 2.0) or 2.0
-                    if self._tts_ended_at and (time.time() - self._tts_ended_at) < grace_period:
+                    if self._tts_ended_at and (time.time() - self._tts_ended_at) < 2.0:
                         return
                     # First partial timing
                     if self._speech_start_ts and not self._first_partial_ts:
@@ -1913,12 +2204,12 @@ class StandaloneRealtimeAVA:
                 elif ev.type == 'tts.start':
                     # HALF-DUPLEX: Set runner tts_active flag so echo gate blocks ASR
                     self.tts_active.set()
+                    self._tts_synthesis_active = True
                     self._tts_last_active = time.time()
                     print("[half-duplex] MIC MUTED (unified) - TTS starting")
-                    # Arm utterance tracking for playback-complete signaling and reset end guard
+                    # Prepare playback-end detection for blackout authority
                     try:
-                        self.utt_playback_done.clear()
-                        self._utt_in_progress = True
+                        self._awaiting_playback_end = True
                         self._playback_end_fired = False
                     except Exception:
                         pass
@@ -1952,71 +2243,61 @@ class StandaloneRealtimeAVA:
                     except Exception:
                         pass
                 elif ev.type == 'tts.end':
-                    # tts.end == synthesis complete, NOT playback complete. Do not unmute or drain here.
+                    # TTS synthesis finished; keep mic gated until playback queue drains in the playback worker.
+                    self._tts_synthesis_active = False
                     self._tts_ended_at = time.time()
                     print("[half-duplex] TTS synthesis complete (unified) - waiting for playback to finish")
-                    # Signal playback end-of-utterance; playback worker will emit playback.end
+                    # LATENCY: Consolidated per-turn latency line
                     try:
-                        self._queue_utterance_end()
-                    except Exception:
-                        self._utt_in_progress = False
+                        _asr_ts = getattr(self, '_asr_final_ts', 0.0)
+                        _vad_end = getattr(self, '_speech_end_ts', 0.0)
+                        _llm_start = _asr_ts
+                        _llm_end = getattr(self, '_awaiting_tts_since', 0.0)
+                        _first_chunk = getattr(self, '_tts_first_chunk_ts', 0.0)
+                        _tts_end = self._tts_ended_at
+                        asr_ms = int((_asr_ts - _vad_end) * 1000) if _asr_ts and _vad_end else 0
+                        llm_ms = int((_llm_end - _llm_start) * 1000) if _llm_end and _llm_start else 0
+                        tts_synth_ms = int((_first_chunk - _llm_end) * 1000) if _first_chunk and _llm_end else 0
+                        playback_ms = int((_tts_end - _first_chunk) * 1000) if _tts_end and _first_chunk else 0
+                        total_ms = asr_ms + llm_ms + tts_synth_ms + playback_ms
+                        print(f"[latency] asr={asr_ms}ms llm={llm_ms}ms tts_synth={tts_synth_ms}ms playback={playback_ms}ms total={total_ms}ms")
                         try:
-                            self.utt_playback_done.set()
+                            if getattr(self, '_lat_prof', None):
+                                self._lat_prof.record('asr_ms', asr_ms)
+                                self._lat_prof.record('llm_ms', llm_ms)
+                                self._lat_prof.record('tts_synth_ms', tts_synth_ms)
+                                self._lat_prof.record('playback_ms', playback_ms)
+                                self._lat_prof.record('total_ms', total_ms)
+                                self._lat_prof.maybe_report()
                         except Exception:
                             pass
-                        try:
-                            self.bus.emit(_VoiceEvent(type="playback.end"))
-                        except Exception:
-                            pass
-                    # Start a watchdog to emit playback.end once audio queue drains (fallback if sentinel is missed)
-                    def _watchdog():
-                        import time as _t
-                        deadline = _t.time() + 12.0
-                        while _t.time() < deadline:
-                            try:
-                                if self.audio_queue.empty() and not self.playback_busy.is_set():
-                                    try:
-                                        self.bus.emit(_VoiceEvent(type="playback.end"))
-                                    except Exception:
-                                        pass
-                                    break
-                            except Exception:
-                                break
-                            _t.sleep(0.15)
-                    try:
-                        threading.Thread(target=_watchdog, daemon=True).start()
                     except Exception:
                         pass
-                elif ev.type == 'playback.end':
-                    # Debounce duplicate playback.end and own the end-of-playback state here
-                    if getattr(self, '_playback_end_fired', False):
-                        return
-                    self._playback_end_fired = True
-                    # Start short ASR blackout to avoid tail finals
-                    try:
-                        self._asr_blackout_until = time.time() + 0.8
-                        print(f"[asr] blackout until {self._asr_blackout_until:.3f} (+0.8s)")
-                    except Exception:
-                        pass
-                    # Now it is safe to end the speaking turn.
-                    try:
-                        self.tts_active.clear()
-                    except Exception:
-                        pass
-                    self._tts_ended_at = time.time()
-                    print("[half-duplex] MIC UNMUTED (unified) - playback finished")
-                    # TURN STATE: Back to IDLE only after audible speech finishes
-                    try:
-                        self._turn_state.force_idle("TTS playback finished (playback.end)")
-                    except Exception:
-                        pass
-                    # Clear ASR buffer AFTER playback finishes
+                    # Playback worker owns final DECIDE -> IDLE transition after queued audio drains.
+                    # Clear ASR buffer to prevent accumulated TTS audio from being transcribed
                     try:
                         if hasattr(self, '_voice_provider') and self._voice_provider:
                             asr = getattr(self._voice_provider, 'asr', None)
                             if asr and hasattr(asr, 'clear_buffer'):
                                 asr.clear_buffer()
-                                print("[echo-gate] Cleared ASR buffer on playback end")
+                                print(f"[echo-gate] Cleared ASR buffer on TTS end")
+                    except Exception:
+                        pass
+                    # Do not drain self.audio_queue here: playback may still have queued speech chunks.
+                    # The playback worker raises the final playback-finished transition after the queue empties.
+                    try:
+                        if getattr(self, '_awaiting_playback_end', False) and hasattr(self, 'audio_queue') and self.audio_queue.empty():
+                            self._asr_blackout_until = time.time() + 0.8
+                            self._awaiting_playback_end = False
+                            self._playback_end_fired = True
+                            self.tts_active.clear()
+                            print(f"[echo-gate] ASR blackout until {self._asr_blackout_until:.3f}")
+                            print("[half-duplex] MIC UNMUTED (unified) - playback finished (empty queue)")
+                            try:
+                                if hasattr(self, '_turn_state') and self._turn_state:
+                                    self._turn_state.force_idle("TTS playback finished (empty queue)")
+                            except Exception:
+                                pass
                     except Exception:
                         pass
             except Exception:
@@ -2027,6 +2308,9 @@ class StandaloneRealtimeAVA:
     def run_unified_voice(self):
         """Start unified local voice (Hybrid ASR + server respond + streamed TTS)."""
         self._init_unified_voice()
+
+        # KEEP-ALIVE: unified mode must own the process lifetime
+        self.running = True
 
         # Ensure playback worker for our streamed TTS
         if not (self.playback_thread and self.playback_thread.is_alive()):
@@ -2041,73 +2325,226 @@ class StandaloneRealtimeAVA:
             return
 
         # Mic capture -> session.push_audio
-        p = pyaudio.PyAudio()
-        aud_cfg = self.cfg.get('audio') or {}
-        config_sample_rate = int(aud_cfg.get('input_sample_rate', 16000))
-        # Rate cascade: config rate first, then standard rates (deduplicated, ordered)
-        _rates_to_try = list(dict.fromkeys([config_sample_rate, 48000, 44100, 16000]))
-        print(f"[audio] Config: device={self.input_device_index}, rate={config_sample_rate}, cascade={_rates_to_try}")
-
-        def _open_mic_with_fallback():
-            """Returns (stream, device_index, actual_rate) or (None, None, None)."""
-            target_idx = self.input_device_index
-            # Try configured device with rate cascade
-            if target_idx is not None:
-                for rate in _rates_to_try:
-                    try:
-                        cf = max(int(rate * 0.02), 160)  # ~20ms at this rate
-                        kw = dict(format=pyaudio.paInt16, channels=1, rate=rate,
-                                  input=True, frames_per_buffer=cf, input_device_index=target_idx)
-                        ms = p.open(**kw)
-                        try:
-                            info = p.get_device_info_by_index(target_idx)
-                            print(f"[audio] Opened input: {info.get('name')} (idx={target_idx}) @ {rate} Hz")
-                        except Exception:
-                            print(f"[audio] Opened input: device idx={target_idx} @ {rate} Hz")
-                        return ms, target_idx, rate
-                    except Exception as e:
-                        print(f"[audio] Device {target_idx} @ {rate} Hz FAILED: {e}")
-                print(f"[audio] WARNING: All rates failed for configured device {target_idx}, trying other devices")
-            # Fallback: try other devices with rate cascade (NO silent fallback)
-            try:
-                dev_count = p.get_device_count()
-                for idx in range(dev_count):
-                    if idx == target_idx:
-                        continue
-                    info = p.get_device_info_by_index(idx)
-                    if int(info.get('maxInputChannels', 0)) <= 0:
-                        continue
-                    for rate in _rates_to_try:
-                        try:
-                            cf = max(int(rate * 0.02), 160)
-                            kw = dict(format=pyaudio.paInt16, channels=1, rate=rate,
-                                      input=True, frames_per_buffer=cf, input_device_index=idx)
-                            ms = p.open(**kw)
-                            print(f"[audio] Fallback input: {info.get('name')} (idx={idx}) @ {rate} Hz")
-                            return ms, idx, rate
-                        except Exception:
-                            continue
-            except Exception:
-                pass
-            return None, None, None
-
-        mic_stream, sel_idx, actual_mic_rate = _open_mic_with_fallback()
+        deterministic_input_wav = os.getenv('AVA_INPUT_WAV')
+        p = None if deterministic_input_wav else pyaudio.PyAudio()
+        if deterministic_input_wav:
+            mic_stream, sel_idx, actual_mic_rate, chunk_frames = self._open_deterministic_input_stream(deterministic_input_wav, target_rate=16000)
+        else:
+            mic_stream, sel_idx, actual_mic_rate, chunk_frames = self._open_ranked_input_stream(
+                p,
+                format=pyaudio.paInt16,
+                channels=1,
+                target_rate=16000,
+                mode_label='input',
+            )
         if mic_stream is None:
-            print("[voice-unified] No suitable input device found.")
-            return
-        chunk_frames = max(int(actual_mic_rate * 0.02), 160)  # ~20ms at actual rate
+            tried_dev = self.input_device_index
+            print(f"[voice-unified] Mic open failed — device={tried_dev}")
+            import sys as _sys
+            _sys.exit(2)
         _need_mic_resample = (actual_mic_rate != 16000)
         if _need_mic_resample:
             print(f"[audio] Will resample mic audio: {actual_mic_rate} Hz -> 16000 Hz for ASR")
 
+        def _open_mic_with_fallback():
+            return self._open_ranked_input_stream(
+                p,
+                format=pyaudio.paInt16,
+                channels=1,
+                target_rate=16000,
+                mode_label='input',
+            )
+
         def _mic_loop():
+            nonlocal mic_stream, sel_idx, actual_mic_rate, chunk_frames, _need_mic_resample
+            print(f"[mic] loop entered frames_per_chunk={chunk_frames} rate={actual_mic_rate} device={sel_idx}")
+            fail_count = 0
+            last_ok = time.time()
+            last_frame_bytes = None
+            identical_frame_run = 0
+            flatline_rms_run = 0
+            # Barge-in gate state
             speaking_frames = 0
             required_frames_when_tts = 8  # ~160ms at 20ms frames
             prev_speaking = False
-            gate_pos_frames = 0  # Two-frame confirm to suppress pops
+            gate_pos_frames = 0
+
+            while self.running:
+                try:
+                    data = mic_stream.read(chunk_frames, exception_on_overflow=False)
+
+                    now = time.time()
+                    self._last_mic_frame_ts = now
+                    try:
+                        mic_rms = self._rms_int16(data)
+                    except Exception:
+                        mic_rms = 0
+
+                    current_frame_bytes = bytes(data)
+                    if last_frame_bytes is not None and current_frame_bytes == last_frame_bytes:
+                        identical_frame_run += 1
+                    else:
+                        identical_frame_run = 0
+                    last_frame_bytes = current_frame_bytes
+
+                    if mic_rms <= 1:
+                        flatline_rms_run += 1
+                    else:
+                        flatline_rms_run = 0
+
+                    frame_looks_healthy = bool(identical_frame_run < 8)
+                    if frame_looks_healthy:
+                        last_ok = now
+                        fail_count = 0
+                    elif (now - last_ok) > 2.0 and identical_frame_run >= 8:
+                        raise RuntimeError(f"mic flatline detected identical_run={identical_frame_run} flatline_rms_run={flatline_rms_run} rms={int(mic_rms)}")
+
+                    # lightweight debug every ~2s
+                    if not hasattr(self, "_micdbg_next"):
+                        self._micdbg_next = 0.0
+                    if now >= self._micdbg_next:
+                        self._micdbg_next = now + 2.0
+                        try:
+                            print(f"[micdbg] rx frames={chunk_frames} rms={int(mic_rms)} thresh={self.START_THRESH} identical_run={identical_frame_run} flatline_rms_run={flatline_rms_run}")
+                        except Exception as e:
+                            print(f"[micdbg] rms error: {e}")
+
+                    # Half-duplex echo gate: do not feed playback/tail audio into ASR.
+                    suppress_asr_for_echo = False
+                    try:
+                        suppress_asr_for_echo = bool(
+                            self.tts_active.is_set()
+                            or getattr(self, '_awaiting_playback_end', False)
+                            or now < float(getattr(self, '_asr_blackout_until', 0.0) or 0.0)
+                        )
+                    except Exception:
+                        suppress_asr_for_echo = False
+
+                    if suppress_asr_for_echo and not getattr(self, '_barge_in_enabled', False):
+                        if not hasattr(self, '_echo_skip_log_next'):
+                            self._echo_skip_log_next = 0.0
+                        if now >= self._echo_skip_log_next:
+                            self._echo_skip_log_next = now + 1.0
+                            print("[echo-gate] Suppressing mic->ASR during playback/blackout")
+                        continue
+
+                    try:
+                        if self._validation_mode:
+                            followup_until = float(getattr(self, '_wake_followup_until', 0.0) or 0.0)
+                            asr_engine = getattr(getattr(self, '_voice_provider', None), 'asr', None)
+                            if asr_engine and getattr(asr_engine, 'capture_enabled', False) and followup_until and now >= followup_until:
+                                asr_engine.set_capture_enabled(False)
+                                self._wake_followup_until = 0.0
+                                print("[wake-followup] Follow-up window expired; ASR capture gate re-armed")
+                        asr_data = _resample_audio(data, actual_mic_rate, 16000) if _need_mic_resample else data
+                        self._voice_session.push_audio(asr_data)
+                    except Exception as e:
+                        print(f"[mic] push_audio error: {e}")
+
+                    # Barge-in: detect user speech during TTS and cancel playback
+                    try:
+                        if getattr(self, '_barge_in_enabled', False) and self.tts_active.is_set():
+                            # Compute RMS if not already
+                            try:
+                                mic_rms
+                            except NameError:
+                                try:
+                                    mic_rms = self._rms_int16(data)
+                                except Exception:
+                                    mic_rms = 0
+                            # Dynamic threshold using playback RMS EMA if available
+                            dyn_thresh = int(max(self.START_THRESH, int(getattr(self, '_playback_rms_ema', 0) * 2.0)))
+                            if mic_rms >= dyn_thresh:
+                                gate_pos_frames += 1
+                                if gate_pos_frames >= 2:
+                                    speaking_frames += 1
+                                    if speaking_frames >= required_frames_when_tts:
+                                        print(f"[barge] user speech detected -> cancel TTS (rms={int(mic_rms)} thr={dyn_thresh})")
+                                        self._cancel_tts_playback()
+                                        speaking_frames = 0
+                                        gate_pos_frames = 0
+                            else:
+                                # decay
+                                speaking_frames = 0
+                                gate_pos_frames = 0
+                    except Exception:
+                        pass
+
+                except Exception as e:
+                    fail_count += 1
+                    if fail_count <= 5 or (fail_count % 50 == 0):
+                        print(f"[mic] read failed (count={fail_count}): {e}")
+
+                    # If we've had no good frames for >2s, try reopening
+                    if (time.time() - last_ok) > 2.0:
+                        print("[mic] no frames for >2s -> attempting mic reopen")
+                        try:
+                            try:
+                                mic_stream.stop_stream()
+                                mic_stream.close()
+                            except Exception:
+                                pass
+
+                            mic_stream, sel_idx, actual_mic_rate, chunk_frames = _open_mic_with_fallback()
+                            if mic_stream is None:
+                                print("[mic] reopen failed: no suitable input device")
+                                time.sleep(0.2)
+                                continue
+
+                            _need_mic_resample = (actual_mic_rate != 16000)
+                            last_frame_bytes = None
+                            identical_frame_run = 0
+                            flatline_rms_run = 0
+                            if _need_mic_resample:
+                                print(f"[audio] Will resample mic audio: {actual_mic_rate} Hz -> 16000 Hz for ASR")
+                            print(f"[mic] reopen success: device={sel_idx} rate={actual_mic_rate} frames={chunk_frames}")
+                            last_ok = time.time()
+                            fail_count = 0
+                        except Exception as e2:
+                            print(f"[mic] reopen exception: {e2}")
+                            time.sleep(0.2)
+                    else:
+                        time.sleep(0.02)
+
+        # Start microphone capture loop
+        try:
+            mic_thread = threading.Thread(target=_mic_loop, name="unified_mic", daemon=True)
+            mic_thread.start()
+            print("[voice-unified] Mic loop started")
+        except Exception as e:
+            print(f"[voice-unified] Failed to start mic loop: {e}")
+            return
+
+        # Block process lifetime here until shutdown
+        # Heartbeat and lifetime block
+        try:
+            _hb_last = 0.0
+            while self.running:
+                time.sleep(0.2)
+                try:
+                    now = time.time()
+                    if now - _hb_last >= 2.0:
+                        _hb_last = now
+                        state = None
+                        try:
+                            state = self._turn_state.state
+                        except Exception:
+                            state = "?"
+                        try:
+                            qsz = self.audio_queue.qsize()
+                        except Exception:
+                            qsz = -1
+                        try:
+                            lm = getattr(self, '_last_mic_frame_ts', 0.0) or 0.0
+                        except Exception:
+                            lm = 0.0
+                        print(f"[hb] unified state={state} tts={self.tts_active.is_set()} q={qsz} last_mic={lm:.3f}")
+                except Exception:
+                    pass
+        finally:
+            self.running = False
             try:
                 while self.running:
-                    _suppress_asr_frame = False
                     try:
                         data = mic_stream.read(chunk_frames, exception_on_overflow=False)
                         if _need_mic_resample:
@@ -2121,23 +2558,19 @@ class StandaloneRealtimeAVA:
                     except Exception:
                         mic_rms = 0.0
 
-                    # ECHO CANCELLATION: Suppress mic input while TTS is active or in grace period
+                    # ECHO CANCELLATION: Suppress mic input while TTS is active or in playback-end blackout
                     try:
-                        # Hard suppression when TTS active
-                        if self.tts_active.is_set():
-                            _suppress_asr_frame = True
-
-                        # Short blackout after playback.end to avoid tail finals
-                        if getattr(self, '_asr_blackout_until', 0.0):
-                            if time.time() < float(self._asr_blackout_until or 0.0):
-                                _suppress_asr_frame = True
-
-                        # Extended grace suppression to let room acoustics settle
                         if self._echo_suppression_enabled:
-                            mic_grace_period = 3.0
-                            if hasattr(self, '_tts_ended_at') and self._tts_ended_at:
-                                if (time.time() - self._tts_ended_at) < mic_grace_period:
-                                    _suppress_asr_frame = True
+                            # Check if TTS is currently active
+                            if self.tts_active.is_set():
+                                # Mic is likely picking up TTS output - skip this frame entirely
+                                continue
+
+                            # Check authoritative playback-end blackout window
+                            blackout_until = float(getattr(self, '_asr_blackout_until', 0.0) or 0.0)
+                            if time.time() < blackout_until:
+                                # Within blackout window - skip ALL frames to prevent tail residue
+                                continue
                     except Exception:
                         pass
 
@@ -2164,10 +2597,9 @@ class StandaloneRealtimeAVA:
                                 print(f"[mic] rms={int(mic_rms)}")
                     except Exception:
                         pass
-                    # Feed ASR (skip during TTS/blackout/grace; harness still captures above)
+                    # Feed ASR
                     try:
-                        if not _suppress_asr_frame:
-                            self._voice_session.push_audio(data)
+                        self._voice_session.push_audio(data)
                         # DEBUG disabled for stability
                         # if hasattr(self, '_voice_provider') and hasattr(self._voice_provider, 'asr'):
                         #     asr = self._voice_provider.asr
@@ -2183,17 +2615,6 @@ class StandaloneRealtimeAVA:
                         is_spk = bool(asr and hasattr(asr, 'is_speaking') and asr.is_speaking())
                         if is_spk:
                             self.user_speaking.set()
-                            # Harness: start/continue capturing user speech (post-resample, 16k mono int16)
-                            try:
-                                if getattr(self, '_harness_enabled', False):
-                                    if not prev_speaking:
-                                        with self._harness_lock:
-                                            self._harness_user_buf.clear()
-                                            self._harness_user_tag = self._harness_turn_tag()
-                                    with self._harness_lock:
-                                        self._harness_user_buf.extend(data)
-                            except Exception:
-                                pass
                             # Adaptive threshold while TTS is active to avoid echo loops
                             if self.tts_active.is_set():
                                 dyn_thresh = max(self.START_THRESH, int(self._playback_rms_ema * 2.0))
@@ -2230,17 +2651,13 @@ class StandaloneRealtimeAVA:
                             if prev_speaking:
                                 self._speech_end_ts = time.time()
                                 prev_speaking = False
-                                # Harness: flush user wav at end of utterance
-                                try:
-                                    if getattr(self, '_harness_enabled', False):
-                                        self._harness_flush_user(sample_rate=16000)
-                                except Exception:
-                                    pass
                     except Exception:
                         pass
             finally:
                 try:
-                    mic_stream.stop_stream(); mic_stream.close(); p.terminate()
+                    mic_stream.stop_stream(); mic_stream.close()
+                    if p is not None:
+                        p.terminate()
                 except Exception:
                     pass
 
@@ -2253,14 +2670,13 @@ class StandaloneRealtimeAVA:
                 try:
                     time.sleep(2.0)
                     m = self.metrics
-                    cap = getattr(self, '_playback_cap_frames', 20)
                     line = (
                         f"[rt] cap->partial={m.get('last_capture_to_partial_ms',0)}ms  "
                         f"vadEnd->ASR={m.get('last_vad_end_to_asr_final_ms',0)}ms  "
                         f"vadEnd->audio={m.get('last_vad_end_to_first_audio_ms',0)}ms  "
                         f"ASR->audio={m.get('asr_final_to_first_audio_ms',0)}ms  "
                         f"bargeStop={m.get('last_barge_stop_ms',0)}ms  "
-                        f"q={m.get('playback_queue_frames',0)}/{cap}"
+                        f"q={m.get('playback_queue_frames',0)}/{getattr(self, '_audio_queue_maxsize', 50)}"
                     )
                     print("\r" + line, end="", flush=True)
                 except Exception:
@@ -2344,8 +2760,6 @@ class StandaloneRealtimeAVA:
         Assumes 24kHz, 16-bit mono (960 bytes per 20ms frame).
         Resamples audio if TTS produces a different sample rate (e.g., Piper at 22050 Hz).
         """
-        # Helper to be called by tts.end to mark utterance boundary
-        # Note: actual method defined elsewhere; this is just reference usage context.
         # If TTS reports a different sample rate (Piper), resample instead of reopening stream
         try:
             if getattr(self, '_utter_rate_checked', False) is False:
@@ -2369,14 +2783,13 @@ class StandaloneRealtimeAVA:
         if src_rate and src_rate != int(self.playback_rate):
             pcm_bytes = _resample_audio(pcm_bytes, src_rate, int(self.playback_rate))
 
-        FRAME_BYTES = int((int(self.playback_rate) // 50) * 2)  # 20ms frames
-        # Keep the queue short for realtime feel. Target ~400ms max buffered audio.
-        # Increase cap to allow multi‑second buffering; previously ~0.4s caused drops
-        CAP_FRAMES = max(int(10.00 / 0.02), 1)  # ~10 seconds at 20ms per frame
         try:
-            self._playback_cap_frames = CAP_FRAMES
+            frame_ms = int(os.environ.get("AVA_PLAYBACK_FRAME_MS", "100") or "100")
         except Exception:
-            pass
+            frame_ms = 100
+        frame_ms = max(20, min(frame_ms, 200))
+        FRAME_BYTES = max(2, int(int(self.playback_rate) * (frame_ms / 1000.0)) * 2)
+        MAX_FRAMES = 500  # ~10 seconds for Piper (synthesizes entire file first)
         try:
             # Slice into ~20ms frames for snappy playback
             i = 0
@@ -2386,172 +2799,32 @@ class StandaloneRealtimeAVA:
                 i += FRAME_BYTES
                 if not chunk:
                     break
-                # Never block here (blocking creates audible gaps).
-                # If the queue is above CAP_FRAMES, drop oldest frames to keep audio "now".
+                # Block if queue is full (don't drop frames for Piper)
                 try:
-                    while self.audio_queue.qsize() >= CAP_FRAMES:
-                        try:
-                            item = self.audio_queue.get_nowait()
-                            # NEVER discard utterance-end sentinel if it somehow got into the trim range
-                            if item is self._UTT_END:
-                                try:
-                                    self.audio_queue.put_nowait(item)
-                                except Exception:
-                                    pass
-                                break
-                        except Exception:
-                            break
-                    # Harness: buffer TTS audio (already resampled to playback_rate)
-                    try:
-                        if getattr(self, '_harness_enabled', False) and getattr(self, '_utt_in_progress', False):
-                            with self._harness_lock:
-                                if self._harness_tts_tag is None:
-                                    self._harness_tts_tag = self._harness_turn_tag()
-                                self._harness_tts_buf.extend(chunk)
-                    except Exception:
-                        pass
-                    self.audio_queue.put_nowait(chunk)
-                    # Mark first-chunk timestamp for latency only once per TTS
-                    try:
-                        if getattr(self, '_awaiting_tts_since', 0.0) and not getattr(self, '_tts_first_chunk_ts', 0.0):
-                            self._tts_first_chunk_ts = time.time()
-                            try:
-                                self.metrics['last_eos_to_first_audio_ms'] = int((self._tts_first_chunk_ts - self._awaiting_tts_since) * 1000)
-                                if getattr(self, '_speech_end_ts', 0.0):
-                                    self.metrics['last_vad_end_to_first_audio_ms'] = int((self._tts_first_chunk_ts - self._speech_end_ts) * 1000)
-                                if getattr(self, '_asr_final_ts', 0.0):
-                                    self.metrics['asr_final_to_first_audio_ms'] = int((self._tts_first_chunk_ts - self._asr_final_ts) * 1000)
-                            except Exception:
-                                pass
-                    except Exception:
-                        pass
-                except Exception:
-                    # If still full or queue unavailable, drop this frame.
+                    self.audio_queue.put(chunk, block=True, timeout=5.0)
+                except queue.Full:
+                    # Only drop if truly stuck
                     pass
                 try:
                     self.metrics['playback_queue_frames'] = self.audio_queue.qsize()
                 except Exception:
                     pass
+                # First-chunk latency measurement
+                if self._awaiting_tts_since and not self._tts_first_chunk_ts:
+                    self._tts_first_chunk_ts = time.time()
+                    try:
+                        self.metrics['last_eos_to_first_audio_ms'] = int((self._tts_first_chunk_ts - self._awaiting_tts_since) * 1000)
+                        if self._speech_end_ts:
+                            self.metrics['last_vad_end_to_first_audio_ms'] = int((self._tts_first_chunk_ts - self._speech_end_ts) * 1000)
+                        if getattr(self, '_asr_final_ts', 0.0):
+                            self.metrics['asr_final_to_first_audio_ms'] = int((self._tts_first_chunk_ts - self._asr_final_ts) * 1000)
+                    except Exception:
+                        pass
         except Exception as e:
             try:
                 print(f"Audio queue error: {e}")
             except Exception:
                 pass
-
-    def _queue_utterance_end(self):
-        """Signal the playback worker that the current utterance is complete."""
-        if not getattr(self, "_utt_in_progress", False):
-            return
-        try:
-            # Make room if needed, but NEVER discard an existing _UTT_END if present
-            try:
-                while self.audio_queue.qsize() > 0 and self.audio_queue.qsize() > 600:
-                    item = self.audio_queue.get_nowait()
-                    if item is self._UTT_END:
-                        try:
-                            self.audio_queue.put_nowait(item)
-                        except Exception:
-                            pass
-                        break
-            except Exception:
-                pass
-            # Queue the sentinel marking end of audible utterance
-            self.audio_queue.put_nowait(self._UTT_END)
-            try:
-                print(f"[tts-end] enqueued _UTT_END (q={self.audio_queue.qsize()})")
-            except Exception:
-                pass
-        except Exception:
-            # Fail-safe: never hang the state machine
-            self._utt_in_progress = False
-            try:
-                self.utt_playback_done.set()
-            except Exception:
-                pass
-
-    # ---------------- Harness helpers (Program 3) ----------------
-    def _harness_get_dir(self) -> Path:
-        """Return harness output directory, creating it if needed."""
-        try:
-            if self._harness_dir:
-                d = Path(self._harness_dir)
-            else:
-                d = Path(__file__).resolve().parent / "harness_wav"
-            d.mkdir(parents=True, exist_ok=True)
-            return d
-        except Exception:
-            d = Path.cwd() / "harness_wav"
-            try:
-                d.mkdir(parents=True, exist_ok=True)
-            except Exception:
-                pass
-            return d
-
-    def _harness_now_stamp(self) -> str:
-        # includes milliseconds
-        return datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
-
-    def _harness_turn_tag(self) -> str:
-        """
-        Prefer an existing per-turn token if your runtime sets one.
-        Fall back to a local sequence.
-        """
-        for attr in ("_turn_token", "_current_turn_token", "_active_turn_token", "turn_token"):
-            try:
-                v = getattr(self, attr, None)
-                if v:
-                    return str(v)
-            except Exception:
-                pass
-        try:
-            self._harness_turn_seq += 1
-            return f"seq{self._harness_turn_seq}"
-        except Exception:
-            return "seqX"
-
-    def _harness_write_wav(self, path: Path, pcm_bytes: bytes, sample_rate: int) -> None:
-        """Write mono 16-bit PCM wav."""
-        try:
-            with wave.open(str(path), "wb") as wf:
-                wf.setnchannels(1)
-                wf.setsampwidth(2)
-                wf.setframerate(int(sample_rate))
-                wf.writeframes(pcm_bytes)
-        except Exception:
-            pass
-
-    def _harness_flush_user(self, sample_rate: int) -> None:
-        if not getattr(self, "_harness_enabled", False):
-            return
-        with self._harness_lock:
-            if not self._harness_user_buf:
-                return
-            tag = self._harness_user_tag or self._harness_turn_tag()
-            out = self._harness_get_dir() / f"{self._harness_now_stamp()}__turn-{tag}__user.wav"
-            self._harness_write_wav(out, bytes(self._harness_user_buf), sample_rate)
-            self._harness_user_buf.clear()
-            self._harness_user_tag = None
-            try:
-                print(f"[harness] wrote user_wav: {out}")
-            except Exception:
-                pass
-
-    def _harness_flush_tts(self, sample_rate: int) -> None:
-        if not getattr(self, "_harness_enabled", False):
-            return
-        with self._harness_lock:
-            if not self._harness_tts_buf:
-                return
-            tag = self._harness_tts_tag or self._harness_turn_tag()
-            out = self._harness_get_dir() / f"{self._harness_now_stamp()}__turn-{tag}__tts.wav"
-            self._harness_write_wav(out, bytes(self._harness_tts_buf), sample_rate)
-            self._harness_tts_buf.clear()
-            self._harness_tts_tag = None
-            try:
-                print(f"[harness] wrote tts_wav: {out}")
-            except Exception:
-                pass
-        
 
     def _dbg(self, tag: str, msg: str, data: dict | None = None):
         try:
@@ -2957,7 +3230,7 @@ class StandaloneRealtimeAVA:
                 }
             # If require_wake_for_tools, check last transcript had wake word
             if self._require_wake_for_tools:
-                last_txt_lower = last_txt.lower()
+                last_txt_lower = self._normalize_for_wake(last_txt)
                 has_wake = any(last_txt_lower.startswith(w) or f" {w}" in last_txt_lower for w in self._wake_words)
                 if not has_wake:
                     print(f"[validation-mode] Tool '{function_name}' requires wake word - skipping")
@@ -3192,6 +3465,160 @@ class StandaloneRealtimeAVA:
             acc += s * s
         return math.sqrt(acc / n)
 
+    def _calibrate_noise_floor(self, duration_ms: int = 700, margin_rms: int = 200, scale: float = 2.5):
+        """
+        Best-effort ambient noise RMS calibration.
+        MUST NOT block unified startup. If mic open fails, log and return with no changes.
+        """
+        stream = None
+        p = None
+
+        try:
+            # Optional kill-switch for instant rollback
+            if str(os.getenv("AVA_AUDIO_SAFE_MODE", "0")).strip() == "1":
+                print("[vad-cal] AVA_AUDIO_SAFE_MODE=1 -> skipping calibration")
+                return
+
+            p = pyaudio.PyAudio()
+            aud_cfg = self.cfg.get('audio') or {}
+
+            # Prefer configured device, else whatever PyAudio thinks is default.
+            target_idx = self.input_device_index if self.input_device_index is not None else aud_cfg.get('input_device')
+            try:
+                target_idx = int(target_idx) if target_idx is not None else None
+            except Exception:
+                target_idx = None
+
+            # Use a rate ladder. 16k often fails on Windows devices; 48k/44.1k usually work.
+            # Try configured rate too, but don't assume it's valid.
+            cfg_rate = aud_cfg.get('input_sample_rate')
+            try:
+                cfg_rate = int(cfg_rate) if cfg_rate else None
+            except Exception:
+                cfg_rate = None
+
+            rate_candidates = []
+            for r in (cfg_rate, 48000, 44100, 16000):
+                if isinstance(r, int) and r > 0 and r not in rate_candidates:
+                    rate_candidates.append(r)
+
+            # Device ladder: configured -> None (default) -> explicit default index (if available) -> 0
+            dev_candidates = []
+            if target_idx is not None:
+                dev_candidates.append(target_idx)
+            dev_candidates.append(None)
+
+            try:
+                di = p.get_default_input_device_info()
+                default_idx = int(di.get("index")) if di and "index" in di else None
+                if default_idx is not None and default_idx not in dev_candidates:
+                    dev_candidates.append(default_idx)
+            except Exception:
+                pass
+
+            if 0 not in dev_candidates:
+                dev_candidates.append(0)
+
+            # Buffer ladder
+            # Keep your "20ms" intent, but if rate is high we still want reasonable fpb.
+            def fpb_for_rate(r: int) -> int:
+                return max(int(r * 0.02), 160)
+
+            last_err = None
+            opened = False
+
+            for dev in dev_candidates:
+                for rate in rate_candidates:
+                    for fpb in (fpb_for_rate(rate), 960, 1024, 640, 320):
+                        try:
+                            kw = dict(
+                                format=pyaudio.paInt16,
+                                channels=1,
+                                rate=rate,
+                                input=True,
+                                frames_per_buffer=fpb,
+                            )
+                            if dev is not None:
+                                kw["input_device_index"] = dev
+
+                            stream = p.open(**kw)
+                            opened = True
+                            if dev is None:
+                                dev_label = "default(None)"
+                            else:
+                                dev_label = str(dev)
+                            print(f"[vad-cal] Opened for calibration: dev={dev_label} rate={rate} fpb={fpb}")
+                            break
+                        except Exception as e:
+                            last_err = e
+                            stream = None
+                    if opened:
+                        break
+                if opened:
+                    break
+
+            if not opened or stream is None:
+                print(f"[vad-cal] Skipping calibration (mic open failed): {last_err}")
+                return
+
+            # Warm-up a couple frames (non-fatal)
+            for _ in range(3):
+                try:
+                    _ = stream.read(stream._frames_per_buffer, exception_on_overflow=False)
+                except Exception:
+                    pass
+
+            # Measure RMS
+            rate = stream._rate if hasattr(stream, "_rate") else rate_candidates[0]
+            fpb = stream._frames_per_buffer if hasattr(stream, "_frames_per_buffer") else fpb_for_rate(rate)
+
+            total_frames = max(int((duration_ms / 1000.0) * rate / fpb), 3)
+            acc = 0.0
+            n = 0
+
+            for _ in range(total_frames):
+                try:
+                    data = stream.read(fpb, exception_on_overflow=False)
+                except Exception:
+                    continue
+                rms = self._rms_int16(data)
+                acc += rms
+                n += 1
+
+            if n <= 0:
+                print("[vad-cal] Skipping calibration (no readable frames)")
+                return
+
+            noise_floor = acc / n
+            # Phase C: dynamic threshold = max(120, noise_floor * scale)
+            # Use config-provided scale; ignore margin to avoid over-inflating the floor
+            new_start = int(max(120, noise_floor * float(scale)))
+            new_stop = int(max(80, new_start * 0.6))
+
+            if new_start != self.START_THRESH or new_stop != self.STOP_THRESH:
+                print(f"[vad-cal] noise_floor_rms={int(noise_floor)} -> START={new_start} STOP={new_stop} "
+                      f"(old START={self.START_THRESH} STOP={self.STOP_THRESH})")
+                self.START_THRESH = new_start
+                self.STOP_THRESH = new_stop
+
+        except Exception as e:
+            # Absolute guarantee: never crash or stall boot because of calibration.
+            print(f"[vad-cal] Skipping calibration (error): {e}")
+            return
+
+        finally:
+            try:
+                if stream:
+                    stream.stop_stream()
+                    stream.close()
+            except Exception:
+                pass
+            try:
+                if p:
+                    p.terminate()
+            except Exception:
+                pass
+
     def _cancel_tts(self):
         try:
             while not self.audio_queue.empty():
@@ -3209,11 +3636,90 @@ class StandaloneRealtimeAVA:
                     if isinstance(data, dict):
                         self.cfg.update(data)
                         vad = self.cfg.get('vad') or {}
-                        self.START_THRESH = int(vad.get('start_rms', self.START_THRESH))
-                        self.STOP_THRESH = int(vad.get('stop_rms', self.STOP_THRESH))
+                        # In validation mode, ignore file-driven VAD thresholds to avoid re-raising too high
+                        _apply_vad_from_cfg = True
+                        try:
+                            if getattr(self, '_validation_mode', False) and \
+                               (('start_rms' in vad) or ('stop_rms' in vad)):
+                                _apply_vad_from_cfg = False
+                        except Exception:
+                            _apply_vad_from_cfg = True
+                        if _apply_vad_from_cfg:
+                            self.START_THRESH = int(vad.get('start_rms', self.START_THRESH))
+                            self.STOP_THRESH = int(vad.get('stop_rms', self.STOP_THRESH))
+                        else:
+                            print(f"[vad-cal] Validation mode: ignoring config VAD (start_rms/stop_rms); keeping START={self.START_THRESH} STOP={self.STOP_THRESH}")
                         self.SPEECH_HOLD_SEC = float(vad.get('hold_sec', self.SPEECH_HOLD_SEC))
                         # Audio updates
                         aud = self.cfg.get('audio') or {}
+                        cal_cfg = aud.get('calibration') or {}
+                        if bool(cal_cfg.get('prefer_saved_pair', True)):
+                            saved = self._load_voice_calibration_state() or {}
+                            saved_out_rate = saved.get('output_rate')
+                            saved_in_rate = saved.get('input_rate')
+                            if saved_out_rate:
+                                aud['playback_rate'] = saved_out_rate
+                                print(f"[audio] Preferring calibrated output rate: {saved_out_rate}")
+                            if saved_in_rate:
+                                aud['input_sample_rate'] = saved_in_rate
+                                print(f"[audio] Preferring calibrated input rate: {saved_in_rate}")
+                            if saved.get('output_device_name') and not aud.get('output_device_name'):
+                                aud['output_device_name'] = saved.get('output_device_name')
+                            if saved.get('input_device_name'):
+                                if not aud.get('input_device_name'):
+                                    aud['input_device_name'] = saved.get('input_device_name')
+                                print(f"[audio] Preferring calibrated input device: {saved.get('input_device_name')}")
+                        env_input_name = os.getenv('AVA_INPUT_DEVICE_NAME')
+                        env_input_idx = os.getenv('AVA_INPUT_DEVICE_INDEX')
+                        env_input_rate = os.getenv('AVA_INPUT_SAMPLE_RATE')
+                        env_output_name = os.getenv('AVA_OUTPUT_DEVICE_NAME')
+                        env_output_idx = os.getenv('AVA_OUTPUT_DEVICE_INDEX')
+                        env_output_rate = os.getenv('AVA_OUTPUT_SAMPLE_RATE')
+                        self._forced_input_device_name = str(env_input_name).strip() if env_input_name else None
+                        self._forced_input_device_index = None
+                        self._forced_input_sample_rate = None
+                        self._forced_output_device_name = str(env_output_name).strip() if env_output_name else None
+                        self._forced_output_device_index = None
+                        self._forced_output_sample_rate = None
+                        if env_input_name:
+                            aud['input_device_name'] = env_input_name
+                            if not env_input_idx:
+                                aud['input_device'] = None
+                            print(f"[audio-env] Overriding input device name from AVA_INPUT_DEVICE_NAME={env_input_name}")
+                        if env_input_idx:
+                            try:
+                                self._forced_input_device_index = int(env_input_idx)
+                                aud['input_device'] = self._forced_input_device_index
+                                print(f"[audio-env] Overriding input device index from AVA_INPUT_DEVICE_INDEX={aud['input_device']}")
+                            except Exception:
+                                print(f"[audio-env] Ignoring invalid AVA_INPUT_DEVICE_INDEX={env_input_idx!r}")
+                        if env_input_rate:
+                            try:
+                                self._forced_input_sample_rate = int(env_input_rate)
+                                aud['input_sample_rate'] = self._forced_input_sample_rate
+                                print(f"[audio-env] Overriding input sample rate from AVA_INPUT_SAMPLE_RATE={aud['input_sample_rate']}")
+                            except Exception:
+                                print(f"[audio-env] Ignoring invalid AVA_INPUT_SAMPLE_RATE={env_input_rate!r}")
+                        if env_output_name:
+                            aud['output_device_name'] = env_output_name
+                            if not env_output_idx:
+                                aud['output_device'] = None
+                            print(f"[audio-env] Overriding output device name from AVA_OUTPUT_DEVICE_NAME={env_output_name}")
+                        if env_output_idx:
+                            try:
+                                self._forced_output_device_index = int(env_output_idx)
+                                aud['output_device'] = self._forced_output_device_index
+                                print(f"[audio-env] Overriding output device index from AVA_OUTPUT_DEVICE_INDEX={aud['output_device']}")
+                            except Exception:
+                                print(f"[audio-env] Ignoring invalid AVA_OUTPUT_DEVICE_INDEX={env_output_idx!r}")
+                        if env_output_rate:
+                            try:
+                                self._forced_output_sample_rate = int(env_output_rate)
+                                aud['playback_rate'] = self._forced_output_sample_rate
+                                print(f"[audio-env] Overriding output sample rate from AVA_OUTPUT_SAMPLE_RATE={aud['playback_rate']}")
+                            except Exception:
+                                print(f"[audio-env] Ignoring invalid AVA_OUTPUT_SAMPLE_RATE={env_output_rate!r}")
+
                         try:
                             pr = int(aud.get('playback_rate', self.playback_rate) or self.playback_rate)
                         except Exception:
@@ -3221,19 +3727,13 @@ class StandaloneRealtimeAVA:
                         if pr != self.playback_rate:
                             self.playback_rate = pr
                             setattr(self, '_reopen_playback', True)
-                        odi = aud.get('output_device')
-                        if odi is not None and odi != self.output_device_index:
-                            try:
-                                self.output_device_index = int(odi)
-                            except Exception:
-                                self.output_device_index = odi
+                        resolved_out = self._resolve_audio_device_index('output', aud.get('output_device'), aud.get('output_device_name'))
+                        if resolved_out is not None and resolved_out != self.output_device_index:
+                            self.output_device_index = resolved_out
                             setattr(self, '_reopen_playback', True)
-                        idi = aud.get('input_device')
-                        if idi is not None and idi != self.input_device_index:
-                            try:
-                                self.input_device_index = int(idi)
-                            except Exception:
-                                self.input_device_index = idi
+                        resolved_in = self._resolve_audio_device_index('input', aud.get('input_device'), aud.get('input_device_name'))
+                        if resolved_in is not None and resolved_in != self.input_device_index:
+                            self.input_device_index = resolved_in
                             setattr(self, '_reopen_mic', True)
                         # Deepgram key update
                         dgk = self.cfg.get('deepgram_api_key')
@@ -3344,121 +3844,118 @@ class StandaloneRealtimeAVA:
             time.sleep(2.0)
 
     def _prepare_tts_text(self, text: str) -> str:
-        # When speak_symbols is False, remove punctuation/symbols entirely
+        # Preserve time expressions before stripping punctuation so "3:51 PM" doesn't become "351 PM".
+        t = str(text or "")
+
+        def _expand_clock_time(match):
+            try:
+                hour = int(match.group(1))
+                minute = int(match.group(2))
+                suffix = (match.group(3) or "").strip().upper()
+                if minute == 0:
+                    spoken = f"{hour} o'clock"
+                elif minute < 10:
+                    spoken = f"{hour} oh {minute}"
+                else:
+                    spoken = f"{hour} {minute}"
+                if suffix:
+                    spoken = f"{spoken} {suffix}"
+                return spoken
+            except Exception:
+                return match.group(0)
+
+        t = re.sub(r"\b(\d{1,2}):(\d{2})\s*([AaPp][Mm])?\b", _expand_clock_time, t)
         if not self.cfg.get('speak_symbols', False):
-            t = text.replace('_', ' ').replace('-', ' ')
+            t = t.replace('_', ' ').replace('-', ' ')
             t = re.sub(r"[^\w\s]", "", t, flags=re.UNICODE)
             t = re.sub(r"\s+", " ", t).strip()
             return t
-        return text
+        return t
 
     async def queue_audio_output(self, pcm_bytes: bytes):
         try:
-            # INCREASED buffer to prevent choppy audio - 800 frames = ~16 seconds at 24kHz
-            # Only drop oldest frame if critically full (not during normal playback)
-            if self.audio_queue.qsize() > 800:
-                try:
-                    # Only drop if TTS is not active (prevents drops during speech)
-                    if not self.tts_active.is_set():
+            max_sz = getattr(self, '_audio_queue_maxsize', 50)
+            overflow_threshold = int(max_sz * 0.8)  # 80% full = overflow
+            qsz = self.audio_queue.qsize()
+            if qsz >= overflow_threshold:
+                # Drop oldest chunks to make room and prevent stale audio buildup
+                dropped = 0
+                while self.audio_queue.qsize() > overflow_threshold // 2:
+                    try:
                         _ = self.audio_queue.get_nowait()
-                except queue.Empty:
-                    pass
+                        dropped += 1
+                    except queue.Empty:
+                        break
+                if dropped > 0:
+                    print(f"[audio-queue] Overflow protection: dropped {dropped} stale chunks (was q={qsz}/{max_sz})")
             self.audio_queue.put_nowait(pcm_bytes)
+        except queue.Full:
+            # Queue is at maxsize — drop oldest to make room
+            try:
+                _ = self.audio_queue.get_nowait()
+                self.audio_queue.put_nowait(pcm_bytes)
+                print(f"[audio-queue] Queue full, dropped oldest chunk to make room")
+            except (queue.Empty, queue.Full):
+                pass
         except Exception as e:
             print(f"Audio queue error: {e}")
 
     async def _ask_server_respond(self, text: str) -> str:
         headers = { 'Content-Type': 'application/json' }
-        # POLICY GATE: Only enable server-side tools when transcript has command verb
         tools_allowed = self._should_allow_tools(text)
         if not tools_allowed:
             print(f"[tool-gate] Server run_tools=False — no command verb in: '{text[:40]}'")
-        # Try preferred route first
-        route = str(self.cfg.get('server_route', 'respond')).lower()
-        base = self.cfg.get('server_url', f"http://127.0.0.1:5051/{route}")
-        def _pack(r: str):
-            if r == 'respond':
+
+        configured_route = str(self.cfg.get('server_route', 'respond')).lower()
+        configured_url = str(self.cfg.get('server_url', 'http://127.0.0.1:5051/respond'))
+        if configured_route != 'respond' or configured_url.rstrip('/').endswith('/chat'):
+            print(f"[route] Live voice forcing /respond (configured server_route={configured_route}, server_url={configured_url})")
+
+        spoken_reply_budget = {
+            "max_sentences": 2,
+            "max_words": 28,
+            "prefer_brief": True
+        }
+
+        pctx = ""
+        if PERSONALITY_AVAILABLE:
+            try:
+                pctx = get_personality_context()
+            except Exception:
                 pctx = ""
-                if PERSONALITY_AVAILABLE:
-                    try:
-                        pctx = get_personality_context()
-                    except Exception:
-                        pctx = ""
-                payload = {
-                    "sessionId": "voice-default",
-                    "messages": [ { "role": "user", "content": text } ],
-                    "freshSession": True,  # Voice: don't include old session history
-                    "run_tools": tools_allowed,
-                    "allow_write": tools_allowed,
-                    "persona": "AVA",
-                    "style": "first_person",
-                    "context": self._build_context(pctx)
-                }
-                # VALIDATION MODE: restrict memory to facts only — no workflows/agent actions
-                if self._validation_mode:
-                    payload["memory_filter"] = "facts_only"
-                return base if base.endswith('/respond') else base.rsplit('/',1)[0] + '/respond', json.dumps(payload).encode('utf-8')
-            else:
-                pctx = ""
-                if PERSONALITY_AVAILABLE:
-                    try:
-                        pctx = get_personality_context()
-                    except Exception:
-                        pctx = ""
-                payload = {
-                    "sessionId": "voice-default",
-                    "text": text,
-                    "freshSession": True,  # Voice: don't include old session history
-                    "run_tools": tools_allowed,
-                    "allow_write": tools_allowed,
-                    "persona": "AVA",
-                    "style": "first_person",
-                    "context": self._build_context(pctx)
-                }
-                # VALIDATION MODE: restrict memory to facts only — no workflows/agent actions
-                if self._validation_mode:
-                    payload["memory_filter"] = "facts_only"
-                    payload["includeMemory"] = False  # /chat path: disable memory entirely
-                return base if base.endswith('/chat') else base.rsplit('/',1)[0] + '/chat', json.dumps(payload).encode('utf-8')
-        # Preferred
-        url, body = _pack(route)
+
+        payload = {
+            "sessionId": "voice-default",
+            "messages": [ { "role": "user", "content": text } ],
+            "freshSession": True,
+            "run_tools": tools_allowed,
+            "allow_write": tools_allowed,
+            "voice_mode": "spoken",
+            "spoken_reply_budget": spoken_reply_budget,
+            "persona": "AVA",
+            "style": "first_person",
+            "context": self._build_context(pctx)
+        }
+        if self._validation_mode:
+            payload["memory_filter"] = "facts_only"
+
+        url = self._voice_server_endpoint('respond')
+        body = json.dumps(payload).encode('utf-8')
         req = urllib.request.Request(url=url, data=body, headers=headers, method='POST')
         try:
             with urllib.request.urlopen(req, timeout=30) as resp:
                 raw = resp.read()
                 j = json.loads(raw.decode('utf-8', errors='ignore'))
                 response_text = (j.get('output_text') or j.get('text') or (j.get('content') or [{}])[0].get('text') or '').strip()
-                
-                # NEW: Filter out step execution status messages
                 if self._is_step_status_message(response_text):
                     print(f"[filter] Blocked step status from /respond: {response_text[:60]}...")
                     return ''
-
                 _sha1 = hashlib.sha1(response_text.encode()).hexdigest()[:12]
                 print(f"[respond-out] sha1={_sha1} len={len(response_text)} preview='{response_text[:60]}...'")
                 return response_text
         except urllib.error.HTTPError as he:
-            # Fallback to alternate route on 5xx/4xx
-            alt = 'chat' if route == 'respond' else 'respond'
-            alt_url, alt_body = _pack(alt)
-            try:
-                req2 = urllib.request.Request(url=alt_url, data=alt_body, headers=headers, method='POST')
-                with urllib.request.urlopen(req2, timeout=30) as resp2:
-                    raw = resp2.read()
-                    j = json.loads(raw.decode('utf-8', errors='ignore'))
-                    response_text = (j.get('output_text') or j.get('text') or (j.get('content') or [{}])[0].get('text') or '').strip()
-                    
-                    # Filter out step execution status messages
-                    if self._is_step_status_message(response_text):
-                        print(f"[filter] Blocked step status from /respond (fallback): {response_text[:60]}...")
-                        return ''
-
-                    _sha1 = hashlib.sha1(response_text.encode()).hexdigest()[:12]
-                    print(f"[respond-out] sha1={_sha1} len={len(response_text)} preview='{response_text[:60]}...'")
-                    return response_text
-            except Exception as e2:
-                print(f"[route] Server error fallback: {e2}")
-                return ''
+            print(f"[route] Server HTTP error on /respond: {he}")
+            return ''
         except Exception as e:
             print(f"[route] Server error: {e}")
             return ''
@@ -3622,13 +4119,6 @@ class StandaloneRealtimeAVA:
             health = base.rstrip('/') + '/health'
             req = urllib.request.Request(health, method='GET')
             with urllib.request.urlopen(req, timeout=timeout) as resp:
-                raw = resp.read()
-                try:
-                    j = json.loads(raw.decode('utf-8', errors='ignore'))
-                    if isinstance(j, dict):
-                        return bool(j.get('ok')) or (200 <= getattr(resp, 'status', 200) < 500)
-                except Exception:
-                    pass
                 code = getattr(resp, 'status', None) or getattr(resp, 'code', None) or 200
                 return 200 <= code < 500
         except Exception:
@@ -3646,6 +4136,354 @@ class StandaloneRealtimeAVA:
     def _server_base(self) -> str:
         url = self.cfg.get('server_url', "http://127.0.0.1:5051/respond")
         return url.rsplit('/', 1)[0] if url.endswith('/respond') or url.endswith('/chat') else url
+
+    def _voice_server_endpoint(self, route: str = 'respond') -> str:
+        route = str(route or 'respond').lower()
+        if route not in {'respond', 'chat'}:
+            route = 'respond'
+        url = str(self.cfg.get('server_url', "http://127.0.0.1:5051/respond")).rstrip('/')
+        if url.endswith('/respond') or url.endswith('/chat'):
+            return url.rsplit('/', 1)[0] + f'/{route}'
+        return url + f'/{route}'
+
+    def _write_latency_log_entry(self, entry: dict) -> None:
+        path = os.getenv('AVA_LATENCY_LOG')
+        if not path:
+            return
+        try:
+            payload = dict(entry or {})
+            payload.setdefault('ts', time.time())
+            with open(path, 'a', encoding='utf-8') as f:
+                f.write(json.dumps(payload) + "\n")
+        except Exception:
+            pass
+
+    def _voice_calibration_state_path(self) -> Path:
+        aud = self.cfg.get('audio') or {}
+        cal = aud.get('calibration') or {}
+        state_path = cal.get('state_path') or 'logs/voice_calibration.json'
+        path = Path(state_path)
+        if not path.is_absolute():
+            path = Path(__file__).parent / path
+        return path
+
+    def _load_voice_calibration_state(self):
+        path = self._voice_calibration_state_path()
+        try:
+            if path.exists():
+                return json.loads(path.read_text(encoding='utf-8'))
+        except Exception:
+            pass
+        return {}
+
+    def _save_voice_calibration_state(self, state: dict) -> None:
+        path = self._voice_calibration_state_path()
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(state or {}, indent=2), encoding='utf-8')
+            print(f"[audio] Saved calibrated voice pair: {path}")
+        except Exception as e:
+            print(f"[audio] Failed to save calibrated voice pair: {e}")
+
+    def _resolve_audio_device_index(self, kind: str, configured_idx=None, configured_name=None):
+        pa = getattr(self, 'audio', None) or pyaudio.PyAudio()
+        is_input = str(kind).lower().startswith('input')
+        channel_key = 'maxInputChannels' if is_input else 'maxOutputChannels'
+        if configured_idx is not None:
+            try:
+                idx = int(configured_idx)
+                info = pa.get_device_info_by_index(idx)
+                if int(info.get(channel_key, 0)) > 0:
+                    return idx
+                print(f"[audio] Ignoring configured {kind} device index {idx}: {channel_key}=0")
+            except Exception:
+                try:
+                    return int(configured_idx)
+                except Exception:
+                    pass
+        target_name = str(configured_name or '').strip().lower()
+        if not target_name:
+            return None
+        try:
+            for idx in range(pa.get_device_count()):
+                info = pa.get_device_info_by_index(idx)
+                if int(info.get(channel_key, 0)) <= 0:
+                    continue
+                label = str(info.get('name') or '')
+                if label.lower() == target_name or target_name in label.lower():
+                    return idx
+        except Exception:
+            pass
+        return None
+
+    def _preferred_input_device_terms(self):
+        aud_cfg = self.cfg.get('audio') or {}
+        return [str(x).lower() for x in (aud_cfg.get('input_device_preferences') or []) if str(x).strip()]
+
+    def _avoided_input_device_terms(self):
+        aud_cfg = self.cfg.get('audio') or {}
+        return [str(x).lower() for x in (aud_cfg.get('input_device_avoid') or []) if str(x).strip()]
+
+    def _score_input_candidate(self, candidate: dict, target_idx=None) -> float:
+        idx = candidate.get('idx')
+        label = str(candidate.get('label') or '')
+        label_l = label.lower()
+        idle_rms = float(candidate.get('idle_rms', 0.0))
+        target_bonus = -120.0 if target_idx is not None and idx == target_idx else 0.0
+        penalty = 0.0
+        if idle_rms == 0.0:
+            penalty += 240.0
+        elif idle_rms < 20.0:
+            penalty += 120.0
+        elif 'sound mapper' in label_l:
+            penalty += 600.0
+        preference_bonus = 0.0
+        for term in self._preferred_input_device_terms():
+            if term and term in label_l:
+                preference_bonus += 60.0
+        for term in self._avoided_input_device_terms():
+            if term and term in label_l:
+                penalty += 400.0
+        if 'webcam' in label_l:
+            penalty += 800.0
+        return idle_rms + penalty - preference_bonus + target_bonus
+
+    def _should_run_loopback_probe(self, mode_label='input') -> bool:
+        probe_cfg = ((self.cfg.get('audio') or {}).get('loopback_probe') or {})
+        env_probe = os.getenv('AVA_LOOPBACK_PROBE')
+        if env_probe is not None:
+            return str(env_probe).strip().lower() in {'1', 'true', 'yes', 'on'}
+        if not bool(probe_cfg.get('enabled', False)):
+            return False
+        if bool(probe_cfg.get('validation_only', False)) and not getattr(self, '_validation_mode', False):
+            return False
+        return True
+
+    def _normalize_probe_text(self, text: str) -> str:
+        return _normalized_transcript(text)
+
+    def _synthesize_loopback_probe_speech(self, probe_text: str = 'Hey Eva say hello there.'):
+        return probe_text.encode('utf-8', errors='ignore')
+
+    def _transcribe_loopback_probe_capture(self, wav_path: str) -> str:
+        return ''
+
+    def _score_loopback_probe_transcript(self, transcript: str, expected_text: str) -> float:
+        actual = set(self._normalize_probe_text(transcript).split())
+        expected = set(self._normalize_probe_text(expected_text).split())
+        if not expected:
+            return 0.0
+        return len(actual & expected) / float(len(expected))
+
+    def _probe_input_loopback_candidate(self, candidate: dict, mode_label='input', probe_expected_text='Hey Eva say hello there.'):
+        transcript = str(candidate.get('probe_transcript') or '')
+        text_score = self._score_loopback_probe_transcript(transcript, probe_expected_text)
+        candidate['probe_transcript'] = transcript
+        candidate['probe_text_score'] = text_score
+        candidate['probe_detected'] = bool(candidate.get('probe_detected'))
+        candidate['probe_calibrated'] = bool(text_score >= float((((self.cfg.get('audio') or {}).get('loopback_probe') or {}).get('speech_calibration_min', 0.6)) or 0.6))
+        print(f"[audio] {mode_label} loopback probe: {candidate.get('label')} transcript='{transcript}' score={text_score:.2f} calibrated={int(bool(candidate['probe_calibrated']))}")
+        return candidate
+
+    def _apply_input_loopback_probe(self, accepted_candidates, hot_candidates, mode_label='input'):
+        probe_cfg = ((self.cfg.get('audio') or {}).get('loopback_probe') or {})
+        if not self._should_run_loopback_probe(mode_label=mode_label):
+            return accepted_candidates, hot_candidates
+        probe_mode = str(probe_cfg.get('mode', 'speech') or 'speech').lower()
+        require_probe_calibration = bool(probe_cfg.get('require_speech_calibration', False))
+        fail_closed_without_calibration = bool(probe_cfg.get('fail_closed_without_calibration', False))
+        seen_devices = set()
+        for group in (accepted_candidates, hot_candidates):
+            for candidate in group:
+                dev_key = (candidate.get('idx'), str(candidate.get('label') or '').lower())
+                if dev_key in seen_devices:
+                    continue
+                seen_devices.add(dev_key)
+                self._probe_input_loopback_candidate(candidate, mode_label=mode_label)
+        if any(bool(candidate.get('probe_detected')) for candidate in accepted_candidates):
+            pass
+        if any(bool(candidate.get('probe_detected')) for candidate in hot_candidates):
+            pass
+        for candidate in accepted_candidates:
+            probe_text_score = float(candidate.get('probe_text_score', 0.0))
+            candidate['probe_text_score'] = probe_text_score
+        if require_probe_calibration and probe_mode == 'speech':
+            calibrated = [c for c in accepted_candidates if bool(c.get('probe_calibrated'))]
+            if calibrated:
+                return calibrated, hot_candidates
+            print(f"[audio] Calibration failed: no {mode_label} candidate reproduced probe speech above threshold")
+            enforce_calibration_block = bool(
+                require_probe_calibration and probe_mode == 'speech' and fail_closed_without_calibration
+            )
+            if enforce_calibration_block:
+                return [], []
+            print(f"[audio] Continuing with best available {mode_label} fallback after calibration miss")
+        return accepted_candidates, hot_candidates
+
+    def _candidate_sort_key(self, candidate: dict):
+        return (
+            0 if bool(candidate.get('target_config_rate_match')) else 1,
+            float(candidate.get('score', 0.0)),
+            -float(candidate.get('probe_text_score', 0.0)),
+            int(candidate.get('idx', 0)),
+        )
+
+    def _probe_input_stream_health(self, stream, chunk_frames: int, sample_reads: int = 8) -> dict:
+        rms_values = []
+        chunks = []
+        try:
+            sample_reads = max(2, int(sample_reads))
+        except Exception:
+            sample_reads = 8
+        for _ in range(sample_reads):
+            data = stream.read(chunk_frames, exception_on_overflow=False)
+            chunks.append(data)
+            try:
+                rms_values.append(float(self._rms_int16(data)))
+            except Exception:
+                rms_values.append(0.0)
+        mean_rms = sum(rms_values) / float(len(rms_values) or 1)
+        rms_min = min(rms_values) if rms_values else 0.0
+        rms_max = max(rms_values) if rms_values else 0.0
+        rms_span = rms_max - rms_min
+        all_identical = len({bytes(chunk) for chunk in chunks}) <= 1
+        return {
+            'idle_rms': mean_rms,
+            'rms_min': rms_min,
+            'rms_max': rms_max,
+            'rms_span': rms_span,
+            'all_identical': all_identical,
+            'flatline': bool(all_identical),
+        }
+
+    def _open_ranked_input_stream(self, pa_instance, format, channels, target_rate, mode_label='input'):
+        aud_cfg = self.cfg.get('audio') or {}
+        config_sr = int(aud_cfg.get('input_sample_rate', target_rate) or target_rate)
+        forced_idx = getattr(self, '_forced_input_device_index', None)
+        forced_name = str(getattr(self, '_forced_input_device_name', '') or '').strip()
+        forced_rate = getattr(self, '_forced_input_sample_rate', None)
+        try:
+            forced_rate = int(forced_rate) if forced_rate is not None else None
+        except Exception:
+            forced_rate = None
+        if forced_rate is not None and (forced_idx is not None or forced_name):
+            rates = [forced_rate]
+        else:
+            rates = list(dict.fromkeys([r for r in (forced_rate, config_sr, 48000, 44100, 16000) if isinstance(r, int) and r > 0]))
+        max_idle_rms = float(aud_cfg.get('max_idle_rms', 1000) or 1000)
+        if forced_idx is not None:
+            try:
+                target_idx = int(forced_idx)
+            except Exception:
+                target_idx = None
+        elif forced_name:
+            target_idx = self._resolve_audio_device_index('input', None, forced_name)
+        elif self.input_device_index is not None:
+            target_idx = self._resolve_audio_device_index('input', self.input_device_index, None)
+        else:
+            target_idx = self._resolve_audio_device_index('input', aud_cfg.get('input_device'), aud_cfg.get('input_device_name'))
+        forced_override_active = bool(forced_name) or (forced_idx is not None)
+        if forced_override_active and target_idx is None:
+            print(f"[audio] Explicit {mode_label} override could not be resolved; refusing ranked fallback")
+            return None, None, None, None
+        configured_input_name = str(aud_cfg.get('input_device_name') or '').strip().lower()
+        blocklist_terms = [str(term).strip().lower() for term in (aud_cfg.get('input_device_blocklist') or []) if str(term).strip()]
+        candidates = []
+        device_count = int(pa_instance.get_device_count())
+        device_indices = [target_idx] if forced_override_active else list(range(device_count))
+        for idx in device_indices:
+            try:
+                info = pa_instance.get_device_info_by_index(idx)
+            except Exception:
+                continue
+            if int(info.get('maxInputChannels', 0)) <= 0:
+                continue
+            label = str(info.get('name') or f'Input {idx}')
+            label_lower = label.lower()
+            configured_name_match = bool(
+                configured_input_name
+                and (
+                    label_lower == configured_input_name
+                    or configured_input_name in label_lower
+                    or label_lower in configured_input_name
+                )
+            )
+            if blocklist_terms and not forced_override_active and any(term in label_lower for term in blocklist_terms):
+                print(f"[audio] Skipping blocked input device: {label} (idx={idx})")
+                continue
+            for rate in rates:
+                try:
+                    chunk_frames = max(int(rate * 0.02), 160)
+                    stream = pa_instance.open(format=format, channels=channels, rate=rate, input=True, frames_per_buffer=chunk_frames, input_device_index=idx)
+                    probe_stats = self._probe_input_stream_health(stream, chunk_frames, sample_reads=8)
+                    stream.stop_stream(); stream.close()
+                    if bool(probe_stats.get('flatline')):
+                        print(f"[audio] Rejecting flatline input: {label} (idx={idx}) @ {rate} Hz rms={int(probe_stats.get('idle_rms', 0))} span={int(probe_stats.get('rms_span', 0))} identical={int(bool(probe_stats.get('all_identical')))}")
+                        continue
+                    candidate = {
+                        'idx': idx,
+                        'label': label,
+                        'rate': rate,
+                        'chunk_frames': chunk_frames,
+                        'idle_rms': float(probe_stats.get('idle_rms', 0.0)),
+                        'probe_rms_span': float(probe_stats.get('rms_span', 0.0)),
+                        'probe_detected': False,
+                        'probe_calibrated': False,
+                        'probe_text_score': 0.0,
+                    }
+                    candidate['configured_input_match'] = bool(
+                        (target_idx is not None and idx == target_idx) or configured_name_match
+                    )
+                    candidate['target_config_rate_match'] = bool(
+                        rate == config_sr and bool(candidate.get('configured_input_match'))
+                    )
+                    candidate['score'] = self._score_input_candidate(candidate, target_idx=target_idx)
+                    candidates.append(candidate)
+                except Exception:
+                    continue
+        candidates = sorted(candidates, key=self._candidate_sort_key)
+        hot_candidates = [candidate for candidate in candidates if candidate['idle_rms'] > max_idle_rms]
+        accepted_candidates = [candidate for candidate in candidates if candidate['idle_rms'] <= max_idle_rms]
+        accepted_candidates, hot_candidates = self._apply_input_loopback_probe(accepted_candidates, hot_candidates, mode_label=mode_label)
+        selected_tag = 'Selected input'
+        if mode_label != 'input':
+            selected_tag = mode_label
+        min_live_rms = float(aud_cfg.get('min_live_rms', 20) or 20)
+        for candidate in accepted_candidates + hot_candidates:
+            idx = candidate['idx']
+            rate = int(candidate['rate'])
+            chunk_frames = int(candidate['chunk_frames'])
+            try:
+                stream = pa_instance.open(format=format, channels=channels, rate=rate, input=True, frames_per_buffer=chunk_frames, input_device_index=idx)
+                reopen_stats = self._probe_input_stream_health(stream, chunk_frames, sample_reads=6)
+                reopen_rms = float(reopen_stats.get('idle_rms', 0.0))
+                if bool(reopen_stats.get('flatline')):
+                    print(f"[audio] Rejecting flatline reopen: {candidate['label']} (idx={idx}) @ {rate} Hz rms={int(reopen_rms)} span={int(reopen_stats.get('rms_span', 0))} identical={int(bool(reopen_stats.get('all_identical')))}")
+                    stream.stop_stream(); stream.close()
+                    continue
+                near_silent = candidate['idle_rms'] < min_live_rms and reopen_rms < min_live_rms
+                has_live_alternative = any(
+                    (c['idx'] != candidate['idx']) and (float(c.get('idle_rms', 0.0)) >= min_live_rms)
+                    for c in accepted_candidates
+                )
+                if near_silent and has_live_alternative and not forced_override_active and not bool(candidate.get('configured_input_match')):
+                    print(f"[audio] Skipping near-silent candidate: {candidate['label']} (idx={idx}) @ {rate} Hz")
+                    stream.stop_stream(); stream.close()
+                    continue
+                self.input_device_index = idx
+                print(f"[audio] {selected_tag}: {candidate['label']} (idx={idx}) @ {rate} Hz rms={int(candidate['idle_rms'])} reopen_rms={int(reopen_rms)} score={int(candidate['score'])}")
+                return stream, idx, rate, chunk_frames
+            except Exception:
+                continue
+        return None, None, None, None
+
+    def _open_deterministic_input_stream(self, wav_path: str | None = None, target_rate: int = 16000):
+        wav_path = wav_path or os.getenv('AVA_INPUT_WAV')
+        if not wav_path:
+            return None, None, None, None
+        print(f"[audio] Deterministic input file: {wav_path}")
+        stream = _DeterministicInputStream(wav_path, target_rate=target_rate)
+        return stream, None, target_rate, max(int(target_rate * 0.02), 160)
 
     def _refresh_server_truth(self):
         if not getattr(self, 'server_client', None):
@@ -3786,19 +4624,13 @@ class StandaloneRealtimeAVA:
             return
         # TTS SOURCE OF TRUTH: sha1 proves no hidden rewrite between /respond and TTS
         _sha1 = hashlib.sha1(text.encode()).hexdigest()[:12]
-        # Decide final routing source for logging
-        _mode_eff = getattr(self, 'voice_mode', None) or getattr(self, '_voice_mode', None) or self._select_voice_mode()
-        _tts_source = "local" if _mode_eff == "unified" else "respond"
-        print(f"[tts-in] TTS_SOURCE={_tts_source} turn_id={turn_id} sha1={_sha1} preview='{text[:60]}...'")
+        print(f"[tts-in] TTS_SOURCE=respond turn_id={turn_id} sha1={_sha1} preview='{text[:60]}...'")
         speak_text = self._prepare_tts_text(text)
         if not speak_text:
             return
-        # UNIFIED MODE: always local TTS, never remote
-        _sel_mode = getattr(self, 'voice_mode', None) or getattr(self, '_voice_mode', None)
-        if not _sel_mode:
-            _sel_mode = self._select_voice_mode()
-        if _sel_mode == 'unified' and getattr(self, '_voice_session', None):
-            lf = (self.cfg.get('local_fallback') or {})
+        # UNIFIED MODE: Route through local TTS (Piper/Edge) instead of Deepgram remote
+        if getattr(self, '_voice_session', None) and getattr(self, 'voice_selected', None) == 'unified':
+            lf = self.cfg.get('local_fallback') or {}
             engine = lf.get('tts_engine', 'edge')
             print(f"[tts-route] Unified mode -> local TTS (engine={engine}): '{speak_text[:50]}...'")
             self._voice_session.speak(speak_text)
@@ -3811,12 +4643,6 @@ class StandaloneRealtimeAVA:
         # Mic loop checks this flag and suppresses audio input during TTS
         self.tts_active.set()
         self._tts_last_active = time.time()
-        # Arm utterance tracking for playback-complete signaling
-        try:
-            self.utt_playback_done.clear()
-            self._utt_in_progress = True
-        except Exception:
-            pass
         print("[half-duplex] MIC MUTED - TTS starting")
         speak_url = f"{DG_SPEAK_BASE}&encoding=linear16&sample_rate={self.playback_rate}"
         req = urllib.request.Request(
@@ -3830,7 +4656,6 @@ class StandaloneRealtimeAVA:
             method='POST'
         )
         ctx = ssl.create_default_context()
-        fell_back_to_local = False
         try:
             # Stream audio chunks directly to playback for lower latency
             with urllib.request.urlopen(req, context=ctx, timeout=60) as resp:
@@ -3846,25 +4671,15 @@ class StandaloneRealtimeAVA:
 
         except Exception as e:
             print(f"TTS error: {e}")
-            # Fallback to local TTS in unified mode so the user still hears a reply
+        finally:
+            # HALF-DUPLEX: Unmute mic after TTS completes
+            self.tts_active.clear()
+            self._tts_ended_at = time.time()
+            print("[half-duplex] MIC UNMUTED - TTS complete (grace period active)")
             try:
-                if getattr(self, '_voice_session', None):
-                    print("[tts-fallback] Remote TTS failed; routing to local TTS")
-                    fell_back_to_local = True
-                    self._voice_session.speak(speak_text)
-                    return
+                self.metrics['tts_utterances'] += 1
             except Exception:
                 pass
-        finally:
-            # HALF-DUPLEX: Unmute mic after TTS completes (only if we didn't reroute to local)
-            if not fell_back_to_local:
-                self.tts_active.clear()
-                self._tts_ended_at = time.time()
-                print("[half-duplex] MIC UNMUTED - TTS complete (grace period active)")
-                try:
-                    self.metrics['tts_utterances'] += 1
-                except Exception:
-                    pass
 
     def _listen_url(self) -> str:
         model = self.cfg.get('asr_model') or 'nova-2'
@@ -4110,52 +4925,29 @@ class StandaloneRealtimeAVA:
         _dg_mic_rate = MIC_RATE
         _dg_chunk = CHUNK_SAMPLES
 
-        def open_mic():
-            nonlocal _dg_mic_rate, _dg_chunk
-            target_idx = self.input_device_index
-            # Try configured device with rate cascade
-            if target_idx is not None:
-                for rate in _dg_rates:
-                    try:
-                        cf = max(int(rate * 0.02), 160)
-                        kw = dict(format=FORMAT, channels=CHANNELS, rate=rate,
-                                  input=True, frames_per_buffer=cf, input_device_index=target_idx)
-                        s = self.audio.open(**kw)
-                        _dg_mic_rate = rate
-                        _dg_chunk = cf
-                        try:
-                            info = self.audio.get_device_info_by_index(target_idx)
-                            print(f"[audio] DG mic opened: {info.get('name')} (idx={target_idx}) @ {rate} Hz")
-                        except Exception:
-                            print(f"[audio] DG mic opened: idx={target_idx} @ {rate} Hz")
-                        return s
-                    except Exception as e:
-                        print(f"[audio] DG mic device {target_idx} @ {rate} Hz failed: {e}")
-            # Fallback with rate cascade
-            for rate in _dg_rates:
-                try:
-                    cf = max(int(rate * 0.02), 160)
-                    kw = dict(format=FORMAT, channels=CHANNELS, rate=rate,
-                              input=True, frames_per_buffer=cf)
-                    s = self.audio.open(**kw)
-                    _dg_mic_rate = rate
-                    _dg_chunk = cf
-                    try:
-                        info = self.audio.get_default_input_device_info()
-                        print(f"[audio] DG mic fallback: {info.get('name')} @ {rate} Hz")
-                    except Exception:
-                        print(f"[audio] DG mic fallback @ {rate} Hz")
-                    return s
-                except Exception:
-                    continue
-            raise RuntimeError(f"No mic available (tried rates {_dg_rates})")
+        def _open_dg_mic():
+            return self._open_ranked_input_stream(
+                self.audio,
+                format=FORMAT,
+                channels=CHANNELS,
+                target_rate=MIC_RATE,
+                mode_label='DG mic',
+            )
 
-        stream = open_mic()
+        stream = _open_dg_mic()
+        _dg_sel_idx = None
+        if isinstance(stream, tuple):
+            stream, _dg_sel_idx, _dg_mic_rate, _dg_chunk = stream
+        if stream is None:
+            raise RuntimeError(f"No mic available (tried rates {_dg_rates})")
         _dg_need_resample = (_dg_mic_rate != MIC_RATE)
         if _dg_need_resample:
             print(f"[audio] DG mic will resample: {_dg_mic_rate} Hz -> {MIC_RATE} Hz")
 
-        print("🎤 Microphone active - AVA is always listening!")
+        if self._validation_mode:
+            print("🎤 Microphone active - wake word required in validation mode")
+        else:
+            print("🎤 Microphone active - AVA is always listening!")
 
         try:
             while self.running:
@@ -4293,31 +5085,7 @@ class StandaloneRealtimeAVA:
                         break
 
                     # Write audio chunk to stream
-                    audio_copy = None
                     try:
-                        # NEW: end-of-utterance marker handling
-                        if audio_data is self._UTT_END:
-                            try:
-                                print(f"[playback] received _UTT_END (q={self.audio_queue.qsize()})")
-                            except Exception:
-                                pass
-                            self._utt_in_progress = False
-                            try:
-                                self.utt_playback_done.set()
-                            except Exception:
-                                pass
-                            # Harness: flush TTS wav when audible utterance ends (authoritative)
-                            try:
-                                if getattr(self, '_harness_enabled', False):
-                                    self._harness_flush_tts(sample_rate=int(self.playback_rate))
-                            except Exception:
-                                pass
-                            try:
-                                # Use unified event model
-                                self.bus.emit(_VoiceEvent(type="playback.end"))
-                            except Exception:
-                                pass
-                            continue
                         # Drop immediately during abort window to ensure snappy barge-in
                         if time.time() < getattr(self, '_playback_abort_until', 0.0):
                             continue
@@ -4336,9 +5104,35 @@ class StandaloneRealtimeAVA:
                         self.playback_busy.clear()
                     # Update global playback RMS EMA for echo gating
                     try:
-                        if audio_copy:
-                            pr = self._rms_int16(audio_copy)
-                            self._playback_rms_ema = (self._playback_rms_ema * 0.85) + (pr * 0.15)
+                        pr = self._rms_int16(audio_data)
+                        self._playback_rms_ema = (self._playback_rms_ema * 0.85) + (pr * 0.15)
+                    except Exception:
+                        pass
+
+                    # Detect end-of-playback to start ASR blackout window
+                    try:
+                        synthesis_active = bool(getattr(self, '_tts_synthesis_active', False))
+                        if getattr(self, '_awaiting_playback_end', False) and not synthesis_active and self.audio_queue.empty():
+                            import time as _t
+                            self._asr_blackout_until = _t.time() + 0.8
+                            self._awaiting_playback_end = False
+                            self._playback_end_fired = True
+                            self.tts_active.clear()
+                            print(f"[echo-gate] ASR blackout until {self._asr_blackout_until:.3f}")
+                            try:
+                                if hasattr(self, '_voice_provider') and self._voice_provider:
+                                    asr = getattr(self._voice_provider, 'asr', None)
+                                    if asr and hasattr(asr, 'clear_buffer'):
+                                        asr.clear_buffer()
+                                        print("[echo-gate] Cleared ASR buffer on playback end")
+                            except Exception:
+                                pass
+                            print("[half-duplex] MIC UNMUTED (unified) - playback finished")
+                            try:
+                                if hasattr(self, '_turn_state') and self._turn_state:
+                                    self._turn_state.force_idle("TTS playback finished (playback.end)")
+                            except Exception:
+                                pass
                     except Exception:
                         pass
 
@@ -4541,33 +5335,20 @@ class StandaloneRealtimeAVA:
         _agent_rates = list(dict.fromkeys([_agent_config_sr, 48000, 44100, 16000]))
         _agent_mic_rate = MIC_RATE
         _agent_mic_chunk = 1024
-        mic_stream = None
-        _agent_target = self.input_device_index
-        if _agent_target is not None:
-            for _ar in _agent_rates:
-                try:
-                    _acf = max(int(_ar * 0.02), 160)
-                    _akw = dict(format=FORMAT, channels=CHANNELS, rate=_ar, input=True, frames_per_buffer=_acf, input_device_index=_agent_target)
-                    mic_stream = p.open(**_akw)
-                    _agent_mic_rate = _ar
-                    _agent_mic_chunk = _acf
-                    info = p.get_device_info_by_index(_agent_target)
-                    print(f"[audio] Agent mic opened: {info.get('name')} (idx={_agent_target}) @ {_ar} Hz")
-                    break
-                except Exception as e:
-                    print(f"[audio] Agent mic device {_agent_target} @ {_ar} Hz failed: {e}")
-        if mic_stream is None:
-            for _ar in _agent_rates:
-                try:
-                    _acf = max(int(_ar * 0.02), 160)
-                    _akw = dict(format=FORMAT, channels=CHANNELS, rate=_ar, input=True, frames_per_buffer=_acf)
-                    mic_stream = p.open(**_akw)
-                    _agent_mic_rate = _ar
-                    _agent_mic_chunk = _acf
-                    print(f"[audio] Agent mic fallback @ {_ar} Hz")
-                    break
-                except Exception:
-                    continue
+
+        def _open_agent_mic():
+            return self._open_ranked_input_stream(
+                p,
+                format=FORMAT,
+                channels=CHANNELS,
+                target_rate=MIC_RATE,
+                mode_label='Agent mic',
+            )
+
+        mic_stream = _open_agent_mic()
+        _agent_target = None
+        if isinstance(mic_stream, tuple):
+            mic_stream, _agent_target, _agent_mic_rate, _agent_mic_chunk = mic_stream
         if mic_stream is None:
             raise RuntimeError(f"No mic available for agent voice (tried rates {_agent_rates})")
         _agent_need_resample = (_agent_mic_rate != MIC_RATE)
@@ -5336,11 +6117,26 @@ class StandaloneRealtimeAVA:
     async def run(self):
         """Main run loop"""
         try:
+            # Prefer unified local voice when configured
+            try:
+                vm = (self.cfg.get('voice_mode') if isinstance(self.cfg, dict) else None) or os.getenv('AVA_VOICE_MODE') or ''
+            except Exception:
+                vm = os.getenv('AVA_VOICE_MODE') or ''
+            if vm.lower() == 'unified' or os.getenv('VOICE_UNIFIED','0') == '1':
+                print("[voice-unified] Entering unified local voice runner")
+                loop = asyncio.get_running_loop()
+                # Run blocking unified voice in executor to keep event loop alive
+                await loop.run_in_executor(None, self.run_unified_voice)
+                return
+            # Otherwise fall back to legacy conversation loop (if present)
             await self.start_conversation()
         finally:
             if self.asr_ws:
                 await self.asr_ws.close()
-            self.audio.terminate()
+            try:
+                self.audio.terminate()
+            except Exception:
+                pass
 
     async def cleanup(self):
         """Cleanup resources before reconnection"""
@@ -5605,7 +6401,8 @@ class StandaloneRealtimeAVA:
         # In validation mode, also require wake word
         if self._validation_mode and self._require_wake_for_tools:
             wake_words = getattr(self, '_wake_words', ['ava', 'eva'])
-            has_wake = any(lower.startswith(w) or f" {w}" in lower for w in wake_words)
+            normalized = self._normalize_for_wake(lower)
+            has_wake = any(normalized.startswith(w) or f" {w}" in normalized for w in wake_words)
             if not has_wake:
                 return False
 
@@ -5614,104 +6411,137 @@ class StandaloneRealtimeAVA:
     # Minimum real words (after stripping wake word) to enter agent loop
     MIN_CONTENT_WORDS = 2
 
+    MIN_CONTENT_WORDS = 2
+
     def _is_chat_only(self, text: str) -> str | None:
-        """Detect conversational transcripts that should NEVER start an agent loop.
-
-        Returns a direct reply string if the transcript is chat-only,
-        or None if it should go to the server / agent loop.
-
-        Rules:
-        - Wake word only (no command content) -> short ack, no agent loop
-        - Greetings -> instant local reply
-        - Short questions (<=6 words) without a command verb -> instant local reply
-        - Anything with an explicit command verb -> None (let agent handle it)
-        """
+        """Detect conversational transcripts that should NEVER start an agent loop."""
         if not text:
             return None
+
+        import random
+        import time as _time
+        import re
+
+        def _normalize_words_local(value: str) -> list[str]:
+            value = (value or '').lower().strip()
+            value = re.sub(r"[^a-z0-9\s]+", " ", value)
+            value = re.sub(r"\s+", " ", value).strip()
+            return [w for w in value.split() if w]
+
+        def _normalize_text_local(value: str) -> str:
+            return ' '.join(_normalize_words_local(value))
+
+        def _wake_phrases_local() -> list[str]:
+            phrases = []
+            for wake in getattr(self, '_wake_words', ['ava', 'eva']):
+                norm = _normalize_text_local(wake)
+                if norm:
+                    phrases.append(norm)
+            return sorted(set(phrases), key=len, reverse=True)
+
         lower = text.strip().lower()
-        words = lower.split()
-        word_count = len(words)
-
-        # Check if any word is a command verb (uses class constant)
-        has_command = bool(set(words) & self.COMMAND_VERBS)
+        clean_words = _normalize_words_local(text)
+        word_count = len(clean_words)
+        has_command = bool(set(clean_words) & self.COMMAND_VERBS)
         if has_command:
-            return None  # Let agent loop handle it
+            return None
 
-        # WAKE-WORD-ONLY GATE: If wake word present but insufficient content after it,
-        # return a short ack — never start the agent loop.
-        wake_words = getattr(self, '_wake_words', ['ava', 'eva'])
-        # Strip all wake-word tokens from the transcript to find remaining content
-        content_after_wake = lower
-        # Remove multi-word wake prefixes first (longest first)
-        wake_prefixes = sorted(wake_words, key=len, reverse=True)
-        for wp in wake_prefixes:
-            if content_after_wake.startswith(wp):
-                content_after_wake = content_after_wake[len(wp):].strip()
-                break
-        # Also strip filler/noise tokens that ASR sometimes prepends
+        wake_phrases = _wake_phrases_local()
+        norm_text = _normalize_text_local(text)
         filler_tokens = {'ha', 'huh', 'um', 'uh', 'ah', 'oh', 'hmm', 'hey', 'hi', 'hello', 'yo', 'ok', 'okay'}
-        remaining_words = [w for w in content_after_wake.split() if w not in filler_tokens and w not in wake_words]
-        if any(w in lower for w in wake_words) and len(remaining_words) < self.MIN_CONTENT_WORDS:
-            import random
+        trimmed_words = list(clean_words)
+        while trimmed_words and trimmed_words[0] in filler_tokens:
+            trimmed_words = trimmed_words[1:]
+        trimmed_text = ' '.join(trimmed_words)
+        wake_match = None
+        for wake_phrase in wake_phrases:
+            if norm_text == wake_phrase or norm_text.startswith(wake_phrase + ' ') or trimmed_text == wake_phrase or trimmed_text.startswith(wake_phrase + ' '):
+                wake_match = wake_phrase
+                break
+
+        remaining_words = list(trimmed_words or clean_words)
+        if wake_match:
+            wake_len = len(wake_match.split())
+            remaining_words = (trimmed_words or clean_words)[wake_len:]
+        remaining_words = [w for w in remaining_words if w not in filler_tokens]
+
+        if wake_match and len(remaining_words) < self.MIN_CONTENT_WORDS:
             ack_replies = ["Yeah?", "I'm here.", "Go ahead.", "Listening.", "What's up?"]
-            print(f"[wake-only] Wake word detected, no command content: '{text}' -> ack only")
+            followup_window = float(getattr(self, '_wake_followup_sec', 6.0) or 6.0)
+            if followup_window > 0:
+                self._wake_followup_until = _time.time() + followup_window
+                print(f"[wake-only] Wake word detected, no command content: '{text}' -> silent followup_window={followup_window}s")
+                return getattr(self, '_wake_followup_silent_reply', '__AVA_WAKE_FOLLOWUP_SILENT__')
+            self._wake_followup_until = 0.0
+            print(f"[wake-only] Wake word detected, no command content: '{text}' -> ack only followup_window=0.0s")
             return random.choice(ack_replies)
 
-        # Greetings - instant local reply
         greeting_patterns = [
             'hello', 'hi', 'hey', 'howdy', 'greetings', 'good morning',
-            'good afternoon', 'good evening', 'good night', "what's up",
-            'whats up', 'sup', 'yo', 'hiya', 'heya',
+            'good afternoon', 'good evening', 'good night', 'whats up',
+            'sup', 'yo', 'hiya', 'heya',
         ]
-        for g in greeting_patterns:
-            if lower == g or lower.startswith(g + ' ') or lower.endswith(' ' + g):
-                import random
-                replies = [
-                    "Hey! What can I do for you?",
-                    "Hi there! How can I help?",
-                    "Hey! I'm listening.",
-                    "Hello! What do you need?",
-                ]
-                return random.choice(replies)
-
-        # Greeting with name (e.g. "hello ava", "hey eva")
-        wake_words = getattr(self, '_wake_words', ['ava', 'eva'])
-        for g in ['hello', 'hi', 'hey', 'howdy', 'good morning', 'good afternoon', 'good evening']:
-            for w in wake_words:
-                if lower in (f"{g} {w}", f"{g} {w}a", f"hey {w}", f"hi {w}"):
-                    import random
+        wake_tokens = set(' '.join(wake_phrases).split())
+        content_for_greeting = ' '.join(w for w in clean_words if w not in wake_tokens)
+        if len(content_for_greeting.split()) <= 3:
+            for g in greeting_patterns:
+                if content_for_greeting == g or content_for_greeting.startswith(g + ' ') or content_for_greeting.endswith(' ' + g):
                     replies = [
                         "Hey! What can I do for you?",
-                        "Hi! I'm here. What do you need?",
-                        "Hello! How can I help?",
+                        "Hi there! How can I help?",
+                        "Hey! I'm listening.",
+                        "Hello! What do you need?",
                     ]
                     return random.choice(replies)
 
-        # Short phrases (<=6 words) without command verbs -> conversational
+        if not has_command:
+            query_text = ' '.join(remaining_words or clean_words)
+            time_query = any(p in query_text for p in [
+                'what time', 'what s the time', 'what is the time',
+                'current time', 'the time', 'need the time', 'time is it',
+            ])
+            if time_query:
+                from datetime import datetime
+                now = datetime.now().strftime("%-I:%M %p" if os.name != 'nt' else "%#I:%M %p")
+                return f"It's {now}."
+            date_query = (
+                any(p in query_text for p in [
+                    'what day', 'what is the date', 'what date', 'today s date',
+                    'the date', 'need the date', 'date today', 'date is it',
+                    'what is today', 'what s today', 'today is it',
+                ])
+                or bool(re.search(r"\bwhat\s+(?:is|s)\s+today\b", query_text))
+                or bool(re.search(r"\bwhat\s+day\s+(?:is\s+)?(?:it|today)\b", query_text))
+            )
+            if date_query:
+                from datetime import datetime
+                today = datetime.now().strftime("%A, %B %-d, %Y" if os.name != 'nt' else "%A, %B %#d, %Y")
+                return f"Today is {today}."
+
         if word_count <= 6 and not has_command:
-            # "how are you" / "what time is it" / "thank you" / "never mind"
             if any(p in lower for p in ['how are you', 'how do you do', 'how goes it']):
                 return "I'm doing well! How can I help?"
             if any(p in lower for p in ['thank', 'thanks']):
                 return "You're welcome!"
             if any(p in lower for p in ['never mind', 'nevermind', 'forget it', 'cancel']):
                 return "Okay, no problem."
-            if any(p in lower for p in ['what time', 'what is the time', 'current time']):
-                from datetime import datetime
-                now = datetime.now().strftime("%-I:%M %p" if os.name != 'nt' else "%#I:%M %p")
-                return f"It's {now}."
-            if any(p in lower for p in ['what day', 'what is the date', 'what date', "today's date"]):
-                from datetime import datetime
-                today = datetime.now().strftime("%A, %B %d")
-                return f"Today is {today}."
             if any(p in lower for p in ['who are you', 'what are you', "what's your name", 'your name']):
                 return "I'm AVA, your autonomous virtual assistant."
             if any(p in lower for p in ['goodbye', 'bye', 'see you', 'later', 'good night']):
                 return "See you later!"
             if lower in ('yes', 'no', 'yeah', 'yep', 'nope', 'nah', 'okay', 'ok', 'sure'):
-                return None  # Affirmations might be confirmations for pending actions
+                return None
 
-        return None  # Not chat-only, let server handle it
+        return None
+
+    def _arm_wake_followup_asr_capture(self) -> None:
+        try:
+            asr_engine = getattr(getattr(self, '_voice_provider', None), 'asr', None)
+            if asr_engine and hasattr(asr_engine, 'set_capture_enabled'):
+                asr_engine.set_capture_enabled(True)
+                print("[wake-followup] ASR capture gate opened for follow-up command")
+        except Exception:
+            pass
 
     async def _maybe_handle_local_intent(self, transcript: str, turn_id=None) -> bool:
         """Handle key voice intents locally to keep server-truth consistent"""
@@ -5723,6 +6553,10 @@ class StandaloneRealtimeAVA:
 
             # CHAT-FIRST ROUTING: Greetings and simple questions never start agent loops
             chat_reply = self._is_chat_only(text)
+            if chat_reply == getattr(self, '_wake_followup_silent_reply', '__AVA_WAKE_FOLLOWUP_SILENT__'):
+                print(f"[chat-first] Silent wake follow-up armed (no TTS): '{text}'")
+                self._arm_wake_followup_asr_capture()
+                return True
             if chat_reply:
                 print(f"[chat-first] Direct reply (no agent loop): '{chat_reply}'")
                 await self._speak_text(chat_reply, turn_id=turn_id)
