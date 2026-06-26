@@ -1,0 +1,4 @@
+[submodule "cmp-use"]
+	path = cmp-use
+	url = https://github.com/jroo162000/cmp-use.git
+	branch = ava-live
