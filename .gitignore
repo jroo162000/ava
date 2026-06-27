@@ -91,7 +91,9 @@ archive/
 *.mlmodel
 vosk-models/
 voices/
-voice/
+# NOTE: do NOT ignore "voice/" — ava-integration/voice/ is the voice-runner SOURCE
+# scaffold (piper_bin, edge_stream, elevenlabs_tts, bus, session, providers) that
+# ava_local_voice.py imports. Models stay ignored via *.onnx / voices/ / vendor/piper/models/.
 
 # Temporary files
 *.tmp
