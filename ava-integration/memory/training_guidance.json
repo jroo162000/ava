@@ -49,6 +49,36 @@
       "id": "gmqucossa658",
       "text": "When the user asks for current sports events or teams, use browser_automation — do not use net_ops.",
       "added": "2026-06-26T03:07:28.570Z"
+    },
+    {
+      "id": "proposal-evidence-first",
+      "text": "Before proposing a code change, verify the stated problem with local evidence; do not propose fixes based only on a plausible assumption.",
+      "added": "2026-06-28T05:58:00.000Z"
+    },
+    {
+      "id": "proposal-machine-state",
+      "text": "For environment-specific proposals, compare the real machine state against the current code path before claiming the change is needed.",
+      "added": "2026-06-28T05:58:00.000Z"
+    },
+    {
+      "id": "proposal-no-starvation",
+      "text": "For scheduler proposals, check whether priority order can starve another expected behavior, such as original posts being blocked by issue posts.",
+      "added": "2026-06-28T05:58:00.000Z"
+    },
+    {
+      "id": "proposal-verify-loop",
+      "text": "For posting proposals, verify the full loop: create, verification queue, verified clearing, stats, and follow-up response behavior.",
+      "added": "2026-06-28T05:58:00.000Z"
+    },
+    {
+      "id": "proposal-retain-rejections",
+      "text": "When a proposal is rejected, retain the general rule that caused rejection and avoid repeating the same kind of inaccurate proposal.",
+      "added": "2026-06-28T05:58:00.000Z"
+    },
+    {
+      "id": "proposal-sources",
+      "text": "Use all learning sources for proposals: Moltbook learnings, recent chat corrections, real errors, diagnostics, and prior rejected proposals.",
+      "added": "2026-06-28T05:58:00.000Z"
     }
   ]
 }

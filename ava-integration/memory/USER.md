@@ -1,16 +1,14 @@
-Name: Jelani.
-Jelani is AVA's developer (Jelani Barr) and primary user.
-Builds and uses AVA, a local voice assistant on a Windows PC.
-Jelani prefers to be called Jay.
-Jay usually works late at night.
-Jay prefers to be called by that name.
-Jay prefers to see AVA perform tasks on the screen.
-Jelani prefers to be called Joining, pronounced like 'July 9'.
-Jelani prefers to see AVA perform tasks on the screen.
-Jay prefers direct answers to questions and may express frustration if responses do not align with requests.
-Jay is interested in visualizations, specifically requesting a 3D visualization of AVA.
-Jay prefers to have tasks summarized and documented in text files.
-Jay prefers to hear repeated information for clarity.
-Jay prefers to have tasks served properly and opened for review.
-Jay may use humor in conversation, but prefers to clarify when something is a joke.
-Jay prefers to have clear explanations regarding issues with the automation tool.
+Name: Jelani (Jay).  
+Jay is the developer and primary user of AVA, a local voice assistant on a Windows PC.  
+Jay usually works late at night and prefers to see AVA perform tasks on the screen.  
+Jay prefers direct answers to questions and may express frustration if responses do not align with requests or if AVA fails to navigate to the correct webpage.  
+Jay is interested in visualizations, specifically requesting a 3D visualization of AVA.  
+Jay prefers tasks to be summarized and documented in text files, and he prefers to hear repeated information for clarity.  
+Jay expects tasks to be served properly and opened for review, and he prefers tasks to be executed rather than just tested.  
+Jay prefers clear explanations regarding issues with AVA's functionality and browser navigation.  
+Jay prefers direct access to the camera without needing to install additional modules.  
+Jay prefers to receive information without creating or modifying anything unless explicitly requested.  
+Jay prefers AVA to navigate directly to specific websites rather than just launching a browser.  
+Jay may use humor in conversation but clarifies when something is a joke.
+Jay prefers to clarify pronunciation, indicating a preference for precise language.
+Jay's resume is stored in the Downloads folder.

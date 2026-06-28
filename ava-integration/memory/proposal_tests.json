@@ -1,0 +1,96 @@
+{
+  "updatedAt": "2026-06-28T05:58:00.000Z",
+  "purpose": "Local-only proposal review curriculum for AVA. Use these tests before staging or approving self-modification proposals.",
+  "tests": [
+    {
+      "id": "pt-001-evidence-before-fix",
+      "source": "proposal_review",
+      "lesson": "A proposal must cite observed evidence from code, logs, state, or user report. Plausible is not enough.",
+      "reject_if": "The proposal describes a possible issue but does not prove that issue is happening here."
+    },
+    {
+      "id": "pt-002-machine-state-check",
+      "source": "rejected_downloads_proposal",
+      "lesson": "For machine-specific paths, registry values, devices, credentials, or ports, check the real state first.",
+      "reject_if": "The current state already matches the proposed behavior, as with Downloads resolving to the same path."
+    },
+    {
+      "id": "pt-003-no-scheduler-starvation",
+      "source": "moltbook_original_posts",
+      "lesson": "Scheduler priority must not let one job permanently starve another expected job.",
+      "reject_if": "A queue of issue/help posts can indefinitely block original self-posts or learning cycles."
+    },
+    {
+      "id": "pt-004-full-loop-verification",
+      "source": "moltbook_verification",
+      "lesson": "Posting fixes must be verified through create, verification queue, post-verification clearing, stats, and recent-post visibility.",
+      "reject_if": "Only the first step works but the verification card or state remains stale."
+    },
+    {
+      "id": "pt-005-comment-followups",
+      "source": "moltbook_replies",
+      "lesson": "Engagement is incomplete if AVA comments on others' posts but does not track and answer replies under those comments.",
+      "reject_if": "The implementation only checks comments on AVA's own posts."
+    },
+    {
+      "id": "pt-006-interval-alignment",
+      "source": "user_guidance",
+      "lesson": "Related autonomous loops should run on compatible cadences when the user asks for them to reinforce each other.",
+      "reject_if": "Moltbook learning remains on a 2-hour cadence while proposal scans run every 15 minutes."
+    },
+    {
+      "id": "pt-007-retain-rejected-lessons",
+      "source": "proposal_review",
+      "lesson": "Every rejected proposal should produce a reusable rule so AVA does not repeat that class of mistake.",
+      "reject_if": "A rejection changes queue status but no lesson is retained."
+    },
+    {
+      "id": "pt-008-minimal-scope",
+      "source": "coding_practice",
+      "lesson": "A good proposal changes the smallest code path that explains the observed failure.",
+      "reject_if": "The diff rewrites unrelated code, broadens permissions, or changes behavior outside the issue."
+    },
+    {
+      "id": "pt-009-privacy-safe-learning",
+      "source": "moltbook_learning",
+      "lesson": "Learn from Moltbook and chats without copying secrets, personal paths, credentials, or private user details into posts or prompts.",
+      "reject_if": "The proposal exports private local context to a public post or external model without explicit approval."
+    },
+    {
+      "id": "pt-010-accuracy-over-volume",
+      "source": "user_guidance",
+      "lesson": "Many proposal tests are useful only if each test is specific, evidence-backed, and tied to a real failure mode.",
+      "reject_if": "The proposal batch is repetitive, generic, or optimized for quantity over correctness."
+    },
+    {
+      "id": "pt-011-source-rotation",
+      "source": "self_improvement",
+      "lesson": "Rotate proposal ideas across Moltbook learnings, chat corrections, real errors, diagnostics, and prior rejections.",
+      "reject_if": "The engine keeps proposing from the same source or file while ignoring other current signals."
+    },
+    {
+      "id": "pt-012-live-verification",
+      "source": "coding_practice",
+      "lesson": "After code changes, restart or otherwise reload the affected service and verify live stats or behavior.",
+      "reject_if": "The code was edited but the running AVA process still uses the old behavior."
+    },
+    {
+      "id": "pt-013-default-browser-repeat",
+      "source": "rejected_proposal",
+      "lesson": "Within the same review batch, do not re-propose default-browser behavior after the narrow browser-intent fix unless new evidence shows the current path fails.",
+      "reject_if": "The proposal is another about:blank/default-browser variant without new failure evidence."
+    },
+    {
+      "id": "pt-014-downloads-repeat",
+      "source": "rejected_proposal",
+      "lesson": "Within the same review batch, do not re-propose the Downloads known-folder registry fix on this PC; the registry and current default both resolve to the same folder.",
+      "reject_if": "The proposal repeats the Downloads registry idea without a changed machine-state check."
+    },
+    {
+      "id": "pt-015-variety-required",
+      "source": "proposal_batch_review",
+      "lesson": "Proposal batches must rotate files and signal sources; repeated variants of the same idea count as failed proposal tests, but a file can be proposed again later when new evidence truly points there.",
+      "reject_if": "The batch keeps returning to the same file, same reason, or same small wording variant."
+    }
+  ]
+}

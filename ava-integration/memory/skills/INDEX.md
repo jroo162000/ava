@@ -2,3 +2,4 @@
 
 - Send an email by voice — when you need to send an email to a contact using voice commands
 - Create and Open a Text File — When you need to create a list and open it for review
+- Create self backup snapshot — When you need to create a versioned backup snapshot of the current AI/code configuration for later restoration or comparison
