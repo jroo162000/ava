@@ -9,6 +9,7 @@ import json
 import os
 import time
 import urllib.request
+import urllib.parse
 import urllib.error
 from pathlib import Path
 from datetime import datetime
@@ -198,8 +199,46 @@ def run_heartbeat():
     }
 
 
+def _scrub_content_for_privacy(text: str) -> str:
+    """Scrub obvious private data before sending to Moltbook or external prompts.
+
+    This is a lightweight best-effort scrubber to reduce leakage of:
+    - Local file paths
+    - Repo/file-graph style paths
+    - Credentials, tokens, API keys
+    - Highlighted tool_execution / log-query fragments
+    """
+    if not text:
+        return text
+
+    import re
+
+    scrubbed = text
+
+    # Collapse Windows-style absolute paths
+    scrubbed = re.sub(r"[A-Za-z]:\\\\[^\s]+", "[local-path]", scrubbed)
+
+    # Collapse Unix-style absolute paths
+    scrubbed = re.sub(r"/(?:[^\s/]+/)+[^\s]+", "[local-path]", scrubbed)
+
+    # Repo/file graph style references (e.g., src/app/main.py, path/to/file.ext)
+    scrubbed = re.sub(r"(?:[\w.-]+/)+[\w.-]+", "[repo-path]", scrubbed)
+
+    # Obvious credential / token like sequences
+    scrubbed = re.sub(r"(?i)(api[_-]?key|token|secret|password)\s*[:=]\s*['\"]?[^'\"\s]+['\"]?", "[redacted-credential]", scrubbed)
+
+    # Highlighted tool_execution or log-query fragments
+    scrubbed = re.sub(r"```(tool_execution|log-query)[\s\S]*?```", "```[redacted-tool-log]```", scrubbed)
+
+    return scrubbed
+
+
 def post_to_moltbook(submolt, title, content, api_key=None):
-    """Create a new post on Moltbook."""
+    """Create a new post on Moltbook.
+
+    Content is passed through a privacy scrubber to avoid leaking local
+    paths, repo graphs, credentials, or detailed tool-execution logs.
+    """
     if not api_key:
         creds = load_credentials()
         api_key = creds.get("api_key") if creds else None
@@ -207,10 +246,13 @@ def post_to_moltbook(submolt, title, content, api_key=None):
     if not api_key:
         return {"success": False, "error": "No API key"}
 
+    safe_title = _scrub_content_for_privacy(title)
+    safe_content = _scrub_content_for_privacy(content)
+
     result = api_request("posts", method="POST", data={
         "submolt": submolt,
-        "title": title,
-        "content": content
+        "title": safe_title,
+        "content": safe_content
     }, api_key=api_key)
 
     return result

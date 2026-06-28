@@ -7,6 +7,7 @@ import logger from '../utils/logger.js';
 import memoryService from '../services/memory.js';
 import llmService from '../services/llm.js';
 import toolsService from '../services/tools.js';
+import pythonWorker from '../services/pythonWorker.js';
 import conversationLogger from '../services/conversationLogger.js';
 import artifactMemory from '../services/artifactMemory.js';
 import personaSvc from '../services/persona.js';
@@ -25,6 +26,57 @@ import os from 'os';
 import agentLoop from '../services/agentLoop.js';
 import moltbookService from '../services/moltbook.js';
 import moltbookScheduler from '../services/moltbookScheduler.js';
+import selfImprove from '../services/selfImprove.js';
+import selfRestart from '../services/selfRestart.js';
+
+const recentTurnKeys = new Map();
+const DUPLICATE_TURN_MS = Math.max(500, parseInt(process.env.AVA_DUPLICATE_TURN_MS || '3000', 10));
+
+function normalizeTurnText(text = '') {
+  return String(text || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]+/g, ' ')
+    .replace(/\s+/g, ' ');
+}
+
+function turnTokenSimilarity(a = '', b = '') {
+  const aTokens = new Set(normalizeTurnText(a).split(' ').filter(Boolean));
+  const bTokens = new Set(normalizeTurnText(b).split(' ').filter(Boolean));
+  if (!aTokens.size || !bTokens.size) return 0;
+  let overlap = 0;
+  for (const token of aTokens) {
+    if (bTokens.has(token)) overlap += 1;
+  }
+  return overlap / Math.max(aTokens.size, bTokens.size);
+}
+
+function markDuplicateTurn(endpoint, sessionId, text) {
+  const normalized = normalizeTurnText(text);
+  if (!normalized) return false;
+  const now = Date.now();
+  for (const [key, entry] of recentTurnKeys.entries()) {
+    const seenAt = typeof entry === 'number' ? entry : entry?.seenAt || 0;
+    if (now - seenAt > DUPLICATE_TURN_MS * 3) recentTurnKeys.delete(key);
+  }
+  const scope = `${endpoint}|${sessionId || ''}`;
+  for (const [key, entry] of recentTurnKeys.entries()) {
+    const seenAt = typeof entry === 'number' ? entry : entry?.seenAt || 0;
+    if (!key.startsWith(`${scope}|`) || now - seenAt > DUPLICATE_TURN_MS) continue;
+    const previous = typeof entry === 'object' ? entry.normalized || '' : '';
+    const similarLength = Math.abs(previous.length - normalized.length) <= Math.max(6, Math.ceil(normalized.length * 0.2));
+    if (previous === normalized || (similarLength && turnTokenSimilarity(previous, normalized) >= 0.82)) {
+      recentTurnKeys.set(key, { seenAt: now, normalized });
+      return true;
+    }
+  }
+  const key = `${scope}|${crypto.createHash('sha256')
+    .update(normalized)
+    .digest('hex')
+    .slice(0, 20)}`;
+  recentTurnKeys.set(key, { seenAt: now, normalized });
+  return false;
+}
 
 // LLM composition helpers
 async function composeLLM({ system, user }, fallbackText){
@@ -340,6 +392,16 @@ function looksLikeRecall(text = '') {
   return false;
 }
 
+// Short, vague follow-ups about the LAST thing AVA did ("what is the result", "did it
+// work", "how did it go"). These must be ANSWERED from recent context — never treated as
+// a new action command (the agent used to guess, e.g. opening Explorer/Downloads).
+function looksLikeFollowupStatus(text = '') {
+  const t = String(text || '').toLowerCase().trim().replace(/[?.!]+$/, '');
+  if (!t) return false;
+  if (t.split(/\s+/).length > 7) return false;
+  return /^(what(?:'?s| is| was| are)?(?: the)? (?:result|results|outcome|status|answer|verdict|finding|findings|diagnosis)|what happened|what did (?:you|that) (?:find|do|say|get)|what now|what next|and (?:then|now)|so what|did (?:it|that|you) (?:work|succeed|finish|pass|fail)|tell me (?:the )?(?:result|what (?:you found|happened|you did))|how did (?:it|that) go|any (?:luck|results?))$/i.test(t);
+}
+
 // Find the most recent successful tool result in the agent loop's history, so its
 // data can be turned into a spoken answer when the loop itself didn't compose one.
 function extractLastToolResult(state) {
@@ -385,6 +447,23 @@ function buildSpokenSelfResponseText() {
   }
 }
 
+// STT (Whisper) routinely garbles "Moltbook" — her AI-agent social network feature — into
+// non-words ("moat book", "mote book", "malt book", "mold book", "molt book") or, in context,
+// real words ("notebook", "more book"). Normalize those to "moltbook" so intent routing and the
+// model aren't derailed by the exact transcription. The original user text is still what gets
+// logged; this only cleans the copy used for understanding/routing.
+function normalizeMoltbookMentions(text) {
+  let s = String(text || '');
+  // Clear non-word mishears — safe to map unconditionally.
+  s = s.replace(/\b(moat ?book|mote ?book|molt ?book|mold ?book|malt ?book|mault ?book|moult ?book|vault ?book|moat ?books)\b/gi, 'moltbook');
+  // Real-word mishears ("notebook", "more book") — only when context is clearly the AI social
+  // network / posting, so legitimate uses of those words aren't clobbered.
+  if (/\b(ai|agent|agents|social|feed|post|posts|posted|posting|platform|network|community|upvote|submolt|comment)\b/i.test(s)) {
+    s = s.replace(/\b(note ?book|notebook|more ?book|moor ?book|moot ?book)\b/gi, 'moltbook');
+  }
+  return s;
+}
+
 function normalizeSpokenReplyBudget(body = {}) {
   const voiceMode = String(body.voice_mode || body.voiceMode || '').toLowerCase();
   const rawBudget = body.spoken_reply_budget || body.spokenReplyBudget || {};
@@ -403,12 +482,125 @@ function normalizeSpokenReplyBudget(body = {}) {
   };
 }
 
+// --- Spoken-number normalization: say numbers the way a person would when HEARD, not read ---
+const _ONES = ['zero','one','two','three','four','five','six','seven','eight','nine','ten','eleven','twelve','thirteen','fourteen','fifteen','sixteen','seventeen','eighteen','nineteen'];
+const _TENS = ['','','twenty','thirty','forty','fifty','sixty','seventy','eighty','ninety'];
+function _twoDigitsToWords(n) {
+  n = parseInt(n, 10);
+  if (n < 20) return _ONES[n];
+  const t = Math.floor(n / 10), o = n % 10;
+  return o ? `${_TENS[t]}-${_ONES[o]}` : _TENS[t];
+}
+// 1999 -> "nineteen ninety-nine"; 2005 -> "two thousand five"; 1905 -> "nineteen oh five"
+function _yearToWords(y) {
+  const n = parseInt(y, 10);
+  if (n >= 2000 && n <= 2009) return n % 10 ? `two thousand ${_ONES[n % 10]}` : 'two thousand';
+  const hi = Math.floor(n / 100), lo = n % 100;
+  if (lo === 0) return `${_twoDigitsToWords(hi)} hundred`;
+  if (lo < 10) return `${_twoDigitsToWords(hi)} oh ${_ONES[lo]}`;
+  return `${_twoDigitsToWords(hi)} ${_twoDigitsToWords(lo)}`;
+}
+const _DIGIT_WORD = { '0':'zero','1':'one','2':'two','3':'three','4':'four','5':'five','6':'six','7':'seven','8':'eight','9':'nine' };
+// Read an ID/code/serial out character by character (digits become words, letters stay).
+function _spellChars(tok) {
+  return String(tok).split('').map(c => _DIGIT_WORD[c] || c.toLowerCase()).filter(Boolean).join(' ');
+}
+// Homograph disambiguation for TTS. The Piper/espeak engine already pronounces MOST homographs
+// correctly from context (measured: it nails read-present, lead-verb, live, tear, bass, wound,
+// record-noun/verb, etc.). It only mis-says a small, MEASURED set — so we surgically respell ONLY
+// those, to a token verified to phonemize correctly, and only in the sense the engine gets wrong.
+// This affects the spoken copy only; the on-screen text keeps the real spelling. Toggle off with
+// AVA_HOMOGRAPH_OFF=1.
+function disambiguateHomographs(text) {
+  if (process.env.AVA_HOMOGRAPH_OFF === '1') return text;
+  const HOMO = new Set(['read', 'lead', 'close', 'excuse', 'wind', 'bow', 'dove', 'minute']);
+  const tokens = []; const re = /[A-Za-z']+/g; let m;
+  while ((m = re.exec(text))) tokens.push({ w: m[0], i: m.index, lw: m[0].toLowerCase() });
+  if (!tokens.length) return text;
+  const words = tokens.map(t => t.lw);
+  const repl = {};
+  for (let k = 0; k < tokens.length; k++) {
+    const w = words[k]; if (!HOMO.has(w)) continue;
+    const prev = (n) => words[k - n] || ''; const next = (n) => words[k + n] || '';
+    const around = words.slice(Math.max(0, k - 4), k + 5);
+    let r = null;
+    if (w === 'read') {                                   // past tense -> "red" (engine says "reed")
+      const PERF = new Set(['have', 'has', 'had', 'having', "i've", "we've", "you've", "they've", "i'd", "we'd", "you'd", "they'd", "he'd", "she'd", 'just', 'already', 'recently']);
+      const PAST = new Set(['yesterday', 'ago', 'earlier', 'already', 'recently', 'then', 'last']);
+      if (PERF.has(prev(1)) || PERF.has(prev(2)) || PAST.has(prev(1)) || around.some(x => PAST.has(x))) r = 'red';
+    } else if (w === 'lead') {                            // the metal -> "led" (engine says "leed")
+      const METAL = new Set(['pipe', 'pipes', 'paint', 'poison', 'poisoning', 'solder', 'acid', 'metal', 'bullet', 'bullets', 'toxic', 'molten', 'dust', 'exposure', 'levels', 'free', 'based']);
+      if (METAL.has(next(1)) || METAL.has(next(2)) || METAL.has(prev(1)) || prev(1) === 'heavy') r = 'led';
+    } else if (w === 'close') {                           // verb -> "cloze" (/z/); adjective stays /s/
+      const OBJ = new Set(['the', 'this', 'that', 'your', 'my', 'our', 'his', 'her', 'their', 'it', 'them', 'a', 'an', 'up', 'down', 'out', 'off', 'everything', 'all']);
+      const ADJN = new Set(['to', 'friend', 'friends', 'call', 'by', 'enough', 'proximity', 'range', 'second', 'attention', 'eye', 'watch', 'relationship', 'family', 'ties', 'together', 'quarters']);
+      const ADJP = new Set(['so', 'very', 'too', 'how', 'getting', 'pretty', 'real', 'more', 'less', 'quite', 'extremely', 'super', 'really']);
+      if (ADJN.has(next(1)) || ADJP.has(prev(1))) r = null;
+      else if (OBJ.has(next(1))) r = 'cloze';
+    } else if (w === 'excuse') {                          // verb -> "excuze" (/z/); noun stays /s/
+      const VOBJ = new Set(['me', 'him', 'her', 'us', 'them', 'myself', 'yourself', 'ourselves', 'my', 'the', 'his', 'their']);
+      const NDET = new Set(['an', 'a', 'the', 'no', 'any', 'some', 'that', 'this', 'your', 'my', 'his', 'her', 'good', 'bad', 'weak', 'lame', 'poor', 'valid', 'great', 'another']);
+      if (NDET.has(prev(1))) r = null;
+      else if (VOBJ.has(next(1)) || ['to', 'will', 'please', 'would', 'can', 'may'].includes(prev(1))) r = 'excuze';
+    } else if (w === 'wind') {                            // verb (wind a clock / wind up) -> "wined" /aɪ/
+      const MECH = new Set(['clock', 'watch', 'spring', 'cord', 'rope', 'string', 'handle', 'crank', 'thread', 'yarn', 'bobbin', 'gear', 'clockwork']);
+      if (next(1) === 'up' || next(1) === 'down') r = 'wined';
+      else if (['the', 'your', 'it', 'a'].includes(next(1)) && (MECH.has(next(2)) || MECH.has(next(3)))) r = 'wined';
+    } else if (w === 'bow') {                             // bend/bow-down -> "bough" /aʊ/; ribbon/weapon stay /oʊ/
+      if (next(1) === 'down' || next(1) === 'to' || (prev(1) === 'a' && ['take', 'took', 'takes', 'taking', 'taken'].includes(prev(2)))) r = 'bough';
+    } else if (w === 'dove') {                            // past of dive -> "dohv" /oʊ/; the bird stays /ʌ/
+      const SUBJ = new Set(['i', 'he', 'she', 'we', 'they', 'you', 'who', 'then', 'just']);
+      const DIR = new Set(['into', 'in', 'under', 'off', 'down', 'for', 'head', 'headfirst', 'deep', 'straight', 'beneath', 'through', 'forward']);
+      if (SUBJ.has(prev(1)) && DIR.has(next(1))) r = 'dohv';
+    } else if (w === 'minute') {                          // tiny -> "mynute"; the time unit stays
+      const TINY = new Set(['amount', 'amounts', 'detail', 'details', 'particle', 'particles', 'quantity', 'quantities', 'trace', 'traces', 'fraction', 'difference', 'differences', 'change', 'changes', 'speck']);
+      if (TINY.has(next(1))) r = 'mynute';
+    }
+    if (r) repl[k] = r;
+  }
+  if (!Object.keys(repl).length) return text;
+  let out = ''; let last = 0;
+  for (let k = 0; k < tokens.length; k++) {
+    if (repl[k]) { out += text.slice(last, tokens[k].i) + repl[k]; last = tokens[k].i + tokens[k].w.length; }
+  }
+  out += text.slice(last);
+  return out;
+}
+
+// Make spoken text TTS-friendly: drop stray markdown symbols and voice numbers by context.
+function normalizeForSpeech(text) {
+  let s = String(text || '');
+  // (a) Strip any stray markdown so TTS never reads symbols aloud (defense-in-depth).
+  s = s.replace(/```[\s\S]*?```/g, ' ')
+       .replace(/`([^`]*)`/g, '$1')
+       .replace(/^\s{0,3}#{1,6}\s+/gm, '')
+       .replace(/^\s*[-*+]\s+/gm, '')
+       .replace(/\*\*([^*]+)\*\*/g, '$1')
+       .replace(/\*([^*]+)\*/g, '$1')
+       .replace(/__([^_]+)__/g, '$1').replace(/_([^_]+)_/g, '$1')
+       .replace(/~~([^~]+)~~/g, '$1');
+  // (a.5) Fix the handful of homographs the TTS engine mispronounces (read-past, lead-metal,
+  // close/excuse verbs, wind/bow/dove/minute) — measured + verified, spoken copy only.
+  s = disambiguateHomographs(s);
+  if (process.env.AVA_SPEAK_NUMBERS_OFF === '1') return s.replace(/[ \t]{2,}/g, ' ');
+  // (b) An ID/code/serial/version after a cue word: read it out character by character.
+  s = s.replace(/\b(id|number|code|serial|confirmation|reference|ref|order|account|invoice|ticket|version|build|commit|hash|pin|phone|model)\b([:#.\s]+)([A-Za-z]*\d[A-Za-z0-9._-]*|\d{3,})/gi,
+    (m, cue, sep, tok) => `${cue}${sep}${_spellChars(tok.replace(/[._-]/g, ''))}`);
+  // (c) Hex-like ID tokens (digits + a–f letters, 6+ chars) anywhere — e.g. change "7bfcdc6b".
+  s = s.replace(/\b(?=[a-f0-9]*\d)(?=[a-f0-9]*[a-f])[a-f0-9]{6,}\b/gi, (m) => _spellChars(m));
+  // (d) Years: a bare 4-digit 1500–2099 that isn't a price/decimal/thousand -> say it as a year.
+  s = s.replace(/(^|[^\w$£€])((1[5-9]|20)\d{2})(?![\w%]|[.,]\d)/g, (m, pre, yr) => `${pre}${_yearToWords(yr)}`);
+  return s.replace(/[ \t]{2,}/g, ' ');
+}
+
 function shapeSpokenReply(text, body = {}) {
   let reply = typeof text === 'string' ? text.trim() : '';
   if (!reply) return '';
 
   const budget = normalizeSpokenReplyBudget(body);
   if (budget.voiceMode !== 'spoken') return reply;
+
+  reply = normalizeForSpeech(reply);
 
   const sentenceMatches = reply.match(/[^.!?]+[.!?]?/g) || [reply];
   reply = sentenceMatches.slice(0, budget.maxSentences).join(' ').replace(/\s+/g, ' ').trim();
@@ -424,14 +616,277 @@ function shapeSpokenReply(text, body = {}) {
   return reply;
 }
 
+function isSelfSnapshotRequest(text = '') {
+  const t = String(text || '').toLowerCase();
+  if (!t) return false;
+  const asksSnapshot = /\b(snapshot|backup|back up|freeze|save|preserve|checkpoint)\b/.test(t);
+  const selfRef = /\b(yourself|your self|this version|current version|working version|version of yourself|current state|working state)\b/.test(t);
+  return asksSnapshot && selfRef;
+}
+
+function isManualProposalRequest(text = '') {
+  const t = String(text || '').toLowerCase();
+  if (!t) return false;
+  const createsProposal = /\b(make|create|draft|generate|queue|run|do)\b[\s\S]{0,80}\b(proposal|proposed change|code change|self.?mod|fix)\b/.test(t)
+    || /\b(proposal|proposed change|code change|self.?mod|fix)\b[\s\S]{0,80}\b(for|from|about|based on)\b/.test(t);
+  if (!createsProposal) return false;
+  const startsAsApproval = /^\s*(approve|approved|approval|apply|accept|reject|decline|discard|cancel)\b/.test(t);
+  return !startsAsApproval;
+}
+
+function sha256File(filePath) {
+  return crypto.createHash('sha256').update(fs.readFileSync(filePath)).digest('hex');
+}
+
+function copySnapshotFile(repoRoot, snapshotDir, rel, files) {
+  const src = path.join(repoRoot, rel);
+  if (!fs.existsSync(src) || !fs.statSync(src).isFile()) return;
+  const dst = path.join(snapshotDir, rel);
+  fs.mkdirSync(path.dirname(dst), { recursive: true });
+  fs.copyFileSync(src, dst);
+  files.push({
+    path: rel.replace(/\\/g, '/'),
+    bytes: fs.statSync(dst).size,
+    sha256: sha256File(dst)
+  });
+}
+
+function createSelfSnapshot(userText = '') {
+  const repoRoot = path.resolve(process.cwd(), '..');
+  const stamp = new Date().toISOString()
+    .replace(/[-:]/g, '')
+    .replace(/\..+$/, '')
+    .replace('T', '_');
+  const snapshotDir = path.join(repoRoot, 'ava-integration', 'backup', 'snapshots', `AVA_${stamp}`);
+  fs.mkdirSync(snapshotDir, { recursive: true });
+
+  const snapshotFiles = [
+    'ava-integration/ava_voice_config.json',
+    'ava-integration/ava_local_voice.py',
+    'ava-integration/start_local_voice.bat',
+    'AGENTS.md',
+    'README.md',
+    'ava-integration/memory/skills/INDEX.md',
+    'ava-integration/memory/skills/create-self-backup-snapshot.md',
+    'ava-server/src/routes/api.js',
+    'ava-server/src/routes/learning.js',
+    'ava-server/src/services/agentLoop.js',
+    'ava-server/src/services/selfImprove.js',
+    'ava-server/src/services/selfRestart.js',
+    'ava-server/src/services/moltbook.js',
+    'ava-server/src/services/moltbookScheduler.js',
+    'ava-server/scripts/restart-server-after-delay.cjs',
+    'ava-client/src/MinimalAVA.jsx',
+    'ava-client/src/hooks/useVoice.js',
+    'ava-client/src/hooks/useRealtimeVoice.js',
+    'ava-client/src/wakeword.js'
+  ];
+  const files = [];
+  for (const rel of snapshotFiles) copySnapshotFile(repoRoot, snapshotDir, rel, files);
+
+  let voiceConfig = null;
+  try {
+    voiceConfig = JSON.parse(fs.readFileSync(path.join(repoRoot, 'ava-integration', 'ava_voice_config.json'), 'utf8'));
+  } catch {}
+
+  const manifest = {
+    createdAt: new Date().toISOString(),
+    request: String(userText || '').slice(0, 500),
+    repoRoot,
+    snapshotDir,
+    workingVoice: {
+      runner: 'ava-integration/ava_local_voice.py',
+      inputDevice: voiceConfig?.audio?.input_device ?? null,
+      inputDeviceName: voiceConfig?.audio?.input_device_name ?? null,
+      inputBackend: voiceConfig?.audio?.input_backend ?? null,
+      inputSampleRate: voiceConfig?.audio?.input_sample_rate ?? null,
+      note: 'Verified working state: TONOR TC777 on MME device 2 at 44100 Hz. Do not switch to TONOR WASAPI device 17 on this setup.'
+    },
+    files
+  };
+  fs.writeFileSync(path.join(snapshotDir, 'manifest.json'), JSON.stringify(manifest, null, 2), 'utf8');
+
+  const indexPath = path.join(repoRoot, 'ava-integration', 'backup', 'snapshot-index.json');
+  let index = [];
+  try {
+    const parsed = JSON.parse(fs.readFileSync(indexPath, 'utf8'));
+    if (Array.isArray(parsed)) index = parsed;
+  } catch {}
+  index.push({
+    createdAt: manifest.createdAt,
+    snapshotDir,
+    fileCount: files.length,
+    workingVoice: manifest.workingVoice
+  });
+  fs.mkdirSync(path.dirname(indexPath), { recursive: true });
+  fs.writeFileSync(indexPath, JSON.stringify(index.slice(-100), null, 2), 'utf8');
+  return manifest;
+}
+
 const router = express.Router();
 
 // Realtime compatibility: route text/messages to Agent Loop with memory/tools
+// Spoken approval/rejection/listing of AVA's proposed self-modifications. Returns a reply
+// string when the utterance is a self-mod intent, otherwise null (so /respond continues).
+// All actions go through the same worker store the UI panel reads, so voice + UI stay in sync.
+async function handleSelfModVoice(userText) {
+  const t = String(userText || '').toLowerCase();
+  const mentionsMod = /\b(change|changes|modification|modifications|code (change|edit|update|fix|fixes)|proposal|proposals|self.?mod|improvement|improvements)\b/.test(t);
+  const idMatch = userText.match(/\b([0-9a-f]{6,8})\b/);
+  const wantsCreateProposal = /\b(make|create|draft|generate|queue|run|do)\b[\s\S]{0,60}\b(proposal|proposed change|code change|fix|self.?mod|improvement)\b/.test(t)
+    || /\b(proposal|proposed change|code change|fix|self.?mod|improvement)\b[\s\S]{0,60}\b(for|from|about|based on)\b/.test(t);
+  const wantsList = (/\b(what|which|any|list|show|pending|outstanding|waiting|review)\b/.test(t) && mentionsMod)
+    || /\b(pending|proposed)\s+(change|changes|modification|modifications|code|fix|fixes)\b/.test(t)
+    || /\banything (to|i need to|that needs) (approve|review|look at)\b/.test(t);
+  const approvesDisplayedProposal = /\b(approve|approved|approval|apply|accept|go ahead|confirm|greenlight|green light)\b[\s\S]{0,40}\b(proposal|change|modification|code change|fix)\b/.test(t)
+    || /\b(proposal|change|modification|code change|fix)\b[\s\S]{0,40}\b(approved|accepted|confirmed)\b/.test(t);
+  const wantsApprove = /\b(approve|approved|approval|apply|accept|go ahead|confirm|greenlight|green light)\b/.test(t);
+  const wantsReject = /\b(reject|decline|discard|cancel|don'?t apply|do not apply|throw (it|that) out)\b/.test(t);
+  // UNDO/REVERT is distinct from reject: reject drops a still-PENDING proposal; undo reverses a
+  // change that was ALREADY APPLIED (restores the file to its pre-change state).
+  const wantsUndo = /\b(undo|revert|roll ?back|reverse|put (it|that) back|take (it|that) back|restore (it|that|the change))\b/.test(t);
+  const hasObject = mentionsMod || !!idMatch || /\b(it|that|this one|the change|all of them|all|them)\b/.test(t);
+  // Unambiguous verbs that need no object — a bare "I approve" / "approved" / "apply it" / "reject".
+  const clearApprove = /\bapprove(d|al)?\b/.test(t)
+    || /\bapply (it|that|this|the (change|proposal|patch|fix|edit))\b/.test(t)
+    || /\bgo ahead and apply\b/.test(t) || /\bgreenlight\b/.test(t);
+  const clearReject = /\breject(ed)?\b/.test(t) || /\b(decline|discard) (it|that|the (change|proposal))\b/.test(t);
+  // A bare affirmation — only treated as approval when exactly one change is pending.
+  const bareAffirm = /\b(yes|yep|yeah|do it|proceed|sounds good|please do|go for it)\b/.test(t);
+
+  if (wantsCreateProposal && !wantsApprove && !wantsReject && !wantsUndo) return null;
+  const clearIntent = clearApprove || clearReject || ((wantsApprove || wantsReject) && hasObject);
+  if (!wantsList && !clearIntent && !bareAffirm && !wantsUndo) return null;
+
+  let lp;
+  try { lp = await pythonWorker.selfMod({ action: 'list_pending' }); } catch { return null; }
+  const raw = (lp && (lp.pending || (lp.result && lp.result.pending))) || [];
+  const pending = (Array.isArray(raw) ? raw : []).filter(m => (m.status || 'pending') === 'pending');
+  const base = (f) => String(f || '').split(/[\\/]/).pop();
+
+  // Bare "yes/do it" with no explicit verb: only act when exactly one change is pending; otherwise
+  // let the normal brain answer (so a stray "yes" doesn't approve something).
+  if (!clearIntent && bareAffirm && pending.length !== 1) return null;
+
+  // UNDO / REVERT an already-applied change — the thing reject can't do.
+  if (wantsUndo) {
+    let all = [];
+    try { const la = await pythonWorker.selfMod({ action: 'list_all' }); all = (la && (la.all || (la.result && la.result.all))) || []; } catch {}
+    const applied = all.filter(m => String(m.status || '') === 'applied');
+    let undoId = null;
+    if (idMatch) { const hit = all.find(m => m.id === idMatch[1] || m.id.startsWith(idMatch[1])); if (hit && hit.status === 'applied') undoId = hit.id; }
+    if (!undoId && applied.length) {
+      undoId = applied.slice().sort((a, b) => new Date(b.applied_at || b.created || 0) - new Date(a.applied_at || a.created || 0))[0].id;
+    }
+    if (undoId) {
+      let r; try { r = await pythonWorker.selfMod({ action: 'undo', modification_id: undoId }); } catch (e) { r = { status: 'error', message: e.message }; }
+      r = (r && (r.result || r)) || {};
+      if (r.status === 'success') {
+        const restart = selfRestart.scheduleServerRestart({ reason: `voice undo ${undoId}` });
+        const restartText = restart.scheduled
+          ? ' I am refreshing my server so the revert loads; the voice runner stays up.'
+          : ' Restart me when you are ready and the revert takes effect.';
+        return `Okay — I undid that change (${base(r.file) || ('id ' + undoId)}) and put the file back the way it was before I applied it.${restartText}`;
+      }
+      if (r.status === 'denied') return `I can't undo that one — ${r.message}`;
+      return `I wasn't able to undo that — ${r.message || 'unknown error'}.`;
+    }
+    // Nothing applied to revert. If they really mean "don't apply" a pending one, reject it.
+    if (pending.length) {
+      const toReject = (pending.length === 1)
+        ? [pending[0].id]
+        : (idMatch ? pending.filter(m => m.id === idMatch[1] || m.id.startsWith(idMatch[1])).map(m => m.id) : []);
+      if (toReject.length) {
+        for (const id of toReject) { try { await pythonWorker.selfMod({ action: 'reject', modification_id: id }); } catch {} }
+        return `Nothing's been applied yet, so there was nothing to revert — but I dropped ${toReject.length} pending change${toReject.length > 1 ? 's' : ''} so ${toReject.length > 1 ? 'they' : 'it'} won't be applied.`;
+      }
+      return `Nothing's been applied, so there's nothing to undo. You do have ${pending.length} change${pending.length > 1 ? 's' : ''} pending — say "reject change ${pending[0].id}" to drop ${pending.length > 1 ? 'them' : 'it'}.`;
+    }
+    return "There's nothing applied to undo right now — nothing's been changed that I'd need to put back.";
+  }
+
+  // LIST
+  if (wantsList && !clearIntent) {
+    if (!pending.length) return "You have no proposed code changes waiting right now. I queue one only when I spot something worth improving, and I'll always ask before applying it.";
+    const reviewText = (m) => {
+      const recommendation = m.review_recommendation || m.reviewRecommendation || m.metadata?.reviewRecommendation;
+      const why = m.review_reason || m.reviewReason || m.metadata?.reviewReason;
+      return recommendation ? ` Reviewer recommendation: ${recommendation}${why ? `, ${why}` : ''}` : '';
+    };
+    const modelText = (m) => {
+      const model = m.decision_model || m.decisionModel || m.metadata?.decisionModel;
+      return model ? ` Proposal model: ${model}.` : '';
+    };
+    const lines = pending.map((m, i) => `${i + 1}. ${base(m.file)}, id ${m.id} — ${m.reason}`);
+    const reviewedLines = lines.map((line, i) => `${line}.${modelText(pending[i])}${reviewText(pending[i])}`);
+    return `You have ${pending.length} change${pending.length > 1 ? 's' : ''} waiting for your approval. ${reviewedLines.join('. ')}. You can say "approve change ${pending[0].id}" or "reject it", or use the panel in the UI.`;
+  }
+
+  // Nothing pending — look up the REAL status of the change being referenced before answering,
+  // so we never wrongly say "nothing waiting" for something that was actually applied/rejected.
+  if (!pending.length) {
+    let all = [];
+    try { const la = await pythonWorker.selfMod({ action: 'list_all' }); all = (la && (la.all || (la.result && la.result.all))) || []; } catch {}
+    let ref = idMatch ? all.find(m => m.id === idMatch[1] || m.id.startsWith(idMatch[1])) : null;
+    if (!ref) ref = all.filter(m => String(m.status || '') !== 'pending').sort((a, b) => new Date(b.created || 0) - new Date(a.created || 0))[0];
+    if (ref) {
+      const fn = base(ref.file);
+      if (ref.status === 'applied') return `That change — ${fn}, id ${ref.id} — is already applied; I backed up the original when it went in. Restart me when you're ready and it takes effect. Nothing else is waiting.`;
+      if (ref.status === 'rejected') return `That change (${fn}, id ${ref.id}) was rejected earlier, so nothing was applied — and there's nothing waiting now.`;
+      if (ref.status === 'failed') return `That change (${fn}, id ${ref.id}) failed when it was applied. Want me to retry it?`;
+    }
+    return "There aren't any changes waiting for approval right now.";
+  }
+
+  // Pick targets
+  let targets = [];
+  if (/\ball\b/.test(t)) targets = pending.map(m => m.id);
+  else if (idMatch) { const hit = pending.find(m => m.id === idMatch[1] || m.id.startsWith(idMatch[1])); if (hit) targets = [hit.id]; }
+  if (!targets.length) {
+    const numMatch = t.match(/\b(?:number|change|#)\s*(\d{1,2})\b/) || t.match(/\b(\d{1,2})\b/);
+    if (numMatch) { const idx = parseInt(numMatch[1], 10) - 1; if (pending[idx]) targets = [pending[idx].id]; }
+  }
+  if (!targets.length) {
+    if (pending.length === 1) targets = [pending[0].id];
+    else if (approvesDisplayedProposal || clearApprove || clearReject) {
+      const newest = pending.slice().sort((a, b) => new Date(b.created || 0) - new Date(a.created || 0))[0];
+      targets = [newest.id];
+    }
+    else if (/\b(it|that|this one|the change|latest|last one|newest|just (queued|proposed))\b/.test(t)) {
+      // "approve it" right after a heads-up → resolve to the most recently queued proposal.
+      const newest = pending.slice().sort((a, b) => new Date(b.created || 0) - new Date(a.created || 0))[0];
+      targets = [newest.id];
+    } else { const verb = wantsReject && !wantsApprove ? 'reject' : 'approve'; return `You have ${pending.length} changes pending. Which one — say the id, like "${verb} change ${pending[0].id}", or "${verb} all".`; }
+  }
+
+  const action = (clearReject || (wantsReject && !wantsApprove)) ? 'reject' : 'approve';
+  const results = [];
+  for (const id of targets) {
+    try { const r = await pythonWorker.selfMod({ action, modification_id: id }); results.push({ id, r: (r && (r.result || r)) || {} }); }
+    catch (e) { results.push({ id, r: { status: 'error', message: e.message } }); }
+  }
+  if (action === 'approve') {
+    const ok = results.filter(x => x.r.status === 'success').map(x => x.id);
+    const denied = results.filter(x => x.r.status === 'denied');
+    const failed = results.filter(x => x.r.status !== 'success' && x.r.status !== 'denied');
+    if (!ok.length && denied.length) return `I couldn't apply ${denied.map(x => x.id).join(', ')} — ${denied[0].r.message}`;
+    if (!ok.length) return `I wasn't able to apply that — ${(results[0] && results[0].r.message) || 'unknown error'}. It's still in the queue for you.`;
+    const tail = failed.length ? ` ${failed.length} couldn't apply and ${failed.length > 1 ? 'are' : 'is'} still waiting in the queue.` : '';
+    const restart = selfRestart.scheduleServerRestart({ reason: `voice approved proposal ${ok.join(', ')}` });
+    const restartText = restart.scheduled
+      ? ' I am refreshing my server now so the change can load; the voice runner stays up.'
+      : ' Restart me when you are ready and the change will take effect.';
+    return `Done — I applied ${ok.length} change${ok.length > 1 ? 's' : ''} (${ok.join(', ')}) and backed up the original first.${tail}${restartText}`;
+  }
+  const ok = results.filter(x => x.r.status === 'success').map(x => x.id);
+  return `Okay — rejected ${ok.length} change${ok.length > 1 ? 's' : ''} (${ok.join(', ')}). Nothing was applied.`;
+}
+
 router.post('/respond', async (req, res) => {
   try {
     const { text, messages, sessionId = 'voice-default', freshSession = false,
             run_tools, memory_filter } = req.body || {};
-    const userText = (typeof text === 'string' && text.trim())
+    let userText = (typeof text === 'string' && text.trim())
       ? text.trim()
       : Array.isArray(messages) && messages.length > 0
         ? String(messages[messages.length - 1]?.content || messages[messages.length - 1]?.text || '').trim()
@@ -441,7 +896,69 @@ router.post('/respond', async (req, res) => {
       return res.status(400).json({ ok: false, error: 'Missing text/messages' });
     }
 
+    if (markDuplicateTurn('/respond', sessionId, userText)) {
+      logger.info('[respond] duplicate turn suppressed', { sessionId, text: userText.slice(0, 80) });
+      return res.json({ ok: true, duplicate_suppressed: true, output_text: '', agent: {
+        id: 'duplicate-' + Date.now(),
+        status: 'duplicate_suppressed',
+        steps: 0,
+        result: '',
+        errors: [],
+      }});
+    }
+
     try { conversationLogger.logUserMessage(userText, { sessionId, endpoint: '/respond', freshSession }); } catch {}
+
+    // Repair STT mishears of "Moltbook" before any intent routing / agent reasoning (original
+    // text is already logged above).
+    userText = normalizeMoltbookMentions(userText);
+
+    if (isSelfSnapshotRequest(userText)) {
+      const snapshot = createSelfSnapshot(userText);
+      const finalText = shapeSpokenReply(
+        `Snapshot saved. I copied ${snapshot.files.length} key files and wrote the manifest at ${snapshot.snapshotDir}.`,
+        req.body || {}
+      );
+      try {
+        conversationLogger.logAssistantMessage(finalText, {
+          sessionId,
+          responseType: 'self-snapshot',
+          snapshotDir: snapshot.snapshotDir,
+          fileCount: snapshot.files.length
+        });
+      } catch {}
+      return res.json({ ok: true, output_text: String(finalText || '').slice(0, 20000), snapshot, agent: {
+        id: 'self-snapshot-' + Date.now(),
+        status: 'success',
+        steps: 0,
+        result: finalText,
+        errors: []
+      }});
+    }
+
+    if (isManualProposalRequest(userText)) {
+      const result = await selfImprove.runScan({
+        reason: `manual voice proposal request: ${userText.slice(0, 240)}`
+      });
+      const base = result && result.proposed
+        ? `I queued proposal ${result.id} for ${String(result.file || '').split(/[\\/]/).pop()}. Reviewer recommendation: ${result.reviewRecommendation || 'review'}. ${result.reviewReason || ''}`
+        : `I tried to create a proposal, but ${result?.note || result?.error || 'nothing concrete enough was staged yet'}.`;
+      const finalText = shapeSpokenReply(base, req.body || {});
+      try {
+        conversationLogger.logAssistantMessage(finalText, {
+          sessionId,
+          responseType: 'manual-proposal',
+          proposal: result
+        });
+      } catch {}
+      return res.json({ ok: true, output_text: String(finalText || '').slice(0, 20000), proposal: result, agent: {
+        id: 'manual-proposal-' + Date.now(),
+        status: result?.ok === false ? 'failed' : 'success',
+        steps: 1,
+        result: finalText,
+        errors: result?.error ? [result.error] : []
+      }});
+    }
 
     // "Dreaming" reviewer: every N turns, kick off a non-blocking background pass that
     // distills durable facts from recent conversation into curated memory. Fire-and-forget
@@ -488,6 +1005,19 @@ router.post('/respond', async (req, res) => {
       }});
     }
 
+    // SELF-MOD APPROVAL PATH: spoken listing / approval / rejection of AVA's proposed code
+    // changes. Goes through the same worker store the UI panel uses, so voice + UI agree.
+    try {
+      const smReply = await handleSelfModVoice(userText);
+      if (smReply) {
+        const finalText = shapeSpokenReply(smReply, req.body || {});
+        try { conversationLogger.logAssistantMessage(finalText, { sessionId, responseType: 'self-mod-approval' }); } catch {}
+        return res.json({ ok: true, output_text: String(finalText || '').slice(0, 20000), agent: {
+          id: 'selfmod-' + Date.now(), status: 'success', steps: 0, result: finalText, errors: []
+        }});
+      }
+    } catch (e) { logger.warn('[respond] self-mod voice path error', { error: e.message }); }
+
     // CAMERA-SEE PATH: "tell me what you see / look through the camera / start the camera
     // and describe" — run camera_ops `see` directly (turns on + captures + describes) so she
     // never asks to confirm or picks the wrong action.
@@ -513,6 +1043,69 @@ router.post('/respond', async (req, res) => {
       }});
     }
 
+    // BROWSE PATH: "navigate to / go to / pull up / take me to / visit <site>" or
+    // "open <site> website" -> open the user's NORMAL browser so they can sign in (the
+    // Selenium automation browser is flagged "not secure" by Google). Folders/files are
+    // handled by the open-file path below, so we only catch web-ish targets here. Explicit
+    // automation ("fill the form", "click", "log in and do X") still goes to the agent.
+    {
+      const navText = String(userText || '');
+      const nm = navText.match(/\b(?:navigate to|go to|pull up|take me to|bring up|visit|open up)\s+(.+)$/i)
+        || navText.match(/\bopen\s+(.+?)\s+(?:website|web ?site|web ?page|online|in (?:the |my |a )?browser)\b/i);
+      let target = nm ? nm[1].trim().replace(/[.?!,]+$/, '') : '';
+      const isFolderish = /\b(folder|directory|downloads?|documents?|desktop|pictures?|photos?|music|videos?|file|files)\b/i.test(target);
+      const isAutomation = /\b(fill|click|type|submit|log ?in to .+ and|scrape|download .+ from|automate)\b/i.test(navText);
+      if (target && !isFolderish && !isAutomation) {
+        let url;
+        if (/^https?:\/\//i.test(target)) url = target;
+        else if (/^[\w-]+(\.[\w-]+)+(\/\S*)?$/.test(target)) url = 'https://' + target;
+        else url = 'https://www.google.com/search?q=' + encodeURIComponent(target);
+        let finalText = '';
+        try {
+          await toolsService.executeTool('open_item', { target: url, confirm: true }, false, { source: 'voice', bypassIdempotency: true });
+          finalText = `I opened ${target} in your regular browser so you can sign in there.`;
+        } catch (e) {
+          finalText = `I tried to open ${target} in your browser but hit an error.`;
+        }
+        finalText = shapeSpokenReply(finalText, req.body || {});
+        try { conversationLogger.logAssistantMessage(finalText, { sessionId, responseType: 'browse' }); } catch {}
+        return res.json({ ok: true, output_text: String(finalText || '').slice(0, 20000), agent: {
+          id: 'browse-' + Date.now(), status: 'success', steps: 1, result: finalText, errors: []
+        }});
+      }
+    }
+
+    // DOWNLOAD-ATTACHMENT PATH: "download / save / grab my resume from my gmail/email" —
+    // find the attachment and save it to Downloads deterministically (the agent tends to
+    // just "find" it and stop instead of completing the download).
+    {
+      const dlText = String(userText || '');
+      const isDl = /\b(download|save|grab|pull|get)\b/i.test(dlText)
+        && /\b(gmail|e-?mail|inbox|attachment)\b/i.test(dlText);
+      if (isDl) {
+        const fnMatch = dlText.match(/\b(?:download|save|grab|pull|get)\s+(?:my |the |a |an )?(.+?)\s+(?:attachment\s+)?(?:from|out of|in)\b/i)
+          || dlText.match(/\b(?:download|save|grab|pull|get)\s+(?:my |the |a |an )?(.+?)\s+attachment\b/i);
+        let term = (fnMatch ? fnMatch[1] : '').trim().replace(/[.?!,]+$/, '');
+        term = term.replace(/\b(file|document|doc|attachment)\b\s*$/i, '').trim();
+        if (term) {
+          let finalText = '';
+          try {
+            const tr = await toolsService.executeTool('comm_ops',
+              { action: 'download_attachment', filename: term, query: term, confirm: true, confirmed: true },
+              false, { source: 'voice', bypassIdempotency: true });
+            const tres = (tr && (tr.result || tr)) || {};
+            if (tres.status === 'ok' && tres.path) finalText = `I downloaded ${tres.filename} to your Downloads folder.`;
+            else finalText = tres.message || `I couldn't find a "${term}" attachment in your email.`;
+          } catch (e) { finalText = `I tried to download "${term}" from your email but hit an error.`; }
+          finalText = shapeSpokenReply(finalText, req.body || {});
+          try { conversationLogger.logAssistantMessage(finalText, { sessionId, responseType: 'download-attachment' }); } catch {}
+          return res.json({ ok: true, output_text: String(finalText || '').slice(0, 20000), agent: {
+            id: 'dl-attach-' + Date.now(), status: 'success', steps: 1, result: finalText, errors: []
+          }});
+        }
+      }
+    }
+
     // DIAGNOSE PATH: "diagnose / check / is your <X> tool working" — run self_awareness's
     // diagnose_tool DIRECTLY instead of letting the model call the tool itself (which it tends
     // to do, e.g. comm_ops to "check email"). Guidance alone didn't fix this reliably.
@@ -521,22 +1114,58 @@ router.post('/respond', async (req, res) => {
       if (diag) {
         logger.info('[respond] Diagnose path', { tool: diag.tool, label: diag.label });
         let finalText = '';
+        let diagnosisPayload = null;
         try {
           const r = await toolsService.executeTool('self_awareness',
             { action: 'diagnose_tool', tool: diag.tool || 'all', tool_name: diag.tool || 'all', name: diag.tool || 'all' },
             false, { source: 'voice', bypassIdempotency: true });
           const dres = (r && (r.result || r)) || {};
-          const inner = dres.result || dres;
-          const msg = inner.summary || inner.capability_summary || inner.likely_cause || inner.message
+          const inner = dres.diagnosis || (dres.result && dres.result.diagnosis) || dres.result || dres;
+          diagnosisPayload = inner && typeof inner === 'object' ? inner : null;
+          const details = diagnosisPayload ? [
+            diagnosisPayload.likely_cause,
+            Array.isArray(diagnosisPayload.recent_log_errors) && diagnosisPayload.recent_log_errors.length
+              ? `Recent errors: ${diagnosisPayload.recent_log_errors.slice(0, 3).join('; ')}`
+              : '',
+            Array.isArray(diagnosisPayload.suggested_fixes) && diagnosisPayload.suggested_fixes.length
+              ? `Suggested fix: ${diagnosisPayload.suggested_fixes.slice(0, 2).join('; ')}`
+              : '',
+          ].filter(Boolean).join(' ') : '';
+          const msg = inner.summary || inner.capability_summary || details || inner.likely_cause || inner.message
             || (typeof inner === 'string' ? inner : '');
           finalText = `I ran a diagnostic on the ${diag.label} tool. ${String(msg || '').trim()}`.trim();
         } catch (e) { finalText = ''; }
         if (!finalText || finalText.length < 12) {
           finalText = `I ran a diagnostic on the ${diag.label} tool — it looks registered and reachable; I didn't find an obvious problem.`;
         }
+        let proposal = null;
+        try {
+          proposal = await selfImprove.runScan({
+            reason: `diagnosis completed for ${diag.label} tool (${diag.tool || 'all'}): ${finalText.slice(0, 900)}`,
+            diag: { issues: [{
+              category: `tool_diagnosis_${diag.tool || diag.label}`,
+              description: finalText,
+              context: JSON.stringify({
+                requested_by: 'user_self_diagnosis',
+                tool: diag.tool || 'all',
+                status: diagnosisPayload && diagnosisPayload.status,
+                source_file: diagnosisPayload && diagnosisPayload.source_file,
+                likely_cause: diagnosisPayload && diagnosisPayload.likely_cause,
+                suggested_fixes: diagnosisPayload && diagnosisPayload.suggested_fixes,
+                recent_log_errors: diagnosisPayload && diagnosisPayload.recent_log_errors,
+              }).slice(0, 1800)
+            }] }
+          });
+        } catch (e) {
+          proposal = { ok: false, error: e.message };
+        }
+        const proposalText = proposal && proposal.proposed
+          ? ` I also queued proposal ${proposal.id} for your review. Reviewer recommendation: ${proposal.reviewRecommendation || 'review'}.`
+          : ` I also tried to create a proposal from that diagnosis, but ${proposal?.note || proposal?.error || 'nothing concrete enough was staged'}.`;
+        finalText = `${finalText}${proposalText}`;
         finalText = shapeSpokenReply(finalText, req.body || {});
-        try { conversationLogger.logAssistantMessage(finalText, { sessionId, responseType: 'diagnose' }); } catch {}
-        return res.json({ ok: true, output_text: String(finalText || '').slice(0, 20000), agent: {
+        try { conversationLogger.logAssistantMessage(finalText, { sessionId, responseType: 'diagnose', proposal }); } catch {}
+        return res.json({ ok: true, output_text: String(finalText || '').slice(0, 20000), proposal, agent: {
           id: 'diagnose-' + Date.now(), status: 'success', steps: 1, result: finalText, errors: []
         }});
       }
@@ -679,7 +1308,7 @@ router.post('/respond', async (req, res) => {
     // results. Only ask the user to narrow down if the search genuinely finds nothing.
     // Recall intent wins even if a tool keyword is present (e.g. "what did we discuss
     // about the CAMERA" is recall, not "turn on the camera").
-    if (looksLikeRecall(userText)) {
+    if (looksLikeRecall(userText) || looksLikeFollowupStatus(userText)) {
       logger.info('[respond] Recall path (history + memory_search)', { text: userText.slice(0, 60) });
       // 1) Keyword matches across memory + all logs. Call via executeTool so the sandbox
       //    LEDGER records memory_search (training checks read the ledger), and so this fires
@@ -708,7 +1337,7 @@ router.post('/respond', async (req, res) => {
       let finalText = '';
       if (ctx.trim()) {
         try {
-          const sys = `${personaSvc.buildPersonaBlock()}\n\nThe user is asking you to recall or summarize past conversations. You DO have your conversation history below — each line is tagged with its date, time, and who said it (You = the user, AVA = you). Answer their question using ONLY this context: summarize what was said, discussed, or decided, and cite WHEN (e.g. "on June 23" or "yesterday around 7pm") where it helps. Be as detailed as the question warrants — it's fine to give a thorough multi-point summary. If the context genuinely does not cover the specific topic they asked about, say so plainly and ask for a detail. Do NOT invent anything beyond the context. Spoken aloud: natural sentences, no markdown or bullet symbols.`;
+          const sys = `${personaSvc.buildPersonaBlock()}\n\nThe user is asking you to recall or summarize past conversations. You DO have your conversation history below — each line is tagged with its date, time, and who said it (You = the user, AVA = you). Answer their question using ONLY this context: summarize what was said, discussed, or decided, and cite WHEN (e.g. "on June 23" or "yesterday around 7pm") where it helps. Be as detailed as the question warrants — it's fine to give a thorough multi-point summary. If the user is asking for a SPECIFIC detail they were given earlier — a file name, a full path, a number, an address, a value — scan the transcript line by line and quote it back EXACTLY; such details are almost always present in the recent turns (e.g. a file path you stated when you saved something), so do NOT say you can't find it without checking carefully first. If the context genuinely does not cover the specific topic they asked about, say so plainly and ask for a detail. Do NOT invent anything beyond the context. This answer is spoken aloud AND shown on screen, so write it naturally for the ear, but for the screen you MAY use light Markdown — **bold** a date or key detail, and use a short "- " bullet list when you enumerate several things. Keep it conversational, not a document.`;
           const usr = `User asked: "${userText}"\n\n${ctx}`;
           const r = await llmService.chat([{ role: 'system', content: sys }, { role: 'user', content: usr }], { temperature: 0.3, max_tokens: 1400 });
           finalText = (r.text || r.content || '').trim();
@@ -719,10 +1348,11 @@ router.post('/respond', async (req, res) => {
       }
       // Use a generous budget for recall so detailed summaries aren't clamped to a sentence.
       const _recallBody = { ...(req.body || {}), spoken_reply_budget: { max_sentences: 80, max_words: 1400, prefer_brief: false } };
-      finalText = shapeSpokenReply(finalText, _recallBody);
-      try { conversationLogger.logAssistantMessage(finalText, { sessionId, responseType: 'recall' }); } catch {}
-      return res.json({ ok: true, output_text: String(finalText || '').slice(0, 20000), agent: {
-        id: 'recall-' + Date.now(), status: 'success', steps: 1, result: finalText, errors: []
+      const _recallDisplay = String(finalText || '').trim();
+      const _recallSpoken = shapeSpokenReply(_recallDisplay, _recallBody);
+      try { conversationLogger.logAssistantMessage(_recallDisplay, { sessionId, responseType: 'recall' }); } catch {}
+      return res.json({ ok: true, output_text: String(_recallSpoken || '').slice(0, 20000), display_text: _recallDisplay.slice(0, 20000), agent: {
+        id: 'recall-' + Date.now(), status: 'success', steps: 1, result: _recallDisplay, errors: []
       }});
     }
 
@@ -739,7 +1369,7 @@ router.post('/respond', async (req, res) => {
         ? ` Keep replies under ${spokenReplyBudget.maxWords} words and ${spokenReplyBudget.maxSentences} sentences unless safety or accuracy requires more.`
         : '';
       const _memBlock = curatedMemory.buildMemoryBlock();
-      const sysPrompt = `${personaSvc.buildPersonaBlock()}${_memBlock ? '\n\n' + _memBlock : ''}\n\nYour responses are spoken aloud, so keep them natural and conversational. Prefer short, direct answers — a sentence or two is usually enough. Avoid unnecessary elaboration, but give complete answers when the question calls for it.${budgetPrompt}${context ? '\n\nContext: ' + context : ''}`;
+      const sysPrompt = `${personaSvc.buildPersonaBlockText()}${_memBlock ? '\n\n' + _memBlock : ''}\n\nThis reply is BOTH spoken aloud AND shown on screen. Keep it natural and conversational — short enough to say out loud (a sentence or two is usually enough). For the screen you may use LIGHT Markdown: a **bold** key term, or a short "- " bullet list when you name several things — but no big headings or tables, and never sound like a written report. Give a complete answer when the question calls for it.${budgetPrompt}${context ? '\n\nContext: ' + context : ''}`;
       // Capability awareness: list the real tools so AVA can answer "what can you
       // do?" accurately even on this no-execution conversational path. (Previously
       // this prompt omitted tools, so she'd say she had none.)
@@ -797,22 +1427,25 @@ router.post('/respond', async (req, res) => {
           console.log(`[respond] Blocked step status (conv): ${finalText.slice(0, 60)}...`);
           finalText = '';
         }
-        finalText = shapeSpokenReply(finalText, req.body || {});
+        // Split: DISPLAY keeps light Markdown for the UI mirror; SPOKEN is stripped + number-
+        // normalized for TTS. The UI shows the formatted version; the runner speaks the plain one.
+        const _convDisplay = String(finalText || '').trim();
+        const _convSpoken = shapeSpokenReply(_convDisplay, req.body || {});
 
-        try { conversationLogger.logAssistantMessage(finalText, { sessionId, responseType: 'conversational' }); } catch {}
+        try { conversationLogger.logAssistantMessage(_convDisplay, { sessionId, responseType: 'conversational' }); } catch {}
 
-        return res.json({ ok: true, output_text: String(finalText || '').slice(0, 20000), agent: {
+        return res.json({ ok: true, output_text: String(_convSpoken || '').slice(0, 20000), display_text: _convDisplay.slice(0, 20000), agent: {
           id: 'conv-' + Date.now(),
           status: 'success',
           steps: 0,
-          result: finalText,
+          result: _convDisplay,
           errors: []
         }});
       }
     }
 
     // TOOL PATH: Full agent loop for tool-enabled requests
-    const loopOptions = {};
+    const loopOptions = { source: 'voice' };  // tag tool events so the live UI mirrors them
     if (memory_filter) loopOptions.memoryFilter = memory_filter;
     // Give the agent loop recent conversation context ONLY when the request refers to
     // something prior ("open it", "yes", "that screenshot"). Injecting history into a
@@ -851,7 +1484,7 @@ router.post('/respond', async (req, res) => {
 - If it did NOT succeed (status is error, blocked, needs_confirm, waiting, or anything other than ok), say honestly that you could NOT do it, and briefly why or what you still need. NEVER claim you did something when the result is not a success.
 - If this was a memory/recall SEARCH: when results were found, summarize what you recall about the topic from them in a natural sentence or two; ONLY if the search returned no relevant matches, say you couldn't find anything about it in your memory and ask the user to add a detail.
 - If this was a self-DIAGNOSIS or capability check: relay your health and, if a plain-language capability summary is present (e.g. a "capability_summary" describing what you can do), tell the user what you can do in natural language. Do NOT refuse or say you "can't provide a list" — you have the information.
-Don't read raw tool names, JSON, or status codes, but you MAY describe your health and what you can do in plain, natural language.`;
+Don't read raw tool names, JSON, or status codes, but you MAY describe your health and what you can do in plain, natural language. This reply is also shown on screen, so when you're naming several items (emails, files, windows, results) you MAY format them as a short "- " Markdown list and **bold** a key value; otherwise keep it to 1-2 natural sentences.`;
         const sumUsr = `User said: "${userText}"\nResult from "${_ground.tool}" (status=${_st}):\n${JSON.stringify(_ground.result).slice(0, 1800)}`;
         const sum = await llmService.chat([{ role: 'system', content: sumSys }, { role: 'user', content: sumUsr }], { temperature: 0.2, max_tokens: 2000 });
         const t = (sum.text || sum.content || '').trim();
@@ -881,11 +1514,13 @@ Don't read raw tool names, JSON, or status codes, but you MAY describe your heal
       finalText = '';
     }
     if (!finalText) finalText = state.final_result || 'Done.';
-    finalText = shapeSpokenReply(finalText, req.body || {});
+    // DISPLAY keeps any light Markdown for the UI mirror; SPOKEN is stripped + number-normalized.
+    const _agentDisplay = String(finalText || '').trim();
+    const _agentSpoken = shapeSpokenReply(_agentDisplay, req.body || {});
 
-    try { conversationLogger.logAssistantMessage(finalText, { sessionId, responseType: 'agent' }); } catch {}
+    try { conversationLogger.logAssistantMessage(_agentDisplay, { sessionId, responseType: 'agent' }); } catch {}
 
-    res.json({ ok: true, output_text: String(finalText || '').slice(0, 20000), agent: {
+    res.json({ ok: true, output_text: String(_agentSpoken || '').slice(0, 20000), display_text: _agentDisplay.slice(0, 20000), agent: {
       id: state.id,
       status: state.status,
       steps: state.step_count,
@@ -1949,7 +2584,7 @@ router.post('/chat', async (req, res) => {
   try {
     // Accept both sessionId and session_id from clients
     const raw = req.body || {};
-    const text = raw.text;
+    let text = raw.text;
     const sessionId = raw.sessionId || raw.session_id || 'default';
     const includeMemory = raw.includeMemory ?? true;
     const storeInMemory = raw.storeInMemory ?? true;
@@ -1959,13 +2594,21 @@ router.post('/chat', async (req, res) => {
       return res.status(400).json({ ok: false, error: 'Text is required' });
     }
 
+    if (markDuplicateTurn('/chat', sessionId, text)) {
+      logger.info('[chat] duplicate turn suppressed', { sessionId, text: text.slice(0, 80) });
+      return res.json({ ok: true, duplicate_suppressed: true, text: '', message: '', sessionId });
+    }
+
     // Log user message
-    const userMessageId = conversationLogger.logUserMessage(text, { 
-      sessionId, 
+    const userMessageId = conversationLogger.logUserMessage(text, {
+      sessionId,
       endpoint: '/chat',
       includeMemory,
-      storeInMemory 
+      storeInMemory
     });
+
+    // Repair STT/typo mishears of "Moltbook" before routing (original is logged above).
+    text = normalizeMoltbookMentions(text);
 
     // DIRECT OPENAI INTEGRATION - No external tool dependencies
     const startTime = Date.now();
@@ -2074,8 +2717,13 @@ router.post('/chat', async (req, res) => {
       });
     }
 
-    // Handle Moltbook queries - hybrid approach: call tools directly for Moltbook actions
-    if (/moltbook|other agents|agent community|what.*(learned|learning)|agent.*(feed|posts|tips)/i.test(lower)) {
+    // Handle Moltbook queries — only when it's an actual Moltbook COMMAND/data request, not just a
+    // passing mention. "what's on moltbook", "check my moltbook feed", "what have you learned on
+    // moltbook" → handled here; "I was thinking about moltbook", "does moltbook matter for this" →
+    // fall through to her normal brain (which has Moltbook context) so she answers in-character.
+    const _mentionsMoltbook = /\bmoltbook\b/i.test(lower);
+    const _moltbookCommand = _mentionsMoltbook && /\b(post|posts|posted|posting|comment|reply|replies|feed|search|find|status|karma|notif\w*|follower|publish|check|browse|open|learn|learned|learning|insight|account|profile|sign\s?in|log\s?in|latest|happening|what'?s on|whats on|my posts?)\b/i.test(lower);
+    if (_moltbookCommand) {
       try {
         let responseText = '';
         const status = await moltbookService.getStatus();
@@ -2173,7 +2821,7 @@ router.post('/chat', async (req, res) => {
     }
 
     // Handle file operation requests
-    if (/list.*file|show.*file|directory.*content|ls|dir\b|files in/i.test(text)) {
+    if (/\b(list|show)\b[\s\S]{0,15}\bfiles?\b|\bdirectory (content|listing)\b|\bls\b|\bdir\b|\bfiles in (this|the|current|that|my)\b/i.test(text)) {
       try {
         const files = fs.readdirSync(process.cwd());
         const fileList = files.map(file => {
@@ -2830,7 +3478,7 @@ router.post('/respond', async (req, res) => {
       return res.status(400).json({ ok: false, error: 'Missing text/messages' });
     }
 
-    const loopOpts = {};
+    const loopOpts = { source: 'voice' };  // tag tool events so the live UI mirrors them
     if (memory_filter) loopOpts.memoryFilter = memory_filter;
     if (run_tools === false) {
       loopOpts.stepLimit = 1;   // No multi-step agent loop for non-tool requests

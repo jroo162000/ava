@@ -31,9 +31,34 @@ class PythonWorker {
     }
 
     try {
-      this.worker = spawn('python', [workerScript], {
+      // Use the project venv python (has the tool deps) instead of bare 'python'
+      // (which on a fresh Windows is the MS Store stub / base interpreter without deps).
+      const venvPy = path.join(integrationDir, '.venv', 'Scripts', 'python.exe');
+      const pythonExe = process.env.AVA_PYTHON || (fs.existsSync(venvPy) ? venvPy : 'python');
+      const cmpUseDir = path.resolve(integrationDir, '..', 'cmp-use');
+      this.worker = spawn(pythonExe, [workerScript], {
         stdio: ['pipe', 'pipe', 'pipe'],
-        cwd: integrationDir
+        cwd: integrationDir,
+        env: {
+          ...process.env,
+          PYTHONPATH: cmpUseDir + path.delimiter + (process.env.PYTHONPATH || ''),
+          CMPUSE_DIR: process.env.CMPUSE_DIR || cmpUseDir,
+          // Make tool binaries (Tesseract OCR, nmap) discoverable to the worker.
+          PATH: (process.env.PATH || '') + path.delimiter +
+                'C:\\Program Files\\Tesseract-OCR' + path.delimiter +
+                'C:\\Program Files (x86)\\Nmap',
+          // Real execution: cmp-use defaults to dry-run + confirm. Without these
+          // every action tool only returns a "dry-run" preview instead of acting.
+          CMPUSE_DRY_RUN: process.env.CMPUSE_DRY_RUN || '0',
+          CMPUSE_CONFIRM: process.env.CMPUSE_CONFIRM || '0',
+          CMPUSE_FORCE: process.env.CMPUSE_FORCE || '1',
+          CMPUSE_ALLOW_SHELL: process.env.CMPUSE_ALLOW_SHELL || '1',
+          CMPUSE_ALLOW_NETWORK: process.env.CMPUSE_ALLOW_NETWORK || '1',
+          // cmp-use Config.network_enabled reads CMPUSE_NETWORK (not *_ALLOW_NETWORK);
+          // without this net_ops returns "network disabled by default".
+          CMPUSE_NETWORK: process.env.CMPUSE_NETWORK || '1',
+          CMPUSE_PATH_WHITELIST: process.env.CMPUSE_PATH_WHITELIST || 'C:\\',
+        },
       });
 
       const rl = readline.createInterface({ input: this.worker.stdout });

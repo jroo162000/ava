@@ -11,6 +11,10 @@ import config from '../utils/config.js';
 import pythonWorker from '../services/pythonWorker.js';
 import autonomyLib from '../services/autonomyPolicy.js';
 import digestQueue from '../services/digestQueue.js';
+import selfImprove from '../services/selfImprove.js';
+import selfRestart from '../services/selfRestart.js';
+import { triggerMoltbookSelfPost, triggerMoltbookEngage, getPendingVerifications, submitMoltbookVerification } from '../services/moltbookScheduler.js';
+import llmService from '../services/llm.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -25,6 +29,46 @@ const ETA_MODEL_PATH = path.join(DATA_DIR, 'eta_model.json');
 const STYLE_PATH = path.join(DATA_DIR, 'style.json');
 
 const router = express.Router();
+
+const CORE_PROPOSAL_FILES = {
+  voice_main: path.resolve(process.cwd(), '..', 'ava-integration', 'ava_local_voice.py'),
+  voice_config: path.resolve(process.cwd(), '..', 'ava-integration', 'ava_voice_config.json'),
+  identity: path.resolve(process.cwd(), '..', 'ava-integration', 'ava_identity.json'),
+  self_awareness: path.resolve(process.cwd(), '..', 'ava-integration', 'ava_self_awareness.py'),
+  self_mod: path.resolve(process.cwd(), '..', 'ava-integration', 'ava_self_modification.py'),
+  worker: path.resolve(process.cwd(), '..', 'ava-integration', 'ava_python_worker.py'),
+  server_main: path.resolve(process.cwd(), 'src', 'server.js'),
+  api_routes: path.resolve(process.cwd(), 'src', 'routes', 'api.js'),
+  agent_loop: path.resolve(process.cwd(), 'src', 'services', 'agentLoop.js'),
+  tools_service: path.resolve(process.cwd(), 'src', 'services', 'tools.js'),
+  llm_service: path.resolve(process.cwd(), 'src', 'services', 'llm.js'),
+};
+
+function resolveProposalFile(fileKey = '') {
+  const raw = String(fileKey || '').trim();
+  if (!raw) return '';
+  if (CORE_PROPOSAL_FILES[raw]) return CORE_PROPOSAL_FILES[raw];
+  if (path.isAbsolute(raw)) return path.resolve(raw);
+  const repoRoot = path.resolve(process.cwd(), '..');
+  const candidates = [
+    path.resolve(process.cwd(), raw),
+    path.resolve(repoRoot, raw),
+    path.resolve(repoRoot, 'ava-integration', raw),
+    path.resolve(repoRoot, 'ava-server', raw),
+    path.resolve(repoRoot, 'cmp-use', 'cmpuse', 'tools', raw),
+  ];
+  return candidates.find(p => fs.existsSync(p)) || path.resolve(repoRoot, raw);
+}
+
+function proposalReviewDiff(original, proposed) {
+  return [
+    'ORIGINAL CONTENT EXCERPT:',
+    String(original || '').slice(0, 2800),
+    '',
+    'PROPOSED CONTENT EXCERPT:',
+    String(proposed || '').slice(0, 2800),
+  ].join('\n');
+}
 
 // Tokenization helpers
 const stopWords = new Set(['the','a','an','and','or','but','if','then','else','for','of','on','in','to','is','are','was','were','be','been','being','i','you','he','she','it','we','they','me','my','your','our','their','this','that','these','those','with','as','at','by','from','about','into','over','after','before','so','not']);
@@ -234,21 +278,201 @@ router.post('/self/learn_correction', async (req, res) => {
 
 router.post('/self_mod', async (req, res) => {
   try {
-    const ALLOWED = ['diagnose','propose_fix','approve','rollback','list_modifications','get_status'];
+    const ALLOWED = ['diagnose','propose_fix','approve','reject','rollback','undo','revert','list_pending','list_all','list_modifications','get_status'];
     const action = req.body?.action;
     if (!action || !ALLOWED.includes(action)) {
       return res.status(400).json({ ok: false, error: `action must be: ${ALLOWED.join(', ')}` });
     }
-    const response = await pythonWorker.selfMod(req.body);
+    let body = req.body;
+    if (action === 'propose_fix') {
+      const target = resolveProposalFile(req.body?.file);
+      const proposedContent = req.body?.content;
+      if (!target || !fs.existsSync(target)) {
+        return res.json({
+          ok: true,
+          status: 'denied',
+          approval_required: true,
+          review_recommendation: 'deny',
+          review_reason: `codex: target file "${req.body?.file || ''}" does not exist, so this proposal cannot be verified or applied safely.`,
+          reviewers: [{
+            reviewer: 'codex',
+            model: 'local-gate',
+            recommendation: 'deny',
+            reason: `Target file "${req.body?.file || ''}" does not exist.`,
+            risks: ['Model-invented file path', 'Applying would create or overwrite the wrong file'],
+          }],
+          message: `Refused: target file "${req.body?.file || ''}" does not exist.`,
+        });
+      }
+      const textContent = typeof proposedContent === 'string' ? proposedContent : '';
+      if (!textContent.trim()) {
+        return res.json({
+          ok: true,
+          status: 'denied',
+          approval_required: true,
+          review_recommendation: 'deny',
+          review_reason: 'codex: proposal did not include replacement file content.',
+          reviewers: [{
+            reviewer: 'codex',
+            model: 'local-gate',
+            recommendation: 'deny',
+            reason: 'Proposal did not include replacement file content.',
+            risks: ['Empty proposal content cannot be reviewed or applied safely'],
+          }],
+          message: 'Refused: proposal did not include replacement file content.',
+        });
+      }
+      const suspiciousPatch = /^\s*(diff --git|---\s+a\/|\+\+\+\s+b\/|ERROR reading\b)/i.test(textContent);
+      if (suspiciousPatch) {
+        return res.json({
+          ok: true,
+          status: 'denied',
+          approval_required: true,
+          review_recommendation: 'deny',
+          review_reason: 'codex: proposal content is a patch/error transcript, but self_mod requires full replacement content for an existing file.',
+          reviewers: [{
+            reviewer: 'codex',
+            model: 'local-gate',
+            recommendation: 'deny',
+            reason: 'Proposal content is a patch/error transcript, not full replacement file content.',
+            risks: ['Would replace source file with a patch transcript', 'Could destroy the target file contents'],
+          }],
+          message: 'Refused: self_mod proposals must provide full replacement content, not a patch transcript.',
+        });
+      }
+      const original = fs.readFileSync(target, 'utf8');
+      const proposalReview = await selfImprove.reviewProposal({
+        file: target,
+        reason: req.body?.reason || 'No reason provided',
+        diff: proposalReviewDiff(original, textContent),
+      });
+      body = {
+        ...req.body,
+        file: target,
+        metadata: {
+          ...(req.body?.metadata || {}),
+          generatorReason: req.body?.reason || 'manual self_mod proposal',
+          proposedAt: new Date().toISOString(),
+          reviewRecommendation: proposalReview.recommendation,
+          reviewReason: proposalReview.reason,
+          reviewers: proposalReview.reviewers,
+        },
+      };
+    }
+
+    const response = await pythonWorker.selfMod(body);
     if (response.ok) {
       const result = response.result || {};
-      if (['propose_fix','approve','rollback'].includes(action)) {
+      if (['propose_fix','approve','rollback','undo','revert'].includes(action)) {
         result.safety_note = '⚠️ Code modification requires user approval.';
+      }
+      if (action === 'approve' && result.status === 'success') {
+        result.restart = selfRestart.scheduleServerRestart({
+          reason: `UI approved proposal ${result.modification_id || req.body?.modification_id || ''}`.trim()
+        });
+        if (result.restart?.scheduled) {
+          result.message = `${result.message || 'Modification applied.'} Server refresh scheduled so the change can load.`;
+        }
+      }
+      // Undoing an applied change also needs the server to reload to take effect.
+      if ((action === 'undo' || action === 'revert') && result.status === 'success') {
+        result.restart = selfRestart.scheduleServerRestart({
+          reason: `UI undo of ${result.modification_id || req.body?.modification_id || ''}`.trim()
+        });
+        if (result.restart?.scheduled) {
+          result.message = `${result.message || 'Change reverted.'} Server refresh scheduled so the revert can load.`;
+        }
       }
       res.json({ ok: true, ...result });
     } else {
       res.status(500).json({ ok: false, error: response.error });
     }
+  } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+});
+
+// Manually trigger a self-improvement scan now (otherwise it runs on a schedule). Produces at
+// most one proposed change, queued for approval in the UI / by voice. Never applies anything.
+router.post('/improve', async (req, res) => {
+  try {
+    const out = await selfImprove.runScan({ reason: (req.body && req.body.reason) || 'manual', max: 1, avoid: (req.body && req.body.avoid) || [] });
+    res.json({ ok: true, ...out });
+  } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+});
+
+// Probe each model in the self-mod reasoning chain so we know which actually work.
+router.post('/selfmod/probe', async (_req, res) => {
+  const env = process.env;
+  const k = (n) => config[n] || env[n] || '';
+  const msgs = [{ role: 'user', content: 'Reply with the single word OK.' }];
+  const primaryOpenAI = env.AVA_SM_OPENAI || 'gpt-5.5';
+  const stableOpenAI = env.AVA_SM_OPENAI_FALLBACK || 'gpt-5.1';
+  const openAIModels = [...new Set([primaryOpenAI, stableOpenAI].filter(Boolean))];
+  const tests = [
+    ...openAIModels.map(model => ['openai/' + model, () => llmService._openaiCompat({ baseURL: 'https://api.openai.com/v1', apiKey: k('OPENAI_API_KEY'), model, system: 'You reply tersely.', messages: msgs, maxTokens: 50 })]),
+    ['gemini/' + (env.AVA_SM_GEMINI || 'gemini-3-pro-preview'), () => llmService.createCompletionGemini({ messages: msgs, system: 'You reply tersely.', maxTokens: 50, model: env.AVA_SM_GEMINI || 'gemini-3-pro-preview' })],
+    ['deepseek/' + (env.AVA_SM_DEEPSEEK || 'deepseek-reasoner'), () => llmService._openaiCompat({ baseURL: 'https://api.deepseek.com', apiKey: k('DEEPSEEK_API_KEY'), model: env.AVA_SM_DEEPSEEK || 'deepseek-reasoner', system: 'You reply tersely.', messages: msgs, maxTokens: 50 })],
+    ['grok/' + (env.AVA_SM_GROK || 'grok-4'), () => llmService._openaiCompat({ baseURL: 'https://api.x.ai/v1', apiKey: k('GROK_API_KEY'), model: env.AVA_SM_GROK || 'grok-4', system: 'You reply tersely.', messages: msgs, maxTokens: 50 })],
+  ];
+  const out = [];
+  for (const [name, fn] of tests) {
+    try { const r = await fn(); out.push({ name, ok: !!String(r.content || r.text || '').trim(), sample: String(r.content || r.text || '').slice(0, 40) }); }
+    catch (e) { out.push({ name, ok: false, error: String(e.message || e).slice(0, 170) }); }
+  }
+  res.json({ ok: true, chain: out });
+});
+
+// Judge ONE proposed self-modification for accuracy/safety (strong-model code review).
+router.post('/selfmod/judge', async (req, res) => {
+  try {
+    const { file, reason, diff } = req.body || {};
+    const sys = [
+      'You are a strict senior code reviewer judging ONE proposed self-modification to an AVA',
+      'source file. Decide if it is ACCURATE and SAFE to apply. Consider: does the change actually',
+      'accomplish its stated reason; is it syntactically valid; could it break behavior, remove',
+      'needed logic, change control flow incorrectly, or introduce a bug; is it minimal and on-target.',
+      'Be skeptical — only "verify" if you are confident it is correct and safe.',
+      'Respond STRICT JSON only: {"verdict":"verify"|"deny","issue":"<short: for deny the specific',
+      'flaw; for verify why it is correct>","rule":"<if deny, a one-line general rule AVA should',
+      'follow next time to avoid this mistake; else empty string>"}',
+    ].join('\n');
+    const user = `FILE: ${file}\nSTATED REASON: ${reason}\n\nDIFF:\n${String(diff || '').slice(0, 6000)}`;
+    const r = await llmService.chatSelfMod(
+      [{ role: 'system', content: sys }, { role: 'user', content: user }],
+      { max_tokens: 600 }
+    );
+    const txt = String(r.text || r.content || '').replace(/^```(?:json)?\s*|\s*```$/g, '');
+    const m = txt.match(/\{[\s\S]*\}/);
+    const j = m ? JSON.parse(m[0]) : null;
+    if (!j || !j.verdict) return res.json({ ok: true, verdict: 'deny', issue: 'judge could not parse a verdict', rule: '' });
+    res.json({ ok: true, verdict: j.verdict === 'verify' ? 'verify' : 'deny', issue: String(j.issue || '').slice(0, 300), rule: String(j.rule || '').slice(0, 200) });
+  } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+});
+
+// Manually post one original self-interested post to Moltbook now.
+router.post('/moltbook/selfpost', async (_req, res) => {
+  try { res.json({ ok: true, ...(await triggerMoltbookSelfPost()) }); }
+  catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+});
+
+// Manually comment on one of someone else's feed posts now.
+router.post('/moltbook/engage', async (_req, res) => {
+  try { res.json({ ok: true, ...(await triggerMoltbookEngage()) }); }
+  catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+});
+
+// Posts awaiting the user's answer to a Moltbook verification challenge.
+router.get('/moltbook/verifications', async (_req, res) => {
+  try { res.json({ ok: true, pending: await getPendingVerifications() }); }
+  catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+});
+
+// User submits the answer to a challenge -> publishes the post (AVA never auto-solves it).
+router.post('/moltbook/verify', async (req, res) => {
+  try {
+    const { code, answer } = req.body || {};
+    if (!code || answer === undefined || answer === '') return res.status(400).json({ ok: false, error: 'code and answer required' });
+    const out = await submitMoltbookVerification(code, answer);
+    res.json({ ok: out.ok, ...out });
   } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
 });
 

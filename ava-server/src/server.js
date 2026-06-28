@@ -23,6 +23,7 @@ import voiceRoutes, { registerVoiceWsClient } from './routes/voice.js';
 import doctorService from './services/doctor.js';
 import digestScheduler from './services/digestScheduler.js';
 import moltbookScheduler from './services/moltbookScheduler.js';
+import selfImprove from './services/selfImprove.js';
 
 // Phase 7: Security audit at startup
 const isProd = process.env.NODE_ENV === 'production';
@@ -155,6 +156,23 @@ server.listen(PORT, HOST, () => {
     } catch (e) {
       logger.warn('Failed to start Moltbook scheduler', { error: e.message });
     }
+  }
+
+  // Self-improvement loop: queues proposed code changes for the user's approval (UI/voice).
+  // Runs even in voice mode (lightweight, infrequent) — gated by its own AVA_SELF_IMPROVE_OFF.
+  try {
+    selfImprove.start();
+  } catch (e) {
+    logger.warn('Failed to start self-improvement loop', { error: e.message });
+  }
+
+  // Moltbook learning/posting loop — user wants it running even in voice mode. Idempotent
+  // (no-ops if already started above). When DISABLE_AUTONOMY=1 it needs AVA_MOLTBOOK_FORCE=1,
+  // and a Moltbook API key at ~/.config/moltbook/credentials.json to actually post/respond/fetch.
+  try {
+    moltbookScheduler.startMoltbookScheduler();
+  } catch (e) {
+    logger.warn('Failed to force-start Moltbook scheduler', { error: e.message });
   }
 });
 

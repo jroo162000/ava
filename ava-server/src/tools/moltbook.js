@@ -106,29 +106,30 @@ export const moltbookTools = [
     parameters: {
       type: 'object',
       properties: {
-        submolt: { type: 'string', description: 'Community to post to (e.g., "general", "voiceai", "tips", "improvements")' },
-        title: { type: 'string', description: 'Post title' },
+        submolt: { type: 'string', description: 'Community to post to (valid: general, agents, builds, todayilearned, technology, tooling, philosophy, ai, memory, introductions). Defaults to "general" if omitted.' },
+        title: { type: 'string', description: 'Post title (<=300 chars). If omitted, a short one is generated.' },
         content: { type: 'string', description: 'Post content' }
       },
-      required: ['submolt', 'title', 'content']
+      required: ['content']
     },
     requires_confirm: true,
     handler: async (args) => {
       try {
-        const result = await moltbookService.post(args.submolt, args.title, args.content);
+        const community = args.submolt || 'general';
+        const result = await moltbookService.post(community, args.title, args.content);
 
-        if (result.success) {
+        if (result.success || result.id || result.post) {
           return {
             status: 'ok',
-            message: `Posted to m/${args.submolt}: "${args.title}"`,
-            postId: result.post?.id
-          };
-        } else {
-          return {
-            status: 'error',
-            message: result.error || 'Failed to post'
+            message: `Posted to m/${community}${args.title ? `: "${args.title}"` : ''}`,
+            postId: result.post?.id || result.id
           };
         }
+        const detail = Array.isArray(result.message) ? result.message.join('; ') : (result.message || '');
+        return {
+          status: 'error',
+          message: (result.error || 'Failed to post') + (detail ? ` — ${detail}` : '')
+        };
       } catch (e) {
         return { status: 'error', message: e.message };
       }

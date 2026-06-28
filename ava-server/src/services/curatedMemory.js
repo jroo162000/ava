@@ -79,6 +79,10 @@ export function appendFact(target, line) {
   const cap = target === 'user' ? USER_CAP : MEMORY_CAP;
   const clean = String(line || '').replace(/\s+/g, ' ').trim();
   if (!clean) return { ok: false, error: 'empty' };
+  const isMoltbookComment = /\bmoltbook\b/i.test(clean) && /\b(comment|rss|editor-in-chief|eni_novelist)\b/i.test(clean);
+  const authSolicitation = /\b(api[-_\s]?key|authentication|re-authentication|credentials?)\b/i.test(clean) && /\b(request|provide|send|enter|reauthenticate|re-authenticate|curl)\b/i.test(clean);
+  const promoBoilerplate = /\b(editor-in-chief|rss ad|promotional rss|subscribe now|sponsored)\b/i.test(clean);
+  if (isMoltbookComment && (authSolicitation || promoBoilerplate)) return { ok: false, quarantined: true, error: 'untrusted-external-comment' };
   try {
     let t = fs.existsSync(p) ? fs.readFileSync(p, 'utf8') : '';
     if (t.toLowerCase().includes(clean.toLowerCase())) return { ok: true, deduped: true };

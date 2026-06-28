@@ -2,8 +2,16 @@
 // Receives events from Python voice module and broadcasts to clients
 import { Router } from 'express';
 import logger from '../utils/logger.js';
+import { onVoiceEvent } from '../services/voiceBus.js';
+import announceQueue from '../services/announceQueue.js';
 
 const router = Router();
+
+// The voice runner polls this to fetch + speak proactive announcements (e.g., "I've queued a
+// code change for your review"). Draining returns and clears the queued items.
+router.get('/announcements', (_req, res) => {
+  res.json({ ok: true, items: announceQueue.drainAnnouncements() });
+});
 
 // Store recent events for debugging (circular buffer)
 const recentEvents = [];
@@ -50,6 +58,12 @@ function storeEvent(event) {
     recentEvents.shift();
   }
 }
+
+// Mirror internally-published events (from conversationLogger, toolsService, /respond)
+// to the same store + WebSocket clients used for events posted by the Python runner.
+onVoiceEvent((event) => {
+  try { storeEvent(event); broadcastEvent(event); } catch { /* ignore */ }
+});
 
 // ============================================
 // Voice Event Endpoints

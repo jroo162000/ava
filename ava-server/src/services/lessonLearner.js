@@ -42,7 +42,17 @@ export async function lessonFromError({ tool, args, error, goal } = {}) {
     } catch (e) { return { saved: false, error: e.message }; }
 
     if (!text || /^null\b/i.test(text) || text.toLowerCase() === 'null') return { saved: false, reason: 'no lesson' };
-    const lesson = text.replace(/\s+/g, ' ').trim().slice(0, 240);
+    let normalized = text.trim();
+    if (normalized.startsWith('{')) {
+      let parsed;
+      try { parsed = JSON.parse(normalized); }
+      catch { logger?.warn?.('[lessonLearner] rejected malformed JSON lesson', { tool }); return { saved: false, reason: 'malformed_json_learning' }; }
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return { saved: false, reason: 'malformed_json_learning' };
+      const pick = (...keys) => keys.map((k) => parsed[k]).find((v) => typeof v === 'string' && v.trim())?.trim();
+      normalized = [pick('title', 'topic'), pick('content', 'insight', 'lesson')].filter(Boolean).join(': ');
+      if (!normalized) return { saved: false, reason: 'malformed_json_learning' };
+    }
+    const lesson = normalized.replace(/\s+/g, ' ').trim().slice(0, 240);
     if (!safe(lesson)) { logger?.warn?.('[lessonLearner] rejected unsafe lesson', { tool }); return { saved: false, reason: 'guard' }; }
 
     const res = curatedMemory.appendFact('memory', `Lesson: ${lesson}`);

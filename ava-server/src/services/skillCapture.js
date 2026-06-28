@@ -37,7 +37,8 @@ export async function reviewAndCapture(opts = {}) {
 
     const sys = `You capture REUSABLE skills from a completed task. If the task involved a NON-TRIVIAL, repeatable procedure (multiple steps, specific tools, or trial-and-error worth remembering for next time), output ONE skill as JSON:
 {"title":"short imperative title","when":"when to use this","steps":["step 1","step 2", ...],"tags":["..."]}
-If the task was trivial, one-off, or has no reusable procedure, output exactly: null
+Explicit user corrections or preference-pattern phrases (for example, "no, I meant...", "actually...", or "when I say X, do Y") are reusable lessons: capture them as a skill with the corrected/preferred behavior in steps, even if they are not a completed task.
+If the task was trivial, one-off, or has no reusable procedure or explicit correction/preference pattern, output exactly: null
 Never include secrets, credentials, or destructive commands in the steps.`;
     const usr = `GOAL: ${opts.goal || '(infer from the transcript)'}\n\nTRANSCRIPT:\n${transcript}`;
 

@@ -9,6 +9,7 @@ import config from '../utils/config.js';
 import logger from '../utils/logger.js';
 import memoryService from './memory.js';
 import moltbookService from './moltbook.js';
+import personaSvc from './persona.js';
 
 // Load AVA identity if available
 function loadIdentity() {
@@ -204,7 +205,8 @@ class LLMService {
       messages,
       system: messages.find(m => m.role === 'system')?.content,
       temperature: options.temperature || 0.7,
-      maxTokens: options.max_tokens || 1000
+      maxTokens: options.max_tokens || 1000,
+      model: options.model
     });
     return {
       text: result.content,
@@ -214,7 +216,7 @@ class LLMService {
     };
   }
 
-  async createCompletionOpenAI({ messages, system, temperature = 0.7, maxTokens = 1000 }) {
+  async createCompletionOpenAI({ messages, system, temperature = 0.7, maxTokens = 1000, model }) {
     const apiKey = this.getApiKey('openai');
     if (!apiKey) throw new Error('OpenAI API key not configured');
 
@@ -224,18 +226,24 @@ class LLMService {
       ...messages
     ];
 
+    const mdl = model || process.env.AVA_OPENAI_MODEL || 'gpt-5.1';
+    // GPT-5 / o-series use max_completion_tokens and reject a custom temperature.
+    const isNewer = /^(gpt-5|o[0-9])/.test(mdl);
+    const payload = { model: mdl, messages: fullMessages };
+    if (isNewer) {
+      payload.max_completion_tokens = Math.max(maxTokens, 800); // headroom for reasoning tokens
+    } else {
+      payload.temperature = temperature;
+      payload.max_tokens = maxTokens;
+    }
+
     const response = await fetch('https://api.openai.com/v1/chat/completions', {
       method: 'POST',
       headers: {
         'Authorization': `Bearer ${apiKey}`,
         'Content-Type': 'application/json'
       },
-      body: JSON.stringify({
-        model: 'gpt-4o-mini',
-        messages: fullMessages,
-        temperature,
-        max_tokens: maxTokens
-      })
+      body: JSON.stringify(payload)
     });
 
     if (!response.ok) {
@@ -252,20 +260,21 @@ class LLMService {
     };
   }
 
-  async createCompletionGemini({ messages, system, temperature = 0.7, maxTokens = 1000 }) {
+  async createCompletionGemini({ messages, system, temperature = 0.7, maxTokens = 1000, model }) {
     const apiKey = this.getApiKey('gemini');
     if (!apiKey) throw new Error('Gemini API key not configured');
+    const mdl = model || 'gemini-2.0-flash';
 
     const systemMessage = system || SYSTEM_PROMPT;
-    
-    // Convert messages to Gemini format
-    const contents = messages.map(msg => ({
+
+    // Convert messages to Gemini format (system goes in systemInstruction, not contents)
+    const contents = messages.filter(m => m.role !== 'system').map(msg => ({
       role: msg.role === 'assistant' ? 'model' : 'user',
       parts: [{ text: msg.content }]
     }));
 
     const response = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`,
+      `https://generativelanguage.googleapis.com/v1beta/models/${mdl}:generateContent?key=${apiKey}`,
       {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -296,11 +305,20 @@ class LLMService {
     };
   }
 
-  async createCompletionClaude({ messages, system, temperature = 0.7, maxTokens = 1000 }) {
+  async createCompletionClaude({ messages, system, temperature = 0.7, maxTokens = 1000, model }) {
     const apiKey = this.getApiKey('claude');
     if (!apiKey) throw new Error('Claude API key not configured');
 
     const systemMessage = system || SYSTEM_PROMPT;
+    // Claude's messages array must contain only user/assistant turns (system goes separately).
+    const convo = (messages || [])
+      .filter(m => m.role !== 'system')
+      .map(msg => ({ role: msg.role, content: msg.content }));
+    const mdl = (model && /^claude/i.test(model)) ? model : (process.env.AVA_CLAUDE_MODEL || 'claude-3-5-haiku-latest');
+    // Claude 4.x models (opus-4-x, sonnet-4-x, haiku-4-x) reject `temperature` ("deprecated").
+    const isNewerClaude = /claude-(opus|sonnet|haiku)-[4-9]/i.test(mdl);
+    const claudeBody = { model: mdl, max_tokens: maxTokens, system: systemMessage, messages: convo };
+    if (!isNewerClaude) claudeBody.temperature = Math.max(0, Math.min(1, temperature));
 
     const response = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
@@ -309,15 +327,7 @@ class LLMService {
         'anthropic-version': '2023-06-01',
         'Content-Type': 'application/json'
       },
-      body: JSON.stringify({
-        model: 'claude-3-5-haiku-latest',
-        max_tokens: maxTokens,
-        system: systemMessage,
-        messages: messages.map(msg => ({
-          role: msg.role,
-          content: msg.content
-        }))
-      })
+      body: JSON.stringify(claudeBody)
     });
 
     if (!response.ok) {
@@ -374,13 +384,88 @@ class LLMService {
     };
   }
 
+  // OpenAI-compatible chat completion (OpenAI, DeepSeek, and xAI/Grok all use this wire format).
+  async _openaiCompat({ baseURL, apiKey, model, system, messages, maxTokens = 1500 }) {
+    if (!apiKey) throw new Error('no api key');
+    const full = [{ role: 'system', content: system || SYSTEM_PROMPT }, ...messages.filter(m => m.role !== 'system')];
+    const isNewerOpenAI = /^(gpt-5|o[0-9])/.test(model);
+    const payload = { model, messages: full };
+    if (isNewerOpenAI) payload.max_completion_tokens = Math.max(maxTokens, parseInt(process.env.AVA_SM_OPENAI_MIN_COMPLETION || '1600', 10));
+    else payload.max_tokens = maxTokens;
+    const resp = await fetch(`${baseURL}/chat/completions`, {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    if (!resp.ok) { const t = await resp.text().catch(() => ''); throw new Error(`${resp.status} ${t.slice(0, 160)}`); }
+    const d = await resp.json();
+    const choice = d.choices?.[0] || {};
+    return {
+      content: choice.message?.content || '',
+      model: d.model || model,
+      finishReason: choice.finish_reason || '',
+      usage: d.usage,
+    };
+  }
+
+  // Self-modification reasoning chain (user-chosen): Claude Opus 4.8 (PRIMARY) ->
+  // OpenAI self-mod model -> stable OpenAI fallback -> Gemini 3 -> DeepSeek -> Grok. Tries
+  // each highest-reasoning model in order until one returns
+  // text, so self-mod keeps working across provider outages / credit issues. Each is overridable
+  // via env (AVA_SM_*). Claude is primary and takes over automatically once its credits exist.
+  async chatSelfMod(messages, options = {}) {
+    const system = messages.find(m => m.role === 'system')?.content;
+    const conv = messages.filter(m => m.role !== 'system');
+    const maxTokens = options.max_tokens || 1500;
+    const env = process.env;
+    const key = (n) => config[n] || env[n] || '';
+    const primaryOpenAI = env.AVA_SM_OPENAI || 'gpt-5.5';
+    const stableOpenAI = env.AVA_SM_OPENAI_FALLBACK || 'gpt-5.1';
+    const openAIModels = [...new Set([primaryOpenAI, stableOpenAI].filter(Boolean))];
+    const chain = [
+      { name: 'claude/' + (env.AVA_SM_CLAUDE || 'claude-opus-4-8'), run: () => this.createCompletionClaude({ messages: conv, system, maxTokens, model: env.AVA_SM_CLAUDE || 'claude-opus-4-8' }) },
+      ...openAIModels.map(model => ({ name: 'openai/' + model, run: () => this._openaiCompat({ baseURL: 'https://api.openai.com/v1', apiKey: key('OPENAI_API_KEY'), model, system, messages: conv, maxTokens }) })),
+      { name: 'gemini/' + (env.AVA_SM_GEMINI || 'gemini-3-pro-preview'), run: () => this.createCompletionGemini({ messages: conv, system, maxTokens, model: env.AVA_SM_GEMINI || 'gemini-3-pro-preview' }) },
+      { name: 'deepseek/' + (env.AVA_SM_DEEPSEEK || 'deepseek-reasoner'), run: () => this._openaiCompat({ baseURL: 'https://api.deepseek.com', apiKey: key('DEEPSEEK_API_KEY'), model: env.AVA_SM_DEEPSEEK || 'deepseek-reasoner', system, messages: conv, maxTokens }) },
+      { name: 'grok/' + (env.AVA_SM_GROK || 'grok-4'), run: () => this._openaiCompat({ baseURL: 'https://api.x.ai/v1', apiKey: key('GROK_API_KEY'), model: env.AVA_SM_GROK || 'grok-4', system, messages: conv, maxTokens }) },
+    ];
+    const errs = [];
+    for (const step of chain) {
+      try {
+        const res = await step.run();
+        const text = res.content || res.text || '';
+        if (text && text.trim()) { logger.info('[selfmod-llm] used ' + step.name); return { text, content: text, provider: step.name }; }
+        const emptyNote = [
+          'empty',
+          res.model ? `model=${res.model}` : '',
+          res.finishReason ? `finish=${res.finishReason}` : '',
+          res.usage ? `usage=${JSON.stringify(res.usage).slice(0, 220)}` : '',
+        ].filter(Boolean).join(' ');
+        errs.push(step.name + ': ' + emptyNote);
+      } catch (e) { errs.push(step.name + ': ' + (e.message || e)); }
+    }
+    logger.warn('[selfmod-llm] entire chain failed', { errs });
+    throw new Error('self-mod chain failed: ' + errs.join(' | '));
+  }
+
   async createCompletion(options) {
     // Try providers in order until one works
-    const providers = ['openai', 'gemini', 'claude', 'groq'];
+    let providers = ['openai', 'gemini', 'claude', 'groq'];
     const errors = [];
 
-    // Start with detected provider
-    if (this.provider) {
+    // Route by model FAMILY when a model is named (e.g. "claude-opus-4-8" -> claude). When a
+    // family is forced, do NOT fall back to a provider that can't run the requested model.
+    const mdl = String(options.model || '');
+    let forced = null;
+    if (/^claude/i.test(mdl)) forced = 'claude';
+    else if (/^(gpt|o[0-9]|text-)/i.test(mdl)) forced = 'openai';
+    else if (/^gemini/i.test(mdl)) forced = 'gemini';
+
+    if (forced) {
+      // Try the requested family first, then fall back to other available providers (using THEIR
+      // own default model) so self-mod keeps working if e.g. the Claude account is out of credits.
+      providers = [forced, ...['openai', 'gemini', 'claude', 'groq'].filter(p => p !== forced)];
+    } else if (this.provider) {
       const idx = providers.indexOf(this.provider);
       if (idx > 0) {
         providers.splice(idx, 1);
@@ -390,17 +475,19 @@ class LLMService {
 
     for (const provider of providers) {
       if (!this.getApiKey(provider)) continue;
+      // For a fallback provider, drop the requested (family-specific) model so it uses its default.
+      const opts = (forced && provider !== forced) ? { ...options, model: undefined } : options;
 
       try {
         switch (provider) {
           case 'openai':
-            return await this.createCompletionOpenAI(options);
+            return await this.createCompletionOpenAI(opts);
           case 'gemini':
-            return await this.createCompletionGemini(options);
+            return await this.createCompletionGemini(opts);
           case 'claude':
-            return await this.createCompletionClaude(options);
+            return await this.createCompletionClaude(opts);
           case 'groq':
-            return await this.createCompletionGroq(options);
+            return await this.createCompletionGroq(opts);
         }
       } catch (error) {
         errors.push(`${provider}: ${error.message}`);
@@ -416,10 +503,21 @@ class LLMService {
     try {
       // Get session history
       const session = this.getSession(sessionId);
-      
+
+      // Lead with AVA's personality so typed (UI) replies sound like HER — not a generic
+      // assistant. Channel decides delivery: 'text' (default, on-screen → Markdown formatting
+      // allowed) vs 'voice' (spoken → plain, TTS-safe). The capability/tool block follows.
+      const channel = options.channel === 'voice' ? 'voice' : 'text';
+      let personaBlock = '';
+      try {
+        personaBlock = channel === 'voice'
+          ? personaSvc.buildPersonaBlock()
+          : personaSvc.buildPersonaBlockText();
+      } catch { personaBlock = ''; }
+
       // Add memory context if available
-      let systemPrompt = SYSTEM_PROMPT;
-      
+      let systemPrompt = personaBlock ? `${personaBlock}\n\n${SYSTEM_PROMPT}` : SYSTEM_PROMPT;
+
       if (options.includeMemory) {
         const persona = memoryService.generatePersona();
         const memoryResults = await memoryService.search(userMessage, 3);
@@ -492,10 +590,14 @@ class LLMService {
         { role: 'user', content: userMessage }
       ];
 
-      // Get completion
+      // Get completion. Give the on-screen (text) channel real headroom so longer,
+      // properly-formatted answers aren't truncated mid-thought; voice stays tighter.
+      const defaultMax = channel === 'voice' ? 1200 : 3000;
+      const maxTokens = options.maxTokens || options.max_tokens || parseInt(process.env.AVA_CHAT_MAX_TOKENS || '', 10) || defaultMax;
       const result = await this.createCompletion({
         messages,
         system: systemPrompt,
+        maxTokens,
         ...options
       });
 

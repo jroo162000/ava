@@ -7,8 +7,8 @@
   "audio": {
     "playback_rate": 44100,
     "output_device": null,
-    "input_device": 1,
-    "input_device_name": "Headset Microphone (Logitech H5)",
+    "input_device": 2,
+    "input_device_name": "Microphone (TONOR TC777 usb mic)",
     "input_backend": "mme",
     "input_sample_rate": 44100,
     "input_channels": 1,
@@ -70,11 +70,13 @@
     "tts_engine": "piper",
     "edge_voice": "en-US-MichelleNeural",
     "whisper_model": "tiny.en",
+    "whisper_language": "en",
+    "whisper_task": "transcribe",
     "auto_switch": true,
     "force_local": true,
     "piper": {
-      "exe": "C:/Users/USER 1/ava/ava-integration/vendor/piper/piper.exe",
-      "model": "C:/Users/USER 1/ava/ava-integration/vendor/piper/models/ava_vella.onnx"
+      "exe": "C:/Users/Dell/Claude/Projects/AVA Development/ava/ava-integration/vendor/piper/piper.exe",
+      "model": "C:/Users/Dell/Claude/Projects/AVA Development/ava/ava-integration/vendor/piper/models/ava_vella.onnx"
     }
   },
   "elevenlabs": {

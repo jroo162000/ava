@@ -5,12 +5,18 @@
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
+import { fileURLToPath } from 'url';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 // Log timestamps are UTC; convert to the user's local time for display/windowing.
 const OFFSET_MIN = parseInt(process.env.AVA_TZ_OFFSET_MIN || '-300', 10); // default CDT (UTC-5)
 
 function logsDir() {
   const cands = [
+    // Absolute, cwd-independent: same dir conversationLogger writes to (../../logs/conversations
+    // from this services/ file). Listed first so recall always reads the real logs.
+    path.join(__dirname, '..', '..', 'logs', 'conversations'),
     path.join(process.cwd(), 'logs', 'conversations'),
     path.join(os.homedir(), 'ava', 'ava-server', 'logs', 'conversations'),
     path.join(os.homedir(), 'ava-server', 'logs', 'conversations'),

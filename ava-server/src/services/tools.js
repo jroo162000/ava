@@ -10,6 +10,7 @@ import logger from '../utils/logger.js';
 import pythonWorker from './pythonWorker.js';
 import securityService from '../utils/security.js';
 import moltbookService from './moltbook.js';
+import { emitVoiceEvent } from './voiceBus.js';
 import fileGen from './fileGen.js';
 import memorySearch from './memorySearch.js';
 import sandbox from './sandbox.js';
@@ -361,6 +362,9 @@ class ToolsService {
     
     // Python tools override
     for (const tool of pythonTools) {
+      if (tool.name === 'camera_ops') {
+        tool.description = `${tool.description || 'Camera controls.'} Use for clear camera intents such as "turn on the camera", "open camera", "start webcam", "turn off the camera", or "stop webcam"; do not use ps_exec for these.`;
+      }
       toolMap.set(tool.name, tool);
     }
 
@@ -574,11 +578,13 @@ class ToolsService {
 
       case 'moltbook_post':
         try {
-          const result = await moltbookService.post(args.submolt, args.title, args.content);
-          if (result.success) {
-            return { ok: true, result: { message: `Posted to m/${args.submolt}`, postId: result.post?.id } };
+          const community = args.submolt || 'general';
+          const result = await moltbookService.post(community, args.title, args.content);
+          if (result.success || result.id || result.post) {
+            return { ok: true, result: { message: `Posted to m/${community}`, postId: result.post?.id || result.id } };
           }
-          return { ok: false, error: result.error || 'Failed to post' };
+          const detail = Array.isArray(result.message) ? result.message.join('; ') : (result.message || '');
+          return { ok: false, error: (result.error || 'Failed to post') + (detail ? ` — ${detail}` : '') };
         } catch (e) {
           return { ok: false, error: e.message };
         }
@@ -788,6 +794,44 @@ class ToolsService {
 export { IdempotencyCache };
 
 const toolsService = new ToolsService();
+
+// Mirror every tool execution to the live UI (voice bus) so the user can watch what
+// AVA does in real time. Wraps the method without touching its internals.
+const _origExecuteTool = toolsService.executeTool.bind(toolsService);
+toolsService.executeTool = async function (name, args, dryRun = false, options = {}) {
+  const src = (options && options.source) || '';
+  try { emitVoiceEvent('tool.start', { tool: name, args: _safeToolArgs(args), dryRun }, src || 'agent'); } catch { /* ignore */ }
+  let res;
+  try {
+    res = await _origExecuteTool(name, args, dryRun, options);
+    return res;
+  } finally {
+    try {
+      const inner = (res && res.result && typeof res.result === 'object') ? res.result : res;
+      const ok = !(res && res.ok === false) && !(inner && inner.status === 'error');
+      emitVoiceEvent('tool.result', {
+        tool: name,
+        ok,
+        status: (inner && inner.status) || (ok ? 'ok' : 'error'),
+        summary: _summarizeToolResult(inner),
+      }, src || 'agent');
+    } catch { /* ignore */ }
+  }
+};
+function _safeToolArgs(args) {
+  try {
+    if (args == null) return {};
+    const s = JSON.stringify(args);
+    return s.length > 240 ? (s.slice(0, 240) + '…') : args;
+  } catch { return {}; }
+}
+function _summarizeToolResult(r) {
+  try {
+    if (r == null) return '';
+    if (typeof r !== 'object') return String(r).slice(0, 180);
+    return String(r.message || r.summary || r.description || r.status || JSON.stringify(r)).slice(0, 200);
+  } catch { return ''; }
+}
 
 // Warm up cache on module load with retry for Python worker
 const warmupCache = async (retries = 3, delay = 5000) => {

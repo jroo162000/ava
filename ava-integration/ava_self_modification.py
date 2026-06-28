@@ -45,6 +45,12 @@ def _detect_codebase() -> Dict[str, Path]:
     env_int = os.getenv("AVA_INTEGRATION_DIR")
     if env_int:
         int_candidates.append(Path(env_int))
+    # This module physically lives IN ava-integration — the most reliable anchor,
+    # works regardless of env/cwd or where the repo is checked out.
+    try:
+        int_candidates.append(Path(__file__).resolve().parent)
+    except Exception:
+        pass
     int_candidates += [home / "ava" / "ava-integration", home / "ava-integration"]
     integration = next((p for p in int_candidates if p.exists()), int_candidates[0])
 
@@ -195,12 +201,21 @@ def get_file_hash(file_path: Path) -> str:
         return hashlib.md5(f.read()).hexdigest()
 
 def read_file(file_path: Path) -> str:
-    """Safely read a file"""
+    """Safely read a file (tolerant of stray non-UTF-8 bytes so a bad byte never crashes us)."""
     try:
-        with open(file_path, 'r', encoding='utf-8') as f:
+        with open(file_path, 'r', encoding='utf-8', errors='replace', newline='') as f:
             return f.read()
     except Exception as e:
         return f"ERROR reading {file_path}: {e}"
+
+
+def _clean_text(s: str) -> str:
+    """Drop lone surrogates / un-encodable code points so content always writes as valid UTF-8.
+    Stray surrogates (e.g. \\udc9d) can sneak in via the LLM or the Node<->worker transport and
+    would otherwise crash the writer with 'utf-8 codec can't encode … surrogates not allowed'."""
+    if not isinstance(s, str):
+        return s
+    return s.encode('utf-8', 'ignore').decode('utf-8', 'ignore')
 
 def write_file(file_path: Path, content: str, backup: bool = True) -> Dict[str, Any]:
     """Write file with optional backup"""
@@ -211,9 +226,9 @@ def write_file(file_path: Path, content: str, backup: bool = True) -> Dict[str, 
             backup_path = create_backup(file_path)
             result["backup"] = str(backup_path)
         
-        with open(file_path, 'w', encoding='utf-8') as f:
-            f.write(content)
-        
+        with open(file_path, 'w', encoding='utf-8', newline='') as f:
+            f.write(_clean_text(content))
+
         result["status"] = "success"
         result["hash"] = get_file_hash(file_path)
         
@@ -832,15 +847,17 @@ def diagnose_tool(tool_name: str, sample_args: Dict[str, Any] = None) -> Dict[st
 class PendingModification:
     """Represents a code change awaiting approval"""
     
-    def __init__(self, file_path: Path, new_content: str, reason: str):
+    def __init__(self, file_path: Path, new_content: str, reason: str, metadata: Dict[str, Any] = None):
         self.id = hashlib.md5(f"{file_path}{datetime.now()}".encode()).hexdigest()[:8]
         self.file_path = file_path
         self.new_content = new_content
         self.reason = reason
+        self.metadata = metadata or {}
         self.original_content = read_file(file_path)
         self.diff = generate_diff(self.original_content, new_content, file_path.name)
         self.created = datetime.now()
-        self.status = "pending"  # pending, approved, rejected, applied
+        self.applied_at = None  # set when approved+applied; used to undo the most recent change
+        self.status = "pending"  # pending, approved, rejected, applied, reverted
     
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -849,23 +866,118 @@ class PendingModification:
             "reason": self.reason,
             "diff": self.diff,
             "status": self.status,
-            "created": self.created.isoformat()
+            "created": self.created.isoformat(),
+            "applied_at": self.applied_at.isoformat() if getattr(self, "applied_at", None) else "",
+            "metadata": self.metadata,
+            "decision_model": self.metadata.get("decisionModel") or self.metadata.get("editModel") or self.metadata.get("planModel") or "",
+            "plan_model": self.metadata.get("planModel", ""),
+            "edit_model": self.metadata.get("editModel", ""),
+            "review_recommendation": self.metadata.get("reviewRecommendation", ""),
+            "review_reason": self.metadata.get("reviewReason", ""),
+            "reviewers": self.metadata.get("reviewers", []),
         }
 
-# Store pending modifications
+# Store pending modifications (persisted to ~/.cmpuse/pending_mods.json so they survive a
+# restart and can be read by the server/UI and the autonomous proposal loop).
 _pending_modifications: Dict[str, PendingModification] = {}
+_PENDING_FILE = AVA_CODEBASE["config"] / "pending_mods.json"
 
-def propose_modification(file_path: Path, new_content: str, reason: str) -> Dict[str, Any]:
-    """Propose a code modification (requires approval to apply)"""
-    mod = PendingModification(file_path, new_content, reason)
+# The approval gate itself must NEVER be self-modified — so AVA can't weaken the rule that
+# the user must approve every change. Proposals targeting these basenames are refused.
+PROTECTED_BASENAMES = {
+    "ava_self_modification.py",  # this module: propose/approve/reject logic
+    "learning.js",               # server approval endpoints
+    "selfmod.js",                # server self-mod approval routes
+    "security.js",               # security utilities
+    "autonomyPolicy.js",         # autonomy policy gate
+}
+
+
+def _is_protected(file_path) -> bool:
+    try:
+        return Path(file_path).name in PROTECTED_BASENAMES
+    except Exception:
+        return False
+
+
+def _save_pending() -> None:
+    try:
+        AVA_CODEBASE["config"].mkdir(exist_ok=True)
+        data = {mid: {
+            "file": str(m.file_path), "new_content": m.new_content,
+            "original_content": m.original_content, "reason": m.reason,
+            "diff": m.diff, "status": m.status, "created": m.created.isoformat(),
+            "applied_at": m.applied_at.isoformat() if getattr(m, "applied_at", None) else None,
+            "metadata": getattr(m, "metadata", {}),
+        } for mid, m in _pending_modifications.items()}
+        with open(_PENDING_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+    except Exception:
+        pass
+
+
+def _load_pending() -> None:
+    try:
+        if not _PENDING_FILE.exists():
+            return
+        with open(_PENDING_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        for mid, d in data.items():
+            try:
+                m = PendingModification.__new__(PendingModification)
+                m.id = mid
+                m.file_path = Path(d["file"])
+                m.new_content = d.get("new_content", "")
+                m.original_content = d.get("original_content", "")
+                m.reason = d.get("reason", "")
+                m.metadata = d.get("metadata", {}) or {}
+                m.diff = d.get("diff", "")
+                m.status = d.get("status", "pending")
+                m.created = datetime.fromisoformat(d["created"]) if d.get("created") else datetime.now()
+                m.applied_at = datetime.fromisoformat(d["applied_at"]) if d.get("applied_at") else None
+                _pending_modifications[mid] = m
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+def propose_modification(file_path: Path, new_content: str, reason: str, metadata: Dict[str, Any] = None) -> Dict[str, Any]:
+    """Propose a code modification (requires user approval to apply)."""
+    if _is_protected(file_path):
+        return {
+            "status": "denied", "approval_required": True,
+            "message": f"Refused: {Path(file_path).name} is part of the approval/safety gate and cannot be self-modified.",
+        }
+    if not Path(file_path).exists():
+        return {
+            "status": "denied", "approval_required": True,
+            "message": f"Refused: target file does not exist: {file_path}",
+        }
+    if not isinstance(new_content, str) or not new_content.strip():
+        return {
+            "status": "denied", "approval_required": True,
+            "message": "Refused: proposal must include full replacement file content.",
+        }
+    if re.match(r"^\s*(diff --git|---\s+a/|\+\+\+\s+b/|ERROR reading\b)", new_content, re.I):
+        return {
+            "status": "denied", "approval_required": True,
+            "message": "Refused: proposal content looks like a patch/error transcript, not full replacement file content.",
+        }
+    mod = PendingModification(file_path, new_content, reason, metadata)
     _pending_modifications[mod.id] = mod
-    
+    _save_pending()
     return {
         "status": "proposed",
         "modification_id": mod.id,
         "file": str(file_path),
         "reason": reason,
         "diff": mod.diff,
+        "metadata": mod.metadata,
+        "decision_model": mod.metadata.get("decisionModel", ""),
+        "review_recommendation": mod.metadata.get("reviewRecommendation", ""),
+        "review_reason": mod.metadata.get("reviewReason", ""),
+        "reviewers": mod.metadata.get("reviewers", []),
         "message": f"Modification proposed. Review the diff and call approve_modification('{mod.id}') to apply.",
         "approval_required": True
     }
@@ -883,15 +995,20 @@ def approve_modification(mod_id: str) -> Dict[str, Any]:
     
     if mod.status != "pending":
         return {"status": "error", "message": f"Modification already {mod.status}"}
-    
+
+    if _is_protected(mod.file_path):
+        return {"status": "denied", "message": f"Refused: {Path(mod.file_path).name} is a protected approval-gate file and cannot be modified."}
+
     # Create backup
     backup_path = create_backup(mod.file_path)
-    
+
     # Apply the change
     result = write_file(mod.file_path, mod.new_content, backup=False)  # Already backed up
-    
+
     if result["status"] == "success":
         mod.status = "applied"
+        mod.applied_at = datetime.now()
+        _save_pending()
         return {
             "status": "success",
             "message": f"Modification applied to {mod.file_path}",
@@ -899,7 +1016,10 @@ def approve_modification(mod_id: str) -> Dict[str, Any]:
             "modification_id": mod_id
         }
     else:
-        mod.status = "failed"
+        # Keep it PENDING (not "failed") so a write error never drops the proposal out of the
+        # queue — it stays visible in the UI / by voice so the user can review or retry it.
+        mod.status = "pending"
+        _save_pending()
         return {
             "status": "error",
             "message": f"Failed to apply: {result.get('error')}",
@@ -910,15 +1030,18 @@ def reject_modification(mod_id: str) -> Dict[str, Any]:
     """Reject a pending modification"""
     if mod_id not in _pending_modifications:
         return {"status": "error", "message": f"Modification {mod_id} not found"}
-    
+
     mod = _pending_modifications[mod_id]
     mod.status = "rejected"
-    
+    _save_pending()
     return {
         "status": "success",
         "message": f"Modification {mod_id} rejected",
         "modification_id": mod_id
     }
+
+# Load any persisted pending modifications on import (survive restarts).
+_load_pending()
 
 def rollback_last_modification(file_path: Path) -> Dict[str, Any]:
     """Rollback to the most recent backup of a file"""
@@ -933,8 +1056,47 @@ def rollback_last_modification(file_path: Path) -> Dict[str, Any]:
     if result["status"] == "success":
         result["backup_used"] = str(latest_backup)
         result["message"] = f"Rolled back {file_path.name} to {latest_backup.name}"
-    
+
     return result
+
+
+def undo_last_applied(mod_id: str = None) -> Dict[str, Any]:
+    """Undo a self-modification AFTER it was applied: restore the file to the exact content
+    captured before the change (the proposal's original_content). Backs up the current state
+    first, so an undo is itself reversible. With no id, undoes the most recently applied change."""
+    target = None
+    if mod_id:
+        target = _pending_modifications.get(mod_id) or next(
+            (m for m in _pending_modifications.values() if m.id.startswith(str(mod_id))), None)
+        if target is None:
+            return {"status": "error", "message": f"Change {mod_id} not found."}
+        if target.status not in ("applied", "reverted"):
+            return {"status": "error", "message": f"Change {mod_id} is {target.status}, not applied — there's nothing to undo."}
+    else:
+        applied = [m for m in _pending_modifications.values() if m.status == "applied"]
+        if not applied:
+            return {"status": "error", "message": "There's no applied change to undo."}
+        applied.sort(key=lambda m: getattr(m, "applied_at", None) or m.created, reverse=True)
+        target = applied[0]
+
+    if _is_protected(target.file_path):
+        return {"status": "denied", "message": f"Refused: {Path(target.file_path).name} is a protected file."}
+    p = Path(target.file_path)
+    if not target.original_content:
+        return {"status": "error", "message": f"No saved pre-change content for {p.name}; can't undo precisely."}
+    try:
+        if p.exists():
+            create_backup(p)
+    except Exception:
+        pass
+    result = write_file(p, target.original_content, backup=False)
+    if result.get("status") == "success":
+        target.status = "reverted"
+        _save_pending()
+        return {"status": "success",
+                "message": f"Reverted {p.name} (change {target.id}) to its pre-change state. Restart me to load it.",
+                "file": str(p), "modification_id": target.id}
+    return {"status": "error", "message": f"Failed to undo: {result.get('error')}", "modification_id": target.id}
 
 # =============================================================================
 # SCRIPT GENERATION
@@ -1038,17 +1200,23 @@ def self_mod_tool_handler(args: Dict[str, Any]) -> Dict[str, Any]:
         file_key = args.get("file")
         new_content = args.get("content")
         reason = args.get("reason", "No reason provided")
+        metadata = args.get("metadata") or {}
         
         if file_key in CORE_FILES:
             path = CORE_FILES[file_key]
         else:
             path = Path(file_key)
         
-        return propose_modification(path, new_content, reason)
+        return propose_modification(path, new_content, reason, metadata)
     
     elif action == "list_pending":
         return {"status": "ok", "pending": list_pending_modifications()}
-    
+
+    elif action == "list_all":
+        # All modifications with their real status (pending/applied/rejected/failed) — used to
+        # answer "did it apply?" accurately instead of guessing.
+        return {"status": "ok", "all": [m.to_dict() for m in _pending_modifications.values()]}
+
     elif action == "approve":
         mod_id = args.get("modification_id")
         return approve_modification(mod_id)
@@ -1064,6 +1232,11 @@ def self_mod_tool_handler(args: Dict[str, Any]) -> Dict[str, Any]:
         else:
             path = Path(file_key)
         return rollback_last_modification(path)
+
+    elif action in ("undo", "revert", "undo_last"):
+        # Undo an already-applied change (most recent, or a specific id) by restoring the
+        # exact pre-change content. This is what voice "undo that change" maps to.
+        return undo_last_applied(args.get("modification_id") or args.get("id"))
     
     elif action == "read_file":
         file_key = args.get("file")

@@ -595,6 +595,16 @@ def handle_command(cmd_data: dict) -> dict:
 
 def main():
     """Main loop - read commands from stdin, write responses to stdout"""
+    # Force UTF-8 on stdio. Node sends JSON commands as UTF-8; without this the worker decodes
+    # stdin with the default Windows console encoding (cp1252), which mojibake-corrupts any
+    # non-ASCII content (em-dashes, smart quotes, accents) — e.g. "—" became "â€"" inside
+    # self-modification file content. Reading/writing UTF-8 keeps content byte-accurate.
+    try:
+        sys.stdin.reconfigure(encoding='utf-8', errors='replace')
+        sys.stdout.reconfigure(encoding='utf-8')
+    except Exception:
+        pass
+
     # cmp-use was imported synchronously above (with fds isolated), so the registry
     # is fully populated by the time we get here.
     tool_count = len(get_tool_definitions()) if CMPUSE_AVAILABLE else 0

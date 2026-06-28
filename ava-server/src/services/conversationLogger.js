@@ -3,6 +3,7 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import logger from '../utils/logger.js';
+import { emitVoiceEvent } from './voiceBus.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -66,6 +67,23 @@ class ConversationLogger {
     };
 
     this.writeLog(logEntry);
+
+    // Mirror every turn to the live UI (voice + web chat). The UI dedupes its own
+    // locally-shown web-chat turns by content, so voice turns are what surface there.
+    try {
+      emitVoiceEvent(
+        direction === 'assistant' ? 'assistant.final' : 'transcript.final',
+        {
+          text: content,
+          endpoint: logEntry.metadata.endpoint || '',
+          responseType: logEntry.metadata.responseType || '',
+          source: logEntry.metadata.source || '',
+          messageId: logEntry.metadata.messageId,
+        },
+        'conversation'
+      );
+    } catch { /* never break logging on telemetry */ }
+
     return logEntry.metadata.messageId;
   }
 

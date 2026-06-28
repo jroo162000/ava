@@ -24,6 +24,7 @@ import queue
 import re
 import signal
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -213,9 +214,14 @@ def _is_conversational_command(text: str) -> bool:
 
 
 def _should_allow_tools(text: str) -> bool:
+    # Allow tools for any request that isn't pure self-intro chit-chat. The old
+    # fixed verb list ('open','send',...) blocked common phrasings like
+    # "read my email", "what's on my calendar", "list my files", "check my
+    # messages" because their verbs weren't in the set. The agent loop / LLM
+    # still decides whether a tool is actually needed.
     if _is_conversational_command(text):
         return False
-    return bool(set(_normalize(text).split()) & COMMAND_VERBS)
+    return True
 
 
 def _server_respond(text: str, config: dict) -> str:
@@ -414,6 +420,9 @@ class LocalVoiceRunner:
         self.last_spoken_text = ""
         self.last_accepted = False
         self.last_ignored_reason = ""
+        # Serializes all TTS output so the proactive-announcement thread never overlaps a reply.
+        self._speak_lock = threading.RLock()
+        self._announce_thread: Optional[threading.Thread] = None
 
     def close(self) -> None:
         self.running = False
@@ -651,8 +660,16 @@ class LocalVoiceRunner:
         if input_enabled:
             self.input_stream = self._open_input()
         self._initialize_wake_gate()
-        model_name = str((self.config.get("local_fallback") or {}).get("whisper_model") or "tiny.en")
-        _log(f"loading_whisper={model_name}")
+        _lf = self.config.get("local_fallback") or {}
+        model_name = str(_lf.get("whisper_model") or "tiny.en")
+        # Language: an explicit code like "en", or null/"auto" for multilingual auto-detect.
+        _lang = _lf.get("whisper_language", "en")
+        if isinstance(_lang, str) and _lang.strip().lower() in ("", "auto", "none", "multi", "multilingual"):
+            _lang = None
+        self.whisper_language = _lang
+        # Task: "transcribe" (keep the spoken language) or "translate" (always output English).
+        self.whisper_task = str(_lf.get("whisper_task") or "transcribe").strip().lower()
+        _log(f"loading_whisper={model_name} lang={self.whisper_language or 'auto'} task={self.whisper_task}")
         self.whisper = WhisperModel(model_name, device="cpu", compute_type="int8")
 
         self.tts = self._build_tts()
@@ -1220,7 +1237,8 @@ class LocalVoiceRunner:
         segments, _ = self.whisper.transcribe(
             samples,
             beam_size=1,
-            language="en",
+            language=getattr(self, "whisper_language", "en"),
+            task=getattr(self, "whisper_task", "transcribe"),
             vad_filter=True,
             condition_on_previous_text=False,
         )
@@ -1250,20 +1268,61 @@ class LocalVoiceRunner:
         self.last_spoken_text = text or ""
         if not text or self.tts is None:
             return
-        playback_rate = int((self.config.get("audio") or {}).get("playback_rate") or 44100)
-        source_rate = int(getattr(self.tts, "current_sample_rate", playback_rate) or playback_rate)
-        _log(f"state=SPEAKING text={text[:80]!r}")
+        with self._speak_lock:
+            playback_rate = int((self.config.get("audio") or {}).get("playback_rate") or 44100)
+            source_rate = int(getattr(self.tts, "current_sample_rate", playback_rate) or playback_rate)
+            _log(f"state=SPEAKING text={text[:80]!r}")
 
-        def on_chunk(pcm: bytes) -> None:
-            if not pcm:
-                return
-            if self.output_stream is not None:
-                out = _resample_pcm16(pcm, source_rate, playback_rate)
-                self.output_stream.write(out)
+            def on_chunk(pcm: bytes) -> None:
+                if not pcm:
+                    return
+                if self.output_stream is not None:
+                    out = _resample_pcm16(pcm, source_rate, playback_rate)
+                    self.output_stream.write(out)
 
-        self.tts.speak(text, on_chunk, frame_ms=100)
-        _log("state=COOLDOWN")
-        time.sleep(0.35)
+            self.tts.speak(text, on_chunk, frame_ms=100)
+            _log("state=COOLDOWN")
+            time.sleep(0.35)
+
+    def _announcements_url(self) -> str:
+        """Derive http://host:port/voice/announcements from the configured /respond URL."""
+        base = str(self.config.get("server_url") or DEFAULT_SERVER_URL)
+        base = base.rstrip("/")
+        if base.endswith("/respond"):
+            base = base[: -len("/respond")]
+        return base + "/voice/announcements"
+
+    def _announce_worker(self) -> None:
+        """Poll the server for proactive announcements (e.g. a queued code change) and speak
+        them aloud. The speak lock guarantees we never talk over a live reply; the wake gate
+        ignores AVA's own voice, so speaking while the mic is open is harmless."""
+        url = self._announcements_url()
+        interval = float(os.getenv("AVA_ANNOUNCE_POLL_SEC", "8") or "8")
+        while self.running:
+            try:
+                req = urllib.request.Request(url=url, method="GET")
+                with urllib.request.urlopen(req, timeout=8) as resp:
+                    data = json.loads(resp.read().decode("utf-8", errors="ignore"))
+                for item in (data.get("items") or []):
+                    if not self.running:
+                        break
+                    text = str(item or "").strip()
+                    if text:
+                        _log(f"announcement={text[:80]!r}")
+                        self._speak(text)
+            except Exception:
+                pass
+            time.sleep(max(2.0, interval))
+
+    def _start_announce_thread(self) -> None:
+        if os.getenv("AVA_ANNOUNCE_OFF") == "1":
+            return
+        if self._announce_thread and self._announce_thread.is_alive():
+            return
+        t = threading.Thread(target=self._announce_worker, name="ava-announce", daemon=True)
+        self._announce_thread = t
+        t.start()
+        _log("announce_thread=started")
 
     def _followup_window_sec(self) -> float:
         validation = self.config.get("validation_mode") or {}
@@ -1408,6 +1467,7 @@ class LocalVoiceRunner:
 
     def run(self) -> None:
         self.initialize()
+        self._start_announce_thread()
         start_rms, stop_rms = self._calibrate_noise()
         while self.running:
             _log("state=LISTENING")

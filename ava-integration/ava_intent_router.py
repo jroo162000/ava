@@ -135,6 +135,8 @@ class IntentRouter:
     
     def classify_intent(self, transcript: str) -> Optional[str]:
         """Classify transcript into intent category"""
+        if re.search(r'\b(?:turn\s+on|open)\s+(?:the\s+)?camera\b', transcript, re.IGNORECASE):
+            return 'camera'
         for intent, patterns in self.compiled_patterns.items():
             for pattern in patterns:
                 if pattern.search(transcript):

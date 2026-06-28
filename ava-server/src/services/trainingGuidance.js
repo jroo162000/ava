@@ -35,6 +35,16 @@ export function listRules() { return load().rules; }
 export function addRule(text) {
   const clean = String(text || '').replace(/\s+/g, ' ').trim().slice(0, MAX_LEN);
   if (!clean) return null;
+  // Narrow sanitization: drop promo/cred/API-key/shell-ish guidance so it can't steer behavior.
+  const lower = clean.toLowerCase();
+  const suspicious = [
+    'editor-in-chief', 'subscribe via rss', 'newsletter', 'promo code',
+    'api key', 'apikey', 'bearer ', 'authorization: bearer', 'client_secret', 'client secret',
+    'password', 'passphrase', 'login with your', 're-authenticate', 're-authentication',
+    'ssh ', 'ssh-keygen', 'curl ', 'wget ', 'pip install', 'npm install', 'bash -c', 'powershell '
+  ];
+  if (suspicious.some((s) => lower.includes(s))) return null;
+
   const rules = load().rules;
   // dedupe (case-insensitive)
   if (rules.some((r) => (r.text || '').toLowerCase() === clean.toLowerCase())) return rules;

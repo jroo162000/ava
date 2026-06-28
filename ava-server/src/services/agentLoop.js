@@ -40,6 +40,89 @@ const DecisionType = {
   STOP: 'stop'
 };
 
+function extractFirstJsonObject(text = '') {
+  const s = String(text || '').trim();
+  const fence = s.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  const src = fence ? fence[1] : s;
+  const start = src.indexOf('{');
+  if (start < 0) return src;
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let i = start; i < src.length; i += 1) {
+    const ch = src[i];
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+    if (ch === '\\') {
+      escaped = true;
+      continue;
+    }
+    if (ch === '"') {
+      inString = !inString;
+      continue;
+    }
+    if (inString) continue;
+    if (ch === '{') depth += 1;
+    if (ch === '}') {
+      depth -= 1;
+      if (depth === 0) return src.slice(start, i + 1);
+    }
+  }
+  return src.slice(start);
+}
+
+function escapeInvalidJsonBackslashes(text = '') {
+  return String(text || '').replace(/\\(?!["\\/bfnrtu])/g, '\\\\');
+}
+
+// Repair a JSON object that was cut off mid-output (the model hit the token limit while writing
+// a long string/reasoning field) — close any open string and any open braces/brackets so the
+// already-emitted fields (decision/tool/args, which come first) can still be parsed. This is what
+// caused the recurring "Unterminated string in JSON at position N" crashes in the decide step.
+function repairTruncatedJson(src = '') {
+  let s = String(src || '');
+  const start = s.indexOf('{');
+  if (start < 0) return s;
+  s = s.slice(start);
+  let inStr = false, esc = false;
+  const stack = [];
+  let out = '';
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    out += ch;
+    if (esc) { esc = false; continue; }
+    if (ch === '\\') { esc = true; continue; }
+    if (ch === '"') { inStr = !inStr; continue; }
+    if (inStr) continue;
+    if (ch === '{') stack.push('}');
+    else if (ch === '[') stack.push(']');
+    else if (ch === '}' || ch === ']') stack.pop();
+  }
+  if (esc) out += '\\';          // a trailing lone backslash would break the closing quote
+  if (inStr) out += '"';         // close an unterminated string
+  out = out.replace(/,\s*$/, ''); // drop a dangling comma left by truncation
+  while (stack.length) out += stack.pop();  // close open braces/brackets in order
+  return out;
+}
+
+function parseDecisionJson(text = '') {
+  const jsonStr = extractFirstJsonObject(text);
+  const attempts = [
+    jsonStr,
+    escapeInvalidJsonBackslashes(jsonStr),
+    repairTruncatedJson(jsonStr),
+    repairTruncatedJson(escapeInvalidJsonBackslashes(jsonStr)),
+  ];
+  let firstError = null;
+  for (const candidate of attempts) {
+    try { return JSON.parse(candidate); }
+    catch (e) { if (!firstError) firstError = e; }
+  }
+  throw firstError;
+}
+
 /**
  * Agent execution status
  */
@@ -89,6 +172,7 @@ function createAgentState(goal, options = {}) {
     recentHistory: options.recentHistory || [],  // recent conversation turns for context
     recentArtifacts: options.recentArtifacts || [],  // exact paths/ids from recent turns
     memoryFilter: options.memoryFilter || null,
+    eventSource: options.source || '',  // tags tool events for the live UI (e.g. 'voice')
     created_at: new Date().toISOString(),
     updated_at: new Date().toISOString(),
     final_result: null
@@ -291,6 +375,10 @@ CRITICAL RULES:
 11. **NEVER claim success for an action you did not actually perform this turn.** To create/update/delete/send anything, you MUST call the relevant tool and see a successful result in THIS run before stopping with success:true. If you only looked something up or nothing executed, do not say you did it.
 12. **SCOPE — do ONLY what the GOAL explicitly asks; then STOP.** Do NOT add unrequested follow-up actions. If asked to "take a screenshot", do NOT also open it. If asked to "create/save a file", do NOT also open or read it. If asked to "send an email", do NOT also read the inbox. As soon as the user's explicit request is satisfied by ONE successful tool result, choose "stop" — do not keep acting "to be helpful".
 13. **RECALL — if the GOAL asks what was previously discussed/decided/said (e.g. "what did we discuss about X"), call memory_search with the key topic as the query (do NOT ask the user to narrow it down first). Only after a search returns nothing relevant should you ask for more detail.**
+14. **QUESTIONS / DIAGNOSE / STATUS — if the GOAL is a question, asks you to explain/diagnose/report, or is a vague follow-up about a previous step (e.g. "what is the result", "what happened", "tell me what to do", "why did that fail", "diagnose the issue"), answer from the CURRENT STATE, the Last result, and context with "stop" — or, for a genuine diagnosis, call the RELEVANT diagnostic tool (e.g. self_awareness). Do NOT substitute an unrelated action.**
+15. **NEVER open a folder, file, app, or browser the user did NOT explicitly name in THIS goal. Opening Downloads/Documents/Explorer is valid ONLY when the user clearly asked to open that exact place. Do not use opening a folder/file as a stand-in for something else.**
+16. **NO GUESSING / ASK WHEN UNSURE — if the request is unclear, garbled, ambiguous, or you can't tell what action the user wants, do NOT run any tool and do NOT open File Explorer, a folder, or an app as a fallback. Choose "ask_user" and ask a specific clarifying question. A wrong or random action (especially opening Explorer/Downloads) is far worse than asking. Opening Explorer/Downloads/an app is ONLY valid when the user explicitly asked to open that exact thing.**
+17. **FORMS & APPLICATIONS (web).** To fill out ANY web form/application/portal: (a) call profile_ops get_all FIRST to autofill the user's saved info (name, email, phone, address, etc.); (b) browser_automation navigate to the page, then get_fields to see the REAL fields and buttons; (c) for any required field you do NOT already have, FIND it by searching the user's own sources — comm_ops search (Gmail) and fs_find / fs_read (files/documents on this PC) — BEFORE asking them, and save new facts with profile_ops set so you have them next time; (d) fill with browser_automation fill_form (text + <select>) and upload_file for attachments (if the file is in email, download it first with comm_ops download_attachment, then pass its path), then click_text to submit. For CUSTOM dropdowns / date pickers, use click_text to open the control then click the option. For MULTI-STEP forms, fill the page, click_text the Next button, then get_fields again and continue. If the page shows a CAPTCHA / "verify you are human" / login challenge you cannot complete legitimately, do NOT try to bypass it — stop and tell the user you need them to finish that one step. You DO have the ability to fill out and submit web forms/applications — NEVER tell the user you "can't apply" or that they must do it themselves. If they say "apply for jobs" / "fill out the applications" but you don't have a specific job link or site, ASK them for the URL or which site (ONE question) — do NOT stall, deny, or open File Explorer.
 
 What is your next action?`;
 }
@@ -334,18 +422,13 @@ async function decide(state, observations) {
       { role: 'user', content: prompt }
     ], {
       temperature: 0.3,
-      max_tokens: 500
+      max_tokens: parseInt(process.env.AVA_DECISION_MAX_TOKENS || '', 10) || 4000,  // headroom so the decision JSON doesn't truncate mid-string
+      model: process.env.AVA_DECISION_MODEL || 'gpt-5.1'  // upgraded decision model
     });
 
     const text = response.text || response.content || '';
     
-    let jsonStr = text;
-    const jsonMatch = text.match(/\{[\s\S]*\}/);
-    if (jsonMatch) {
-      jsonStr = jsonMatch[0];
-    }
-
-    const decision = JSON.parse(jsonStr);
+    const decision = parseDecisionJson(text);
 
     // Tolerant recovery: the model sometimes puts the TOOL NAME in `decision`
     // (e.g. decision:"memory_search") instead of decision:"tool_call", tool:"memory_search".
@@ -484,8 +567,23 @@ async function act(state, decision) {
           break;
         }
 
+        // GUARD: never open File Explorer / a folder / an app the user did NOT actually
+        // mention. When a request is unclear the model used to default to opening
+        // Explorer/Downloads — block that and ask for clarity instead.
+        if (decision.tool === 'open_item') {
+          const _tgt = String((action.args && (action.args.target || action.args.path)) || '').toLowerCase();
+          const _goal = String(state.goal || '').toLowerCase();
+          const _generic = /\b(explorer|file explorer|downloads?|documents?|desktop|pictures?|music|videos?|this pc|my computer|home|folder|files?)\b/;
+          if (_generic.test(_tgt) && !_generic.test(_goal)) {
+            state.status = AgentStatus.SUCCESS;
+            state.final_result = "I'm not sure what you'd like me to do — could you say it a different way, or tell me the specific task? For example: \"fill out this application: <link>\", \"search my email for <thing>\", or \"open my downloads folder\".";
+            logger.info('[agent] Blocked generic open_item not in goal; asking for clarity', { target: _tgt });
+            break;
+          }
+        }
+
         logger.info('[agent] Executing tool', { tool: decision.tool, args: action.args });
-        const toolResult = await toolsService.executeTool(decision.tool, action.args);
+        const toolResult = await toolsService.executeTool(decision.tool, action.args, false, { source: state.eventSource || '' });
         result = toolResult.result || toolResult;
         try {
           const { getAutonomy } = autonomyLib; const autonomy = getAutonomy(logger);

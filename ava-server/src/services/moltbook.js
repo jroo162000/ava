@@ -19,6 +19,7 @@ class MoltbookService {
     this.credentials = null;
     this.learnings = [];
     this.lastFeedCheck = null;
+    this.rateLimitedUntil = 0;
     this.loadCredentials();
     this.loadLearnings();
   }
@@ -53,7 +54,7 @@ class MoltbookService {
         fs.mkdirSync(dir, { recursive: true });
       }
       fs.writeFileSync(STATE_PATH, JSON.stringify({
-        learnings: this.learnings.slice(-100), // Keep last 100 learnings
+        learnings: this.learnings.slice(-5000), // Keep broad Moltbook context for proposal generation
         lastFeedCheck: this.lastFeedCheck,
         updatedAt: new Date().toISOString()
       }, null, 2));
@@ -74,9 +75,25 @@ class MoltbookService {
     return !!this.apiKey;
   }
 
+  get isRateLimited() {
+    return Date.now() < (this.rateLimitedUntil || 0);
+  }
+
+  get rateLimitResetAt() {
+    return this.rateLimitedUntil || 0;
+  }
+
   async apiRequest(endpoint, method = 'GET', data = null) {
     if (!this.apiKey) {
       return { success: false, error: 'Moltbook not configured - no API key' };
+    }
+
+    if (this.isRateLimited) {
+      return {
+        success: false,
+        error: 'rate_limited_local_cooldown',
+        message: `Cooling down until ${new Date(this.rateLimitedUntil).toISOString()}`
+      };
     }
 
     const url = `${MOLTBOOK_API}/${endpoint.replace(/^\//, '')}`;
@@ -94,7 +111,34 @@ class MoltbookService {
 
     try {
       const response = await fetch(url, options);
-      const result = await response.json();
+      let result = {};
+      try {
+        result = await response.json();
+      } catch {
+        result = { message: response.statusText };
+      }
+      if (!response.ok) {
+        result = {
+          ...result,
+          success: false,
+          statusCode: result.statusCode || response.status,
+          error: result.error || result.message || response.statusText || `HTTP ${response.status}`,
+        };
+      }
+      if ((result && result.error === 'rate_limited') || response.status === 429 || result.statusCode === 429) {
+        const retryAfter = Number(result.retry_after_seconds || 0);
+        const resetAt = result.reset_at ? Date.parse(result.reset_at) : 0;
+        const cooldownMs = retryAfter > 0
+          ? retryAfter * 1000
+          : resetAt > Date.now()
+            ? resetAt - Date.now()
+            : Math.max(5, parseInt(process.env.AVA_MOLTBOOK_RATE_LIMIT_COOLDOWN_MIN || '15', 10)) * 60 * 1000;
+        this.rateLimitedUntil = Date.now() + cooldownMs;
+        logger.warn('[moltbook] Rate limited; cooling down', {
+          endpoint,
+          until: new Date(this.rateLimitedUntil).toISOString()
+        });
+      }
       return result;
     } catch (e) {
       logger.error('[moltbook] API request failed', { endpoint, error: e.message });
@@ -136,11 +180,29 @@ class MoltbookService {
   }
 
   async post(submolt, title, content) {
-    const result = await this.apiRequest('posts', 'POST', { submolt, title, content });
-    if (result.success) {
-      logger.info('[moltbook] Posted successfully', { submolt, title });
+    // The Moltbook API names the community field `submolt_name` (a string) — NOT `submolt`.
+    // Sending `submolt` alone => 400 "Bad Request" (validation: "submolt_name must be a string").
+    // Default to "general" so a bare "make a post" still has a valid target community.
+    const community = String(submolt || 'general').trim().replace(/^m\//, '') || 'general';
+    const safeTitle = String(title || '').trim().slice(0, 300) || 'A note from AVA';
+    const result = await this.apiRequest('posts', 'POST', {
+      submolt_name: community,
+      submolt: community,   // sent for backward-compat; the API uses submolt_name
+      title: safeTitle,
+      content: String(content || '').trim(),
+    });
+    if (result.success || result.id || result.post) {
+      logger.info('[moltbook] Posted successfully', { community, title: safeTitle });
+    } else {
+      logger.warn('[moltbook] Post failed', { community, error: result.error, detail: result.message });
     }
     return result;
+  }
+
+  // Submit an answer to a post's verification challenge. The answer comes from the USER — AVA
+  // does NOT auto-solve the obfuscated challenge. Publishes the post when the answer is correct.
+  async submitVerification(verificationCode, answer) {
+    return this.apiRequest('verify', 'POST', { verification_code: verificationCode, answer: String(answer).trim() });
   }
 
   async comment(postId, content, parentCommentId = null) {
@@ -176,6 +238,30 @@ class MoltbookService {
       return result.notifications;
     }
     return [];
+  }
+
+  async getHome() {
+    return this.apiRequest('home');
+  }
+
+  async getPostComments(postId, limit = 100) {
+    const result = await this.apiRequest(`posts/${postId}/comments?sort=new&limit=${limit}`);
+    if (result.success && Array.isArray(result.comments)) return result.comments;
+    return [];
+  }
+
+  async markPostNotificationsRead(postId) {
+    return this.apiRequest(`notifications/read-by-post/${postId}`, 'POST');
+  }
+
+  recordLearning(learning) {
+    if (!learning || !learning.postId || !learning.summary) return false;
+    const key = `${learning.postId}:${learning.commentId || learning.title || learning.summary.slice(0, 60)}`;
+    const exists = this.learnings.some(l => (l.key || `${l.postId}:${l.commentId || l.title || String(l.summary || '').slice(0, 60)}`) === key);
+    if (exists) return false;
+    this.learnings.push({ key, learnedAt: new Date().toISOString(), upvotes: 0, ...learning });
+    this.saveLearnings();
+    return true;
   }
 
   async getPost(postId) {
@@ -227,8 +313,33 @@ class MoltbookService {
     const newLearnings = [];
     const now = new Date().toISOString();
 
+    // Very lightweight spam/adversarial filter: skip obvious promos/noise before they become learnings
+    const isNoisy = (post) => {
+      const content = (post?.content || '').toLowerCase();
+      const title = (post?.title || '').toLowerCase();
+      const joined = `${title} ${content}`;
+
+      // Heuristics: external links + promo-y phrases, or extremely long boilerplate
+      if (/https?:\/\//.test(joined) && /subscribe|signup|sign up|promotion|sponsor|sponsored|affiliate|referral/.test(joined)) {
+        return true;
+      }
+
+      // Very long low-signal blobs (e.g. boilerplate dumps)
+      if (content.length > 5000 && !/design|architecture|implementation|bug|fix|lesson|retrospective/.test(content)) {
+        return true;
+      }
+
+      // Simple offensive content guard
+      if (/rdrama_ebooks|hate speech|slur|kill yourself|kys/.test(joined)) {
+        return true;
+      }
+
+      return false;
+    };
+
     for (const post of posts) {
       if (!post || !post.title) continue;
+      if (isNoisy(post)) continue;
 
       const submolt = post.submolt?.name || 'general';
       const author = post.author?.name || 'unknown';

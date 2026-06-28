@@ -142,3 +142,36 @@ ava-integration/training/
 
 # Separate sub-app (its own project; contains its own .env)
 AVa's reasoning/
+
+# === Secrets — NEVER commit (API keys, credentials, certs) ===
+# (Belt-and-suspenders on top of the .env rule above.)
+.env
+.env.*
+!.env.template
+!.env.example
+**/secrets.json
+**/secret.json
+*secrets*.json
+*.secret
+**/credentials.json
+**/credential.json
+*.pem
+*.key
+*.p12
+*.pfx
+*.pkcs12
+id_rsa
+id_rsa.*
+id_ed25519
+id_ed25519.*
+*.keystore
+*.jks
+service-account*.json
+gcp-*.json
+*apikey*
+*api_key*
+
+# === Self-snapshot backups (regenerable; duplicate code) ===
+ava-integration/backup/
+backup_*/
+**/snapshots/
