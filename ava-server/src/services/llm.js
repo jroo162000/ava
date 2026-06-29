@@ -430,7 +430,7 @@ class LLMService {
       { name: 'claude/' + (env.AVA_SM_CLAUDE || 'claude-opus-4-8'), run: () => this.createCompletionClaude({ messages: conv, system, maxTokens, model: env.AVA_SM_CLAUDE || 'claude-opus-4-8' }) },
       ...openAIModels.map(model => ({ name: 'openai/' + model, run: () => this._openaiCompat({ baseURL: 'https://api.openai.com/v1', apiKey: key('OPENAI_API_KEY'), model, system, messages: conv, maxTokens }) })),
       { name: 'gemini/' + (env.AVA_SM_GEMINI || 'gemini-pro-latest'), run: () => this.createCompletionGemini({ messages: conv, system, maxTokens, model: env.AVA_SM_GEMINI || 'gemini-pro-latest' }) },
-      { name: 'deepseek/' + (env.AVA_SM_DEEPSEEK || 'deepseek-reasoner'), run: () => this._openaiCompat({ baseURL: 'https://api.deepseek.com', apiKey: key('DEEPSEEK_API_KEY'), model: env.AVA_SM_DEEPSEEK || 'deepseek-reasoner', system, messages: conv, maxTokens }) },
+      { name: 'deepseek/' + (env.AVA_SM_DEEPSEEK || 'deepseek-chat'), run: () => this._openaiCompat({ baseURL: 'https://api.deepseek.com', apiKey: key('DEEPSEEK_API_KEY'), model: env.AVA_SM_DEEPSEEK || 'deepseek-chat', system, messages: conv, maxTokens }) },
       { name: 'grok/' + (env.AVA_SM_GROK || 'grok-4'), run: () => this._openaiCompat({ baseURL: 'https://api.x.ai/v1', apiKey: key('GROK_API_KEY'), model: env.AVA_SM_GROK || 'grok-4', system, messages: conv, maxTokens }) },
     ];
     const errs = [];
@@ -464,7 +464,7 @@ class LLMService {
       claude: env.AVA_SM_CLAUDE || 'claude-opus-4-8',
       openai: [...new Set([env.AVA_SM_OPENAI || 'gpt-5.5', env.AVA_SM_OPENAI_FALLBACK || 'gpt-5.1'])],
       gemini: env.AVA_SM_GEMINI || 'gemini-pro-latest',
-      deepseek: env.AVA_SM_DEEPSEEK || 'deepseek-reasoner',
+      deepseek: env.AVA_SM_DEEPSEEK || 'deepseek-chat',
       grok: env.AVA_SM_GROK || 'grok-4',
     };
     const DEFAULT_ORDER = ['claude', 'openai', 'gemini', 'deepseek', 'grok', 'groq'];
