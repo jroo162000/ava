@@ -1,9 +1,16 @@
 // subagentRoles.js — named SUBAGENT ROLES, each with a description, a SCOPED toolset (allow/deny,
 // Claude-SDK style), and a specialized system prompt. The lead assigns a role per subtask; the
-// agent loop then restricts that subagent to its role's tools and gives it the role's instructions.
-// Tool patterns support exact names and a trailing '*' wildcard (e.g. "fs_*"). allow:null = all tools.
+// agent loop restricts that subagent to its role's tools and gives it the role's instructions.
+//
+// Roles are DYNAMIC + PERSISTENT: beyond the built-in set, AVA can CREATE new role types on the fly
+// (when no existing role fits a task). Custom roles are saved to data/subagent-roles.json and stay
+// available for reuse across restarts. Built-in roles can't be overridden. Tool patterns support
+// exact names and a trailing '*' wildcard (e.g. "fs_*"); allow:null = full toolset.
+import fs from 'fs';
+import path from 'path';
+import logger from '../utils/logger.js';
 
-const ROLES = {
+const BUILTIN = {
   researcher: {
     description: 'Gathers and analyzes information — web search, reading files/email/screen, memory. Does NOT modify the system or build things.',
     allow: ['web_search', 'net_ops', 'memory_search', 'analysis_ops', 'vision_ops', 'screen_ops', 'ocr_ops', 'file_resolve', 'fs_ops', 'self_diagnostics', 'self_awareness', 'sys_ops', 'comm_ops', 'browser_automation'],
@@ -36,28 +43,79 @@ const ROLES = {
   },
   general: {
     description: 'General-purpose subagent with the FULL toolset (use when a task spans many categories).',
-    allow: null,  // no restriction
+    allow: null,
     prompt: 'You are a general-purpose subagent with the full toolset. Use whatever tools your task needs.',
   },
 };
 
 const DEFAULT_ROLE = 'general';
+const CUSTOM_FILE = path.join(process.cwd(), 'data', 'subagent-roles.json');
+
+function _loadCustom() {
+  try { if (fs.existsSync(CUSTOM_FILE)) { const j = JSON.parse(fs.readFileSync(CUSTOM_FILE, 'utf8')); if (j && typeof j === 'object') return j; } } catch { /* ignore */ }
+  return {};
+}
+let _custom = _loadCustom();
+
+function _saveCustom() {
+  try { fs.mkdirSync(path.dirname(CUSTOM_FILE), { recursive: true }); fs.writeFileSync(CUSTOM_FILE, JSON.stringify(_custom, null, 2)); }
+  catch (e) { try { logger.warn('[roles] save failed', { error: e.message }); } catch { /* ignore */ } }
+}
+
+function _slug(name) {
+  return String(name || '').toLowerCase().trim().replace(/[^a-z0-9_-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40);
+}
 
 function getRole(name) {
-  const key = String(name || '').toLowerCase().trim();
-  return ROLES[key] ? { name: key, ...ROLES[key] } : { name: DEFAULT_ROLE, ...ROLES[DEFAULT_ROLE] };
+  const key = _slug(name);
+  if (_custom[key]) return { name: key, custom: true, ..._custom[key] };
+  if (BUILTIN[key]) return { name: key, ...BUILTIN[key] };
+  return { name: DEFAULT_ROLE, ...BUILTIN[DEFAULT_ROLE] };
+}
+
+function roleExists(name) {
+  const key = _slug(name);
+  return !!(BUILTIN[key] || _custom[key]);
+}
+
+// Create or update a CUSTOM role and PERSIST it. Built-in role names can't be overridden.
+function createRole({ name, description, prompt, allow, tools, deny }) {
+  const key = _slug(name);
+  if (!key) return { ok: false, error: 'invalid role name' };
+  if (BUILTIN[key]) return { ok: false, error: `'${key}' is a built-in role and can't be overridden` };
+  const allowList = Array.isArray(allow) ? allow : (Array.isArray(tools) ? tools : null);
+  _custom[key] = {
+    description: String(description || `Custom role: ${key}`).slice(0, 300),
+    prompt: String(prompt || `You are a ${key} subagent. Do your assigned task and report a clear, complete result.`).slice(0, 1500),
+    allow: (allowList && allowList.length) ? allowList.map(t => String(t).slice(0, 60)).slice(0, 40) : null,
+    ...(Array.isArray(deny) && deny.length ? { deny: deny.map(t => String(t).slice(0, 60)).slice(0, 40) } : {}),
+    createdAt: new Date().toISOString(),
+  };
+  _saveCustom();
+  try { logger.info('[roles] custom role saved', { role: key, tools: _custom[key].allow ? _custom[key].allow.length : 'all' }); } catch { /* ignore */ }
+  return { ok: true, name: key, custom: true, ..._custom[key] };
+}
+
+function deleteRole(name) {
+  const key = _slug(name);
+  if (!_custom[key]) return { ok: false, error: `'${key}' is not a custom role` };
+  delete _custom[key];
+  _saveCustom();
+  return { ok: true, deleted: key };
 }
 
 function listRoles() {
-  return Object.entries(ROLES).map(([name, r]) => ({
-    name, description: r.description, tools: r.allow ? r.allow.length : 'all',
-  }));
+  const out = Object.entries(BUILTIN).map(([name, r]) => ({ name, description: r.description, tools: r.allow ? r.allow.length : 'all', builtin: true }));
+  for (const [name, r] of Object.entries(_custom)) out.push({ name, description: r.description, tools: r.allow ? r.allow.length : 'all', builtin: false });
+  return out;
 }
 
 // One-line "name — description" list for prompting the lead.
 function rolesForPrompt() {
-  return Object.entries(ROLES).map(([name, r]) => `  - ${name}: ${r.description}`).join('\n');
+  const lines = Object.entries(BUILTIN).map(([name, r]) => `  - ${name}: ${r.description}`);
+  for (const [name, r] of Object.entries(_custom)) lines.push(`  - ${name} (custom): ${r.description}`);
+  return lines.join('\n');
 }
 
-export { ROLES, DEFAULT_ROLE, getRole, listRoles, rolesForPrompt };
-export default { ROLES, DEFAULT_ROLE, getRole, listRoles, rolesForPrompt };
+export { BUILTIN, DEFAULT_ROLE, getRole, roleExists, createRole, deleteRole, listRoles, rolesForPrompt };
+export default { BUILTIN, DEFAULT_ROLE, getRole, roleExists, createRole, deleteRole, listRoles, rolesForPrompt };

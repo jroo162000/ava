@@ -94,6 +94,18 @@ router.get('/agent/roles', (_req, res) => {
   res.json({ ok: true, roles: subagentRoles.listRoles() });
 });
 
+/** Create + SAVE a custom subagent role. POST /agent/roles  Body: {name, description, prompt, tools|allow, deny} */
+router.post('/agent/roles', (req, res) => {
+  try {
+    const { name, description, prompt, tools, allow, deny } = req.body || {};
+    if (!name) return res.status(400).json({ ok: false, error: 'name required' });
+    res.json(subagentRoles.createRole({ name, description, prompt, tools, allow, deny }));
+  } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+});
+
+/** Delete a custom subagent role (built-ins can't be deleted). DELETE /agent/roles/:name */
+router.delete('/agent/roles/:name', (req, res) => { res.json(subagentRoles.deleteRole(req.params.name)); });
+
 /** Recent subagent orchestration runs. GET /agent/orchestrations (also before /agent/:id). */
 router.get('/agent/orchestrations', (_req, res) => {
   res.json({ ok: true, recent: subagentOrchestrator.recent(20) });

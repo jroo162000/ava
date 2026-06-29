@@ -48,12 +48,14 @@ async function planSubtasks(goal) {
     'Assign each subtask the best-fitting ROLE from this list — each role has its OWN SCOPED toolset:',
     subagentRoles.rolesForPrompt(),
     "A subagent only gets its role's tools, so pick the role that matches the work; use \"general\" when it spans many categories.",
+    'If NONE of these roles fit a subtask, DEFINE a NEW role: give it a fresh "role" name plus a "define" object with a description, specialized instructions (prompt), and the focused list of tools it needs. New roles are SAVED for reuse later.',
     'Split ONLY into truly independent, parallelizable pieces. If the goal is a single coherent task, return ONE subtask.',
-    'Use 1-6 subtasks. Output STRICT JSON only: {"subtasks":[{"role":"<role name from the list>","goal":"<one concrete instruction for that subagent>"}]}',
+    'Use 1-6 subtasks. Output STRICT JSON only: {"subtasks":[{"role":"<existing or new role name>","goal":"<instruction>","define":{"description":"...","prompt":"specialized instructions","tools":["tool_a","tool_b"]}}]}  — include "define" ONLY when inventing a new role.',
   ].join('\n');
   try {
-    const r = await llmService.chat([{ role: 'system', content: sys }, { role: 'user', content: `GOAL: ${goal}` }], { temperature: 0.3, max_tokens: 900 });
-    return _normalizeSubs((_parseLoose(r.text || r.content || '') || {}).subtasks);
+    const r = await llmService.chat([{ role: 'system', content: sys }, { role: 'user', content: `GOAL: ${goal}` }], { temperature: 0.3, max_tokens: 1100 });
+    const j = _parseLoose(r.text || r.content || '') || {};
+    return Array.isArray(j.subtasks) ? j.subtasks.filter(s => s && s.goal).slice(0, MAX_SUBAGENTS) : [];
   } catch (e) { logger.warn('[subagents] planSubtasks failed', { error: e.message }); return []; }
 }
 
@@ -102,13 +104,21 @@ async function synthesize(goal, results) {
 // MAIN: AVA leads — plan (if needed) -> spawn subagents (parallel, bounded) -> collect -> synthesize.
 async function orchestrate({ goal, subtasks, sharedContext, synthesize: doSynth = true } = {}) {
   const id = 'orch-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 5);
-  let subs = (Array.isArray(subtasks) && subtasks.length) ? _normalizeSubs(subtasks) : await planSubtasks(String(goal || ''));
+  const raw = (Array.isArray(subtasks) && subtasks.length) ? subtasks : await planSubtasks(String(goal || ''));
+  // Create + PERSIST any inline-DEFINED roles first, so brand-new subagent types are saved and reusable.
+  const createdRoles = [];
+  for (const s of (raw || [])) {
+    if (s && s.define && s.role && !subagentRoles.roleExists(s.role)) {
+      try { const c = subagentRoles.createRole({ name: s.role, ...s.define }); if (c.ok) createdRoles.push(c.name); } catch { /* ignore */ }
+    }
+  }
+  const subs = _normalizeSubs(raw);
   if (!subs.length) return { ok: false, id, error: "I couldn't break that into subtasks to delegate." };
-  logger.info('[subagents] lead spawning subagents', { id, count: subs.length, roles: subs.map(s => s.role) });
+  logger.info('[subagents] lead spawning subagents', { id, count: subs.length, roles: subs.map(s => s.role), createdRoles });
   const t0 = Date.now();
   const results = await _runAll(subs, sharedContext);
   const synthesis = doSynth ? await synthesize(String(goal || ''), results) : '';
-  const rec = { id, goal: String(goal || ''), createdAt: new Date().toISOString(), ms: Date.now() - t0, subagents: results, synthesis };
+  const rec = { id, goal: String(goal || ''), createdAt: new Date().toISOString(), ms: Date.now() - t0, createdRoles, subagents: results, synthesis };
   _ring.push({ id, goal: rec.goal, count: results.length, at: rec.createdAt });
   if (_ring.length > 50) _ring.shift();
   _persist(rec);

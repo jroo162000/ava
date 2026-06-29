@@ -388,10 +388,10 @@ For SEVERAL INDEPENDENT read-only lookups at once (none depending on another's r
 Use "parallel" ONLY for read-only tools that change nothing and don't depend on each other. Anything that writes/sends/opens/deletes or needs confirmation must be a single "tool_call".
 ${state.canDelegate ? `
 You are the LEAD agent. For a COMPLEX goal with several INDEPENDENT parts, you may DELEGATE to subagents — each is a full agent that handles one part in parallel with a SCOPED toolset for its role; then you synthesize their results:
-{"decision": "delegate", "subtasks": [{"role": "<role>", "goal": "<one focused instruction>"}, ...], "reasoning": "why split it this way"}
+{"decision": "delegate", "subtasks": [{"role": "<existing or NEW role>", "goal": "<one focused instruction>", "define": {"description":"...","prompt":"specialized instructions","tools":["tool_a","tool_b"]}}, ...], "reasoning": "why split it this way"}
 Available subagent roles (each gets only its own scoped tools):
 ${subagentRoles.rolesForPrompt()}
-Pick the role that best fits each subtask; use "general" if it spans many categories. Delegate only when the parts are genuinely independent and the goal is big enough to benefit (research several things at once, build multiple components in parallel). For a single simple task, just do it yourself. After the subagents return, you'll synthesize a final answer.
+Pick the role that best fits each subtask (use "general" if it spans many categories). If NONE of them fit, INVENT a new role: give it a fresh name plus a "define" object (description, specialized prompt, and the focused tools it needs) — include "define" ONLY when creating a new role; it is SAVED for reuse later. Delegate only when the parts are genuinely independent and the goal is big enough to benefit. For a single simple task, just do it yourself. After the subagents return, you'll synthesize a final answer.
 ` : ''}
 For clarification needed:
 {"decision": "ask_user", "question": "what you need to know", "reasoning": "why you need this"}
