@@ -145,6 +145,9 @@ ava-integration/training/
 # Separate sub-app (its own project; contains its own .env)
 AVa's reasoning/
 
+# Separate 3D-UI builds (Gemini/Antigravity projects with their own tooling; do NOT commit here)
+ava-ui-3d*/
+
 # === Secrets — NEVER commit (API keys, credentials, certs) ===
 # (Belt-and-suspenders on top of the .env rule above.)
 .env
