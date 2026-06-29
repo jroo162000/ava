@@ -195,6 +195,8 @@ class LLMService {
       case 'gemini': return config.GOOGLE_API_KEY || config.GEMINI_API_KEY;
       case 'claude': return config.ANTHROPIC_API_KEY || config.CLAUDE_API_KEY;
       case 'groq': return config.GROQ_API_KEY;
+      case 'deepseek': return config.DEEPSEEK_API_KEY || process.env.DEEPSEEK_API_KEY;
+      case 'grok': return config.GROK_API_KEY || process.env.GROK_API_KEY;
       default: return null;
     }
   }
@@ -263,7 +265,9 @@ class LLMService {
   async createCompletionGemini({ messages, system, temperature = 0.7, maxTokens = 1000, model }) {
     const apiKey = this.getApiKey('gemini');
     if (!apiKey) throw new Error('Gemini API key not configured');
-    const mdl = model || 'gemini-2.0-flash';
+    // Default to the SAME recent model as the solidified self-mod chain — NOT the retired
+    // gemini-2.0-flash (which 404s: "model no longer available"). Overridable via AVA_SM_GEMINI.
+    const mdl = model || process.env.AVA_SM_GEMINI || 'gemini-pro-latest';
 
     const systemMessage = system || SYSTEM_PROMPT;
 
@@ -449,45 +453,62 @@ class LLMService {
   }
 
   async createCompletion(options) {
-    // Try providers in order until one works
-    let providers = ['openai', 'gemini', 'claude', 'groq'];
+    // CANONICAL FALLBACK CHAIN — matches the solidified self-mod chain (chatSelfMod) exactly:
+    // Claude (opus 4.8) -> OpenAI (gpt-5.5, gpt-5.1) -> Gemini (pro-latest) -> DeepSeek (reasoner)
+    // -> Grok (4), with Groq as a final extra. Each provider uses its canonical model from the same
+    // AVA_SM_* env so the two chains never drift. When most providers are quota/credit-exhausted,
+    // it keeps falling through instead of dying after gemini (the old bug that 404'd on gemini-2.0
+    // and never reached DeepSeek/Grok).
+    const env = process.env;
+    const SM = {
+      claude: env.AVA_SM_CLAUDE || 'claude-opus-4-8',
+      openai: [...new Set([env.AVA_SM_OPENAI || 'gpt-5.5', env.AVA_SM_OPENAI_FALLBACK || 'gpt-5.1'])],
+      gemini: env.AVA_SM_GEMINI || 'gemini-pro-latest',
+      deepseek: env.AVA_SM_DEEPSEEK || 'deepseek-reasoner',
+      grok: env.AVA_SM_GROK || 'grok-4',
+    };
+    const DEFAULT_ORDER = ['claude', 'openai', 'gemini', 'deepseek', 'grok', 'groq'];
     const errors = [];
 
-    // Route by model FAMILY when a model is named (e.g. "claude-opus-4-8" -> claude). When a
-    // family is forced, do NOT fall back to a provider that can't run the requested model.
+    // Route by model FAMILY when a specific model is named (e.g. the agent decision forces gpt-5.1):
+    // try that family FIRST, then continue down the canonical chain for the rest.
     const mdl = String(options.model || '');
     let forced = null;
     if (/^claude/i.test(mdl)) forced = 'claude';
     else if (/^(gpt|o[0-9]|text-)/i.test(mdl)) forced = 'openai';
     else if (/^gemini/i.test(mdl)) forced = 'gemini';
-
-    if (forced) {
-      // Try the requested family first, then fall back to other available providers (using THEIR
-      // own default model) so self-mod keeps working if e.g. the Claude account is out of credits.
-      providers = [forced, ...['openai', 'gemini', 'claude', 'groq'].filter(p => p !== forced)];
-    } else if (this.provider) {
-      const idx = providers.indexOf(this.provider);
-      if (idx > 0) {
-        providers.splice(idx, 1);
-        providers.unshift(this.provider);
-      }
-    }
+    else if (/^deepseek/i.test(mdl)) forced = 'deepseek';
+    else if (/^grok/i.test(mdl)) forced = 'grok';
+    const providers = forced ? [forced, ...DEFAULT_ORDER.filter(p => p !== forced)] : DEFAULT_ORDER;
 
     for (const provider of providers) {
       if (!this.getApiKey(provider)) continue;
-      // For a fallback provider, drop the requested (family-specific) model so it uses its default.
-      const opts = (forced && provider !== forced) ? { ...options, model: undefined } : options;
-
+      const isForced = forced && provider === forced;  // use the requested model only for the forced family
       try {
         switch (provider) {
-          case 'openai':
-            return await this.createCompletionOpenAI(opts);
-          case 'gemini':
-            return await this.createCompletionGemini(opts);
           case 'claude':
-            return await this.createCompletionClaude(opts);
+            return await this.createCompletionClaude({ ...options, model: isForced ? options.model : SM.claude });
+          case 'openai': {
+            const models = isForced && options.model ? [options.model] : SM.openai;
+            let lastErr;
+            for (const m of models) {
+              try { return await this.createCompletionOpenAI({ ...options, model: m }); }
+              catch (e) { lastErr = e; }
+            }
+            throw lastErr || new Error('openai failed');
+          }
+          case 'gemini':
+            return await this.createCompletionGemini({ ...options, model: isForced ? options.model : SM.gemini });
+          case 'deepseek': {
+            const r = await this._openaiCompat({ baseURL: 'https://api.deepseek.com', apiKey: this.getApiKey('deepseek'), model: isForced ? options.model : SM.deepseek, system: options.system, messages: options.messages, maxTokens: options.maxTokens });
+            return { ...r, provider: 'deepseek' };
+          }
+          case 'grok': {
+            const r = await this._openaiCompat({ baseURL: 'https://api.x.ai/v1', apiKey: this.getApiKey('grok'), model: isForced ? options.model : SM.grok, system: options.system, messages: options.messages, maxTokens: options.maxTokens });
+            return { ...r, provider: 'grok' };
+          }
           case 'groq':
-            return await this.createCompletionGroq(opts);
+            return await this.createCompletionGroq(options);
         }
       } catch (error) {
         errors.push(`${provider}: ${error.message}`);
