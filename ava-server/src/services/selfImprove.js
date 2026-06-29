@@ -1,22 +1,40 @@
 // selfImprove.js — AVA's autonomous self-improvement loop.
 //
 // Gathers improvement signals (tracked issues from Moltbook, recent failed commands from the
-// conversation logs, and code diagnostics), asks the decision model to draft ONE small, safe,
-// concrete code change, and stages it as a *proposed* self-modification. Nothing is ever
-// applied here — every proposal lands in the same pending store the UI panel and voice
-// approval read from, so the user reviews the diff and approves (UI button or voice) first.
+// conversation logs, and code diagnostics), asks the decision model to draft a SIGNIFICANT, safe
+// improvement (which may be a larger, multi-part change), and stages it as a *proposed*
+// self-modification. Nothing is ever applied here — every proposal lands in the same pending store
+// the UI panel and voice approval read from, so the user reviews the diff and approves first.
 //
-// Safety: changes are expressed as a single exact find/replace that must appear exactly once
-// in the target file (no blind full-file rewrites). The approval gate (ava_self_modification's
+// Safety: a change is expressed as ONE OR MORE exact find/replace edits, each of which must appear
+// exactly once in the target file and is applied in order (never a blind full-file rewrite); the
+// combined result is syntax-checked before proposing, and the approval gate (ava_self_modification's
 // PROTECTED_BASENAMES) independently refuses proposals against the approval/safety code.
 
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 import logger from '../utils/logger.js';
 import llmService from './llm.js';
 import pythonWorker from './pythonWorker.js';
 import announceQueue from './announceQueue.js';
 import personaSvc from './persona.js';
+import { verifyFileSyntax } from '../utils/verifyFileSyntax.js';
+
+// Syntax-check candidate full-file CONTENT before proposing it. Writes a throwaway file NEXT TO the
+// target (so node --check / py_compile inherit the project's ESM / package context, which an
+// os.tmpdir() copy would not) and removes it immediately. Best-effort: never blocks on checker error.
+async function _syntaxCheckContent(targetPath, content) {
+  try {
+    const dir = path.dirname(targetPath);
+    const ext = path.extname(targetPath) || '.txt';
+    const tmp = path.join(dir, `.ava_check_${Date.now()}_${Math.random().toString(36).slice(2, 6)}${ext}`);
+    fs.writeFileSync(tmp, content, 'utf8');
+    let v;
+    try { v = await verifyFileSyntax(tmp); } finally { try { fs.unlinkSync(tmp); } catch { /* ignore */ } }
+    return v || { ok: true };
+  } catch { return { ok: true }; }
+}
 
 const DATA_DIR = path.join(process.cwd(), 'data');
 const LOG_PATH = path.join(DATA_DIR, 'self-improve-log.jsonl');
@@ -533,8 +551,9 @@ async function runScan({ reason = 'scheduled', max = 1, avoid = [], diag: trigge
       'If trigger_reason contains a recent user-requested diagnosis or a just-completed diagnosis,',
       'treat that as the highest-priority signal and propose a repair for that diagnosis when a',
       'concrete safe code/config change is possible.',
+      "PREFER SUBSTANTIAL UPGRADES: favor changes that MEANINGFULLY improve AVA's functionality or add a real capability over cosmetic tweaks, renames, or comment-only edits. A larger, multi-part change to ONE file is welcome — but it must be genuinely needed, evidenced by the signals, and safe.",
       'Output STRICT JSON only (no prose, no code fences):',
-      '{"file_name":"<exact entry copied from CANDIDATE_FILES, e.g. tools/open_item.py>","issue":"<specific change to make and why>"}',
+      '{"file_name":"<exact entry copied from CANDIDATE_FILES, e.g. tools/open_item.py>","issue":"<the SIGNIFICANT functionality upgrade to make and why it matters — may be a larger, multi-part change to that file>"}',
       'or {"skip":true,"why":"..."} if nothing is concrete and evidenced.',
       'Copy file_name EXACTLY as listed (dir/name). Do NOT output a full path or invent a name.',
       'Never choose the approval/safety gate: ava_self_modification.py, learning.js, security.js, autonomyPolicy.js.',
@@ -597,29 +616,37 @@ async function runScan({ reason = 'scheduled', max = 1, avoid = [], diag: trigge
       return { ok: true, proposed: 0, note: `Couldn't read a usable ${path.basename(plan.file)}.` };
     }
 
-    // STEP 2 — given the real file, produce an exact find/replace.
+    // STEP 2 — given the real file, produce ONE OR MORE exact find/replace edits. A larger,
+    // multi-part upgrade is allowed (and encouraged when it meaningfully improves functionality),
+    // but NEVER a blind full-file rewrite: every edit is a unique, verbatim find/replace applied to
+    // the real file in order, and the combined result is syntax-checked before being proposed.
     const editSys = [
-      'You are making one small, safe edit to the file below. Output STRICT JSON only:',
-      '{"find":"<substring copied VERBATIM from the file, appearing exactly once>","replace":"<the corrected text>","reason":"<one line why>"}',
+      'You are implementing a SIGNIFICANT improvement to AVA by editing the file below.',
+      'Output STRICT JSON only: {"edits":[{"find":"<substring copied VERBATIM from the file, appearing exactly once>","replace":"<the new text>"}, ...],"reason":"<one line: the upgrade and why it matters>"}',
       'or {"skip":true,"why":"..."}.',
-      'Rules: "find" must be copied exactly from the file (same whitespace) and be unique. Keep the',
-      'change minimal and correct. Do not reformat unrelated code.',
-      'COMPLETE & FUNCTIONAL (critical — past proposals failed here): your "replace" must be finished,',
-      'working code, not a sketch. If you add a function, field, command, parameter, branch, or doc',
-      'line, you MUST also include the code that actually IMPLEMENTS and USES it in the SAME edit.',
-      'NEVER produce: a docstring/comment describing behavior that is not implemented; a declared',
-      'variable/field that nothing reads; a function defined but never called; a TODO/placeholder/stub',
-      'or pass-only body; or a partial change that needs a follow-up to work. If a complete, working',
-      'change does not fit in one exact edit, SKIP instead. The result must run and do exactly what',
-      'your "reason" claims, with no further edits required.',
+      'You MAY return MULTIPLE edits to make a larger, multi-part change — e.g. add a new function AND',
+      'wire it into the existing flow AND export it. Use as many edits as the upgrade genuinely needs',
+      '(1 to 8). Edits apply IN ORDER, so each "find" must still be unique when its turn comes.',
+      'Each "find" must be copied EXACTLY from the file (same whitespace) and appear EXACTLY ONCE. Do',
+      'not reformat unrelated code.',
+      "ONLY propose changes that MEANINGFULLY improve AVA's functionality or add a real capability —",
+      'NOT cosmetic tweaks, renames, reformatting, or comment-only edits. If you cannot make a',
+      'substantial, correct, safe improvement to THIS file, SKIP.',
+      'COMPLETE & FUNCTIONAL (critical): every edit must be finished, working code. If you add a',
+      'function, field, command, parameter, or branch, also include the code that IMPLEMENTS and USES',
+      'it (in the same or another edit of this set). NEVER produce a docstring/comment for',
+      'unimplemented behavior, a declared variable/field nothing reads, a function never called, a',
+      'TODO/placeholder/stub, or a partial change needing a follow-up. The WHOLE set together must run',
+      'and do exactly what your "reason" claims, with no further edits required. If you cannot meet',
+      'this bar, SKIP.',
     ].join('\n') + lessonsBlock;
-    const editUser = `CHANGE TO MAKE: ${plan.issue}\n\nFILE: ${plan.file}\n\n<<<FILE CONTENT>>>\n${content.slice(0, 18000)}\n<<<END>>>`;
+    const editUser = `UPGRADE TO MAKE: ${plan.issue}\n\nFILE: ${plan.file}\n\n<<<FILE CONTENT>>>\n${content.slice(0, parseInt(process.env.AVA_SELFMOD_FILE_CAP || '26000', 10))}\n<<<END>>>`;
     let edit = null;
     let editModel = '';
     try {
       const r = await llmService.chatSelfMod(
         [{ role: 'system', content: editSys }, { role: 'user', content: editUser }],
-        { temperature: 0.1, max_tokens: 1600, model: process.env.AVA_SELFMOD_MODEL || 'claude-opus-4-8' }
+        { temperature: 0.1, max_tokens: 4000, model: process.env.AVA_SELFMOD_MODEL || 'claude-opus-4-8' }
       );
       editModel = r.provider || r.model || '';
       const raw = String(r.text || r.content || '');
@@ -627,33 +654,52 @@ async function runScan({ reason = 'scheduled', max = 1, avoid = [], diag: trigge
       if (!edit) logEntry({ reason, proposed: 0, note: 'edit parse failed', file: plan.file, planModel, editModel, raw: raw.slice(0, 400) });
     } catch (e) {
       logEntry({ reason, proposed: 0, note: 'edit chat error', file: plan.file, planModel, error: e.message });
-      return { ok: true, proposed: 0, note: 'Identified a fix but could not draft a clean edit.' };
+      return { ok: true, proposed: 0, note: 'Identified an upgrade but could not draft a clean edit.' };
     }
-    if (!edit || edit.skip || !edit.find || edit.replace == null) {
+    // Accept the multi-edit {edits:[...]} shape OR a single {find,replace} (back-compat).
+    let edits = Array.isArray(edit && edit.edits) ? edit.edits
+      : (edit && edit.find != null ? [{ find: edit.find, replace: edit.replace }] : []);
+    edits = (edits || []).filter(e => e && typeof e.find === 'string' && e.find.length && e.replace != null);
+    if (!edit || edit.skip || !edits.length) {
       logEntry({ reason, proposed: 0, skip: true, file: plan.file, why: edit && edit.why });
       return { ok: true, proposed: 0, note: (edit && edit.why) || 'No safe exact edit found.' };
     }
-    const occ = content.split(edit.find).length - 1;
-    if (occ !== 1) {
-      logEntry({ reason, proposed: 0, note: `snippet appears ${occ}x`, file: plan.file });
-      return { ok: true, proposed: 0, note: `The snippet to change appears ${occ} times in ${path.basename(plan.file)} — too ambiguous, skipping.` };
+    if (edits.length > 8) edits = edits.slice(0, 8);
+    // Apply the edits SEQUENTIALLY; each "find" must be unique in the CURRENT working content (never a
+    // blind rewrite). If any find is missing or ambiguous, abandon the whole proposal to stay safe.
+    let working = content;
+    for (let i = 0; i < edits.length; i++) {
+      const e = edits[i];
+      const occ = working.split(e.find).length - 1;
+      if (occ !== 1) {
+        logEntry({ reason, proposed: 0, note: `edit ${i + 1}/${edits.length} snippet appears ${occ}x`, file: plan.file });
+        return { ok: true, proposed: 0, note: `Edit ${i + 1} of the upgrade didn't apply cleanly (its target appears ${occ} times) — skipping to stay safe.` };
+      }
+      working = working.replace(e.find, String(e.replace));
     }
-    let newContent = content.replace(edit.find, edit.replace);
-    // Match the file's dominant line ending so the diff is a clean targeted hunk, not whole-file
-    // CRLF/LF churn (which made every proposal look like a full-file rewrite).
+    let newContent = working;
+    // Match the file's dominant line ending so the diff stays a clean targeted hunk, not whole-file churn.
     if (content.includes('\r\n')) newContent = newContent.replace(/\r\n/g, '\n').replace(/\n/g, '\r\n');
     else newContent = newContent.replace(/\r\n/g, '\n');
     if (newContent === content) {
       logEntry({ reason, proposed: 0, note: 'no-op change', file: plan.file });
       return { ok: true, proposed: 0, note: 'Proposed change was a no-op.' };
     }
+    // Safety: syntax-check the FULL combined result before proposing (multi-part edits carry more
+    // risk). If it wouldn't parse, abandon rather than queue a broken upgrade.
+    const syn = await _syntaxCheckContent(plan.file, newContent);
+    if (syn && syn.ok === false) {
+      logEntry({ reason, proposed: 0, note: 'multi-edit failed syntax check', file: plan.file, error: String(syn.error || '').slice(0, 200) });
+      return { ok: true, proposed: 0, note: `Drafted a ${edits.length}-part upgrade but it didn't pass a syntax check, so I held it back.` };
+    }
     plan.reason = edit.reason || plan.issue;
+    // Show the reviewer ALL the edits (it also receives the full current file + component map).
+    const editsRepr = edits.map((e, i) => `--- EDIT ${i + 1} of ${edits.length} ---\nFIND:\n${e.find}\nREPLACE:\n${e.replace}`).join('\n\n');
 
     const proposalReview = await reviewProposal({
       file: plan.file,
       reason: plan.reason,
-      find: edit.find,
-      replace: edit.replace,
+      diff: editsRepr,
     });
     // If the reviewer denied it, feed that concern back so the next proposals incorporate it.
     recordReviewerFeedback(plan.file, plan.reason, proposalReview);
@@ -664,6 +710,7 @@ async function runScan({ reason = 'scheduled', max = 1, avoid = [], diag: trigge
       decisionModel,
       planModel,
       editModel,
+      editsCount: edits.length,
       generatorReason: reason,
       proposedAt: new Date().toISOString(),
       reviewRecommendation: proposalReview.recommendation,
@@ -705,6 +752,7 @@ async function runScan({ reason = 'scheduled', max = 1, avoid = [], diag: trigge
         decisionModel,
         planModel,
         editModel,
+        editsCount: edits.length,
         reviewRecommendation: proposalReview.recommendation,
         reviewReason: proposalReview.reason,
         reviewers: proposalReview.reviewers,
