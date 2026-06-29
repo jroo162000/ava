@@ -4,6 +4,7 @@ import express from 'express';
 import logger from '../utils/logger.js';
 import agentLoop from '../services/agentLoop.js';
 import subagentOrchestrator from '../services/subagentOrchestrator.js';
+import subagentRoles from '../services/subagentRoles.js';
 
 const router = express.Router();
 
@@ -85,6 +86,17 @@ router.post('/agent/:id/resume', async (req, res) => {
     logger.error('[agent-api] Resume failed', { error: error.message });
     res.status(500).json({ ok: false, error: error.message });
   }
+});
+
+/** Available subagent roles (each with a scoped toolset). GET /agent/roles
+ *  NOTE: must be registered BEFORE GET /agent/:id, or ":id" would capture "roles". */
+router.get('/agent/roles', (_req, res) => {
+  res.json({ ok: true, roles: subagentRoles.listRoles() });
+});
+
+/** Recent subagent orchestration runs. GET /agent/orchestrations (also before /agent/:id). */
+router.get('/agent/orchestrations', (_req, res) => {
+  res.json({ ok: true, recent: subagentOrchestrator.recent(20) });
 });
 
 /**
@@ -235,11 +247,6 @@ router.post('/agent/orchestrate', async (req, res) => {
     logger.error('[agent-api] Orchestrate failed', { error: error.message });
     res.status(500).json({ ok: false, error: error.message });
   }
-});
-
-/** Recent subagent orchestration runs. GET /agent/orchestrations */
-router.get('/agent/orchestrations', (_req, res) => {
-  res.json({ ok: true, recent: subagentOrchestrator.recent(20) });
 });
 
 export default router;

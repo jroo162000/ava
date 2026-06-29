@@ -12,6 +12,7 @@
 import logger from '../utils/logger.js';
 import config from '../utils/config.js';
 import toolsService from './tools.js';
+import subagentRoles from './subagentRoles.js';
 import autonomyLib from './autonomyPolicy.js';
 import memoryService, { MemoryType, MemorySource } from './memory.js';
 import curiosity from './curiositySupervisor.js';
@@ -41,6 +42,20 @@ const DecisionType = {
   ASK_USER: 'ask_user',
   STOP: 'stop'
 };
+
+// Subagent role tool-scoping: a pattern is an exact tool name or a trailing-'*' wildcard ("fs_*").
+function _toolMatch(name, pattern) {
+  name = String(name || ''); pattern = String(pattern || '');
+  if (pattern === '*') return true;
+  if (pattern.endsWith('*')) return name.startsWith(pattern.slice(0, -1));
+  return name === pattern;
+}
+// Is a tool permitted for this (possibly role-scoped) agent? Lead/general agents allow everything.
+function _toolAllowed(state, toolName) {
+  if (Array.isArray(state.allowedTools) && state.allowedTools.length && !state.allowedTools.some(p => _toolMatch(toolName, p))) return false;
+  if (Array.isArray(state.deniedTools) && state.deniedTools.length && state.deniedTools.some(p => _toolMatch(toolName, p))) return false;
+  return true;
+}
 
 function extractFirstJsonObject(text = '') {
   const s = String(text || '').trim();
@@ -159,6 +174,9 @@ function createAgentState(goal, options = {}) {
     step_limit: Math.min(options.stepLimit || DEFAULT_STEP_LIMIT, MAX_STEP_LIMIT),
     runTools: options.runTools !== false,  // default true; false skips tool execution
     canDelegate: options.canDelegate !== false,  // LEAD may spawn subagents; subagents get false (no recursion)
+    allowedTools: options.allowedTools || null,  // subagent ROLE tool scoping (allowlist of names/'*' patterns)
+    deniedTools: options.deniedTools || null,    // optional denylist
+    role: options.role || null,                  // subagent role name (for logging/observability)
     last_action: null,
     last_result: null,
     errors: [],
@@ -198,6 +216,11 @@ async function observe(state) {
   // 1. Get available tools
   try {
     state.toolset = await toolsService.getAllTools();
+    // ROLE SCOPING: a role-scoped subagent only SEES its allowed tools (so the model can't pick
+    // out-of-scope tools), in addition to the hard block enforced at execution time.
+    if ((Array.isArray(state.allowedTools) && state.allowedTools.length) || (Array.isArray(state.deniedTools) && state.deniedTools.length)) {
+      state.toolset = state.toolset.filter(t => _toolAllowed(state, t.name));
+    }
     observations.tools_available = state.toolset.length;
   } catch (e) {
     logger.warn('[agent] Failed to get tools', { error: e.message });
@@ -364,9 +387,11 @@ For SEVERAL INDEPENDENT read-only lookups at once (none depending on another's r
 {"decision": "parallel", "tool_calls": [{"tool": "tool_a", "args": {...}}, {"tool": "tool_b", "args": {...}}], "reasoning": "why"}
 Use "parallel" ONLY for read-only tools that change nothing and don't depend on each other. Anything that writes/sends/opens/deletes or needs confirmation must be a single "tool_call".
 ${state.canDelegate ? `
-You are the LEAD agent. For a COMPLEX goal with several INDEPENDENT parts, you may DELEGATE to subagents — each is a full agent with your tools that handles one part in parallel; then you synthesize their results:
-{"decision": "delegate", "subtasks": [{"role": "<short role, e.g. researcher>", "goal": "<one focused instruction>"}, ...], "reasoning": "why split it this way"}
-Delegate only when the parts are genuinely independent and the goal is big enough to benefit (e.g. research several things at once, build multiple components in parallel). For a single simple task, just do it yourself. After the subagents return, you'll receive their results to synthesize a final answer.
+You are the LEAD agent. For a COMPLEX goal with several INDEPENDENT parts, you may DELEGATE to subagents — each is a full agent that handles one part in parallel with a SCOPED toolset for its role; then you synthesize their results:
+{"decision": "delegate", "subtasks": [{"role": "<role>", "goal": "<one focused instruction>"}, ...], "reasoning": "why split it this way"}
+Available subagent roles (each gets only its own scoped tools):
+${subagentRoles.rolesForPrompt()}
+Pick the role that best fits each subtask; use "general" if it spans many categories. Delegate only when the parts are genuinely independent and the goal is big enough to benefit (research several things at once, build multiple components in parallel). For a single simple task, just do it yourself. After the subagents return, you'll synthesize a final answer.
 ` : ''}
 For clarification needed:
 {"decision": "ask_user", "question": "what you need to know", "reasoning": "why you need this"}
@@ -552,6 +577,12 @@ async function act(state, decision) {
         action.tool = decision.tool;
         action.args = decision.args || {};
 
+        // ROLE SCOPING: hard-block any tool outside a role-scoped subagent's toolset.
+        if (!_toolAllowed(state, decision.tool)) {
+          result = { status: 'error', message: `Tool '${decision.tool}' is not in this subagent's role toolset${state.role ? ` (${state.role})` : ''}.` };
+          break;
+        }
+
         // Honor runTools=false: skip tool execution, return conversational-only
         if (!state.runTools) {
           logger.info('[agent] runTools=false, skipping tool execution', { tool: decision.tool });
@@ -675,6 +706,7 @@ async function act(state, decision) {
           try {
             const t = await toolsService.getTool(c.tool);
             if (!t) return { tool: c.tool, result: { status: 'error', message: `Tool not found: ${c.tool}` } };
+            if (!_toolAllowed(state, c.tool)) return { tool: c.tool, result: { status: 'blocked', message: `${c.tool} not in this role's toolset` } };
             const unsafe = t.requires_confirm || DESTRUCTIVE.test(c.tool) || (t.risk_level && t.risk_level !== 'low');
             if (unsafe) return { tool: c.tool, result: { status: 'deferred', message: `${c.tool} needs sequential/confirmed execution — issue it as a single tool_call` } };
             const r = await toolsService.executeTool(c.tool, c.args || {}, false, { source: state.eventSource || '' });

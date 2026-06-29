@@ -8,6 +8,7 @@ import logger from '../utils/logger.js';
 import llmService from './llm.js';
 import agentLoop from './agentLoop.js';
 import environmentContext from './environmentContext.js';
+import subagentRoles from './subagentRoles.js';
 
 const FILE = path.join(process.cwd(), 'data', 'orchestrations.json');
 const MAX_SUBAGENTS = parseInt(process.env.AVA_MAX_SUBAGENTS || '6', 10);
@@ -36,17 +37,19 @@ function _parseLoose(t) {
 function _normalizeSubs(arr) {
   return (Array.isArray(arr) ? arr : []).filter(s => s && (s.goal || typeof s === 'string')).slice(0, MAX_SUBAGENTS)
     .map((s, i) => (typeof s === 'string'
-      ? { role: `subagent ${i + 1}`, goal: s.slice(0, 800) }
-      : { role: String(s.role || `subagent ${i + 1}`).slice(0, 60), goal: String(s.goal).slice(0, 800) }));
+      ? { role: 'general', goal: s.slice(0, 800) }
+      : { role: subagentRoles.getRole(s.role).name, goal: String(s.goal).slice(0, 800) }));
 }
 
 // LEAD plans the subtasks (each a subagent's goal + role) when not given explicitly.
 async function planSubtasks(goal) {
   const sys = [
     'You are AVA, the LEAD agent. Break the GOAL into INDEPENDENT subtasks that separate subagents can run IN PARALLEL.',
-    'Each subagent has the SAME tools you do (OS control, files, browser, web search, image/3D generation, web builder, etc.) and works on ONE focused piece.',
+    'Assign each subtask the best-fitting ROLE from this list — each role has its OWN SCOPED toolset:',
+    subagentRoles.rolesForPrompt(),
+    "A subagent only gets its role's tools, so pick the role that matches the work; use \"general\" when it spans many categories.",
     'Split ONLY into truly independent, parallelizable pieces. If the goal is a single coherent task, return ONE subtask.',
-    'Use 1-6 subtasks. Output STRICT JSON only: {"subtasks":[{"role":"<short role, e.g. researcher>","goal":"<one concrete instruction for that subagent>"}]}',
+    'Use 1-6 subtasks. Output STRICT JSON only: {"subtasks":[{"role":"<role name from the list>","goal":"<one concrete instruction for that subagent>"}]}',
   ].join('\n');
   try {
     const r = await llmService.chat([{ role: 'system', content: sys }, { role: 'user', content: `GOAL: ${goal}` }], { temperature: 0.3, max_tokens: 900 });
@@ -58,17 +61,20 @@ async function planSubtasks(goal) {
 async function runSubagent(sub, sharedCtx) {
   let env = '';
   try { env = await environmentContext.buildEnvironmentBlock(); } catch { env = ''; }
+  const roleDef = subagentRoles.getRole(sub.role);
   const goal = [
-    `You are a SUBAGENT (role: ${sub.role}) working under AVA, the lead agent. Do ONLY your assigned task, use your tools as needed, and report a clear, complete result.`,
+    roleDef.prompt,  // role's specialized instructions (Claude-SDK style)
+    `You are a SUBAGENT (role: ${roleDef.name}) working under AVA, the lead agent. Do ONLY your assigned task, use your (scoped) tools as needed, and report a clear, complete result.`,
     sharedCtx ? `SHARED CONTEXT: ${sharedCtx}` : '',
     `YOUR TASK: ${sub.goal}`,
   ].filter(Boolean).join('\n');
   const state = await agentLoop.runAgentLoop(goal, {
-    multiStep: true, runTools: true, stepLimit: SUBAGENT_STEP_LIMIT, environment: env, source: 'subagent', canDelegate: false,
+    multiStep: true, runTools: true, stepLimit: SUBAGENT_STEP_LIMIT, environment: env,
+    source: 'subagent', canDelegate: false, role: roleDef.name, allowedTools: roleDef.allow,
   });
   const ok = state && state.status === agentLoop.AgentStatus.SUCCESS;
   return {
-    role: sub.role, goal: sub.goal, status: ok ? 'done' : 'failed',
+    role: roleDef.name, goal: sub.goal, status: ok ? 'done' : 'failed',
     result: String((state && (state.final_result || (state.last_result && state.last_result.message))) || '').slice(0, 1200),
     steps: state ? state.step_count : 0,
   };
