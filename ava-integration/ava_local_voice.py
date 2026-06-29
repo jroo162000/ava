@@ -1305,12 +1305,23 @@ class LocalVoiceRunner:
             source_rate = int(getattr(self.tts, "current_sample_rate", playback_rate) or playback_rate)
             _log(f"state=SPEAKING text={spoken[:80]!r}")
 
+            # Thread the audioop.ratecv state across THIS utterance's chunks so the resampler
+            # filter stays continuous. The shared _resample_pcm16 passes state=None every call,
+            # which is fine for one-shot ASR buffers but drops the filter state at every ~100ms
+            # frame boundary here, injecting a discontinuity ~10x/sec that sounds choppy. The
+            # state list resets per utterance (each _speak call), so utterances stay independent.
+            rs_state = [None]
+
             def on_chunk(pcm: bytes) -> None:
                 if not pcm:
                     return
-                if self.output_stream is not None:
-                    out = _resample_pcm16(pcm, source_rate, playback_rate)
-                    self.output_stream.write(out)
+                if self.output_stream is None:
+                    return
+                if source_rate == playback_rate:
+                    out = pcm
+                else:
+                    out, rs_state[0] = audioop.ratecv(pcm, SAMPLE_WIDTH, CHANNELS, source_rate, playback_rate, rs_state[0])
+                self.output_stream.write(out)
 
             self.tts.speak(spoken, on_chunk, frame_ms=100)
             _log("state=COOLDOWN")
