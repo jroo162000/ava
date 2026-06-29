@@ -3,6 +3,7 @@
 import express from 'express';
 import logger from '../utils/logger.js';
 import agentLoop from '../services/agentLoop.js';
+import subagentOrchestrator from '../services/subagentOrchestrator.js';
 
 const router = express.Router();
 
@@ -215,6 +216,30 @@ router.post('/agent/step', async (req, res) => {
   } catch (error) {
     res.status(500).json({ ok: false, error: error.message });
   }
+});
+
+/**
+ * LEAD AGENT — decompose a goal into subtasks, spawn subagents (each its own loop) in parallel,
+ * collect results, and synthesize. AVA is the lead. POST /agent/orchestrate
+ * Body: { goal: string, subtasks?: [{role,goal}], sharedContext?: string, synthesize?: boolean }
+ */
+router.post('/agent/orchestrate', async (req, res) => {
+  try {
+    const { goal, subtasks, sharedContext, synthesize } = req.body || {};
+    if ((!goal || String(goal).trim().length < 3) && !(Array.isArray(subtasks) && subtasks.length)) {
+      return res.status(400).json({ ok: false, error: 'Provide a goal (and/or explicit subtasks).' });
+    }
+    logger.info('[agent-api] Orchestrating (lead + subagents)', { goal: String(goal || '').slice(0, 100), subtasks: Array.isArray(subtasks) ? subtasks.length : 'auto' });
+    res.json(await subagentOrchestrator.orchestrate({ goal, subtasks, sharedContext, synthesize: synthesize !== false }));
+  } catch (error) {
+    logger.error('[agent-api] Orchestrate failed', { error: error.message });
+    res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
+/** Recent subagent orchestration runs. GET /agent/orchestrations */
+router.get('/agent/orchestrations', (_req, res) => {
+  res.json({ ok: true, recent: subagentOrchestrator.recent(20) });
 });
 
 export default router;

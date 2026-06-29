@@ -37,6 +37,7 @@ const MAX_CONSECUTIVE_ERRORS = 3;
 const DecisionType = {
   TOOL_CALL: 'tool_call',
   PARALLEL: 'parallel',     // run several INDEPENDENT read-only tool_calls concurrently
+  DELEGATE: 'delegate',     // LEAD: spawn subagents (each its own loop) for independent subtasks
   ASK_USER: 'ask_user',
   STOP: 'stop'
 };
@@ -157,6 +158,7 @@ function createAgentState(goal, options = {}) {
     step_count: 0,
     step_limit: Math.min(options.stepLimit || DEFAULT_STEP_LIMIT, MAX_STEP_LIMIT),
     runTools: options.runTools !== false,  // default true; false skips tool execution
+    canDelegate: options.canDelegate !== false,  // LEAD may spawn subagents; subagents get false (no recursion)
     last_action: null,
     last_result: null,
     errors: [],
@@ -361,7 +363,11 @@ For tool execution:
 For SEVERAL INDEPENDENT read-only lookups at once (none depending on another's result, e.g. search memory AND read a file AND check system state), run them concurrently:
 {"decision": "parallel", "tool_calls": [{"tool": "tool_a", "args": {...}}, {"tool": "tool_b", "args": {...}}], "reasoning": "why"}
 Use "parallel" ONLY for read-only tools that change nothing and don't depend on each other. Anything that writes/sends/opens/deletes or needs confirmation must be a single "tool_call".
-
+${state.canDelegate ? `
+You are the LEAD agent. For a COMPLEX goal with several INDEPENDENT parts, you may DELEGATE to subagents — each is a full agent with your tools that handles one part in parallel; then you synthesize their results:
+{"decision": "delegate", "subtasks": [{"role": "<short role, e.g. researcher>", "goal": "<one focused instruction>"}, ...], "reasoning": "why split it this way"}
+Delegate only when the parts are genuinely independent and the goal is big enough to benefit (e.g. research several things at once, build multiple components in parallel). For a single simple task, just do it yourself. After the subagents return, you'll receive their results to synthesize a final answer.
+` : ''}
 For clarification needed:
 {"decision": "ask_user", "question": "what you need to know", "reasoning": "why you need this"}
 
@@ -445,6 +451,13 @@ async function decide(state, observations) {
       decision.tool = decision.tool_calls[0].tool;
       decision.args = decision.tool_calls[0].args || {};
       decision.decision = DecisionType.TOOL_CALL;
+    }
+
+    // Delegation: route a `subtasks`/`subagents` array (or decision 'delegate') to the DELEGATE path.
+    // ONLY the lead may delegate — subagents run with canDelegate=false (their delegate is blocked in act).
+    if (state.canDelegate && (decision.decision === 'delegate' || Array.isArray(decision.subtasks) || Array.isArray(decision.subagents))) {
+      decision.subtasks = decision.subtasks || decision.subagents || [];
+      if (Array.isArray(decision.subtasks) && decision.subtasks.length) decision.decision = DecisionType.DELEGATE;
     }
 
     // Tolerant recovery: the model sometimes puts the TOOL NAME in `decision`
@@ -671,6 +684,31 @@ async function act(state, decision) {
         const okN = parResults.filter(r => String(r.result.status).toLowerCase() === 'ok').length;
         result = { status: okN ? 'ok' : 'error', parallel: true, results: parResults, message: parResults.map(r => `${r.tool}: ${r.result.status}`).join('; ') };
         logger.info('[agent] Parallel tools executed', { count: calls.length, ok: okN });
+        break;
+      }
+
+      case DecisionType.DELEGATE: {
+        if (!state.canDelegate) { result = { status: 'error', message: 'Subagents cannot delegate further.' }; break; }
+        if (!state.runTools) { result = { status: 'skipped', message: 'Delegation disabled (run_tools=false)' }; break; }
+        const subtasks = (decision.subtasks || []).filter(s => s && (s.goal || typeof s === 'string'));
+        if (!subtasks.length) { result = { status: 'error', message: 'No subtasks provided to delegate.' }; break; }
+        action.subtasks = subtasks;
+        try {
+          // Lazy import avoids the subagentOrchestrator <-> agentLoop circular dependency at load time.
+          const orch = (await import('./subagentOrchestrator.js')).default;
+          const out = await orch.orchestrate({ goal: state.goal, subtasks, sharedContext: state.goal, synthesize: false });
+          const subs = (out && out.subagents) || [];
+          const okN = subs.filter(s => s.status === 'done').length;
+          result = {
+            status: okN ? 'ok' : 'error',
+            delegated: true,
+            message: `Spawned ${subs.length} subagent(s): ` + subs.map(s => `${s.role}=${s.status}`).join(', '),
+            subagents: subs.map(s => ({ role: s.role, status: s.status, result: s.result })),
+          };
+          logger.info('[agent] Delegated to subagents', { count: subs.length, ok: okN });
+        } catch (e) {
+          result = { status: 'error', message: `Delegation failed: ${e.message}` };
+        }
         break;
       }
 
