@@ -90,7 +90,8 @@ async function collectChecks() {
     node: process.version,
     platform: process.platform,
     allowWrite: config.ALLOW_WRITE,
-    build: config.BUILD_STAMP
+    build: config.BUILD_STAMP,
+    processStartedAt: process.uptime ? Date.now() - Math.floor(process.uptime() * 1000) : null
   };
 
   // Logs & data
