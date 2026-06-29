@@ -13,7 +13,7 @@ import autonomyLib from '../services/autonomyPolicy.js';
 import digestQueue from '../services/digestQueue.js';
 import selfImprove from '../services/selfImprove.js';
 import selfRestart from '../services/selfRestart.js';
-import { triggerMoltbookSelfPost, triggerMoltbookEngage, getPendingVerifications, submitMoltbookVerification } from '../services/moltbookScheduler.js';
+import { triggerMoltbookSelfPost, triggerMoltbookEngage, getPendingVerifications, submitMoltbookVerification, previewSelfPosts } from '../services/moltbookScheduler.js';
 import llmService from '../services/llm.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -452,6 +452,14 @@ router.post('/selfmod/judge', async (req, res) => {
     const j = m ? JSON.parse(m[0]) : null;
     if (!j || !j.verdict) return res.json({ ok: true, verdict: 'deny', issue: 'judge could not parse a verdict', rule: '' });
     res.json({ ok: true, verdict: j.verdict === 'verify' ? 'verify' : 'deny', issue: String(j.issue || '').slice(0, 300), rule: String(j.rule || '').slice(0, 200) });
+  } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+});
+
+// Preview (debug): generate sample posts WITHOUT posting, to confirm they're persona-driven + varied.
+router.get('/moltbook/preview', async (req, res) => {
+  try {
+    const n = Math.max(1, Math.min(6, parseInt(req.query.n, 10) || 4));
+    res.json({ ok: true, ...(await previewSelfPosts(n)) });
   } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
 });
 

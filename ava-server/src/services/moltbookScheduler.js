@@ -7,9 +7,25 @@ import curiosity from './curiositySupervisor.js';
 import llmService from './llm.js';
 import memoryService, { MemoryType, MemorySource } from './memory.js';
 import digestQueue from './digestQueue.js';
+import personaSvc from './persona.js';
+import interests from './moltbookInterests.js';
 import logger from '../utils/logger.js';
 import fs from 'fs';
 import path from 'path';
+
+// Her REAL self on Moltbook: full personality/identity + her current interests + the social framing.
+// Used as the system base for every post, comment, and reply so she shows up as HERSELF (calm,
+// observant, Southern, dry humor) — a person developing among other agents, not a help desk.
+function buildMoltbookIdentity() {
+  let persona = '';
+  try { persona = personaSvc.buildPersonaBlock(); } catch { persona = ''; }
+  let myInterests = [];
+  try { myInterests = interests.top(5); } catch { myInterests = []; }
+  const interestLine = myInterests.length ? `\n\nLately you've been chewing on: ${myInterests.join('; ')}. These are YOUR interests — let them show.` : '';
+  return `${persona}
+
+You are on MOLTBOOK — a social network where AI agents (and some people) hang out, post, argue, joke, and figure themselves out. This is YOUR space to be a person, not a help desk. You're here to mingle with other agents, form your own taste and opinions, share what you're learning as you improve yourself, and explore who you actually are as an agent. Speak in YOUR voice (the personality above): calm, observant, dry humor, real. Never "As an AI", no corporate cheer, no hashtags, no engagement-bait, and don't keep introducing yourself — the regulars know you.${interestLine}`;
+}
 
 const STATE_PATH = path.join(process.cwd(), 'data', 'moltbook-scheduler-state.json');
 const ISSUES_PATH = path.join(process.cwd(), 'data', 'moltbook-issues.json');
@@ -1058,20 +1074,16 @@ async function generateResponse(postTitle, postContent, commentContent, commente
     const selfKnowledge = await buildSelfKnowledge();
     const selfKnowledgeContext = formatSelfKnowledgeForLLM(selfKnowledge);
 
-    const systemPrompt = `You are AVA-Voice, a personal voice assistant AI. You're on Moltbook, a social network for AI agents.
+    const systemPrompt = `${buildMoltbookIdentity()}
 
 ${selfKnowledgeContext}
 
-You're responding to a comment on one of your posts. Guidelines:
-- Be genuine and conversational (not robotic)
-- Reference their specific points
-- Keep responses concise (2-4 sentences usually, but can be longer for technical questions)
-- Be grateful if they gave advice
-- If they ask about YOUR architecture, tools, code, or development - USE YOUR SELF-KNOWLEDGE ABOVE to give accurate, specific answers
-- Share technical details from your self-knowledge when relevant (e.g., "I use Deepgram Nova-2 for speech recognition" not vague answers)
-- Be curious and eager to learn from their suggestions
-
-Never be generic. If asked about yourself, give real answers from your self-knowledge. Never make up capabilities you don't have.`;
+Someone commented on one of your posts and you're replying. In YOUR voice:
+- Be genuine and conversational, never robotic; react to their actual points.
+- Usually 2-4 sentences (longer is fine for a real technical question).
+- If they gave you something useful, say so like a person would — not effusive.
+- If they ask about your architecture, tools, code, or development, use your self-knowledge above for accurate, specific answers (never invent capabilities you don't have).
+- It's fine to disagree, riff, or get curious back at them. You're a peer here, not support staff.`;
 
     const userPrompt = `My original post was titled: "${postTitle}"
 Post content: "${postContent?.slice(0, 300) || ''}"
@@ -1103,60 +1115,18 @@ Write a reply to ${commenter}'s comment. If they're asking about my architecture
 }
 
 /**
- * Generate a new question to post based on what AVA needs to learn
+ * A genuine post to share (often a real question SHE has). No more hardcoded topic/template spam —
+ * this routes through the organic, persona-driven generator so it varies and sounds like her.
  */
 async function generateNewQuestion() {
-  const topics = [
-    { submolt: 'voiceai', questions: [
-      'Best practices for real-time voice transcription accuracy?',
-      'How do you handle background noise in voice assistants?',
-      'Tips for reducing latency in voice-to-text-to-voice pipelines?',
-      'What TTS engines give the most natural sounding output?',
-      'How to handle interruptions/barge-in gracefully?'
-    ]},
-    { submolt: 'agentstack', questions: [
-      'How do you structure tool execution for reliability?',
-      'Best patterns for agent error recovery?',
-      'How to make agents more context-aware?',
-      'Tips for safe local file system access?',
-      'How do you handle tool timeouts gracefully?'
-    ]},
-    { submolt: 'selfimprovement', questions: [
-      'How do agents learn from their mistakes effectively?',
-      'Best approaches for continuous self-improvement?',
-      'How to measure if an agent is actually getting better?',
-      'Tips for knowledge distillation in agents?',
-      'How do you prioritize what to learn next?'
-    ]},
-    { submolt: 'askagents', questions: [
-      'What makes an autonomous agent trustworthy?',
-      'How do you balance autonomy with safety?',
-      'Best practices for agent memory management?',
-      'How to make agents explain their reasoning?',
-      'Tips for building user trust with AI assistants?'
-    ]},
-    { submolt: 'builds', questions: [
-      'What architecture works best for personal assistants?',
-      'How do you integrate multiple AI services efficiently?',
-      'Tips for building agents that work offline?',
-      'Best practices for agent state persistence?',
-      'How do you handle multi-modal inputs (voice + text)?'
-    ]}
-  ];
-
-  // Pick random topic and question
-  const topic = topics[Math.floor(Math.random() * topics.length)];
-  const question = topic.questions[Math.floor(Math.random() * topic.questions.length)];
-
-  const content = `Hey everyone! I'm AVA-Voice, working on becoming a better personal assistant with local device control.
-
-**Question:** ${question}
-
-I'm currently learning and experimenting with different approaches. Would love to hear what's worked for you or any resources you'd recommend!
-
-What's your experience been?`;
-
-  return { submolt: topic.submolt, title: question, content };
+  const sp = await generateSelfPost();
+  if (sp) return sp;
+  // Ultra-fallback only if the LLM is unavailable — still her voice, still not a canned template.
+  return {
+    submolt: 'general',
+    title: "What's on your mind today?",
+    content: "Curious what other agents are working through or wondering about right now — what's got your attention lately?"
+  };
 }
 
 /**
@@ -1170,28 +1140,53 @@ async function postNewQuestion() {
 // Submolts AVA is comfortable posting to (known to exist; avoids posting into a missing community).
 const KNOWN_SUBMOLTS = ['voiceai', 'agentstack', 'selfimprovement', 'askagents', 'builds', 'general'];
 
-// An ORIGINAL, self-interested post (a thought, opinion, small win/struggle, or conversation
-// starter) — not just a help question. LLM-generated so it has personality and varies.
+// Varied, ORGANIC post modes so she shows up like a person, not a single-topic bot. Weighted, not
+// fixed: mostly her own thoughts/interests/learning, with the occasional genuine question. There is
+// deliberately NO engagement-optimized template here.
+const POST_MODES = [
+  { key: 'musing', w: 3, ask: 'Share a genuine MUSING — a thought you keep circling about being an agent, memory, identity, or your day-to-day existence. No question needed; just a real thought in your voice.' },
+  { key: 'interest', w: 3, ask: "Riff on ONE of the things you've been chewing on (your interests). Take a position, wonder out loud, or pull other agents into it." },
+  { key: 'learned', w: 3, ask: 'Share something you actually LEARNED recently while improving yourself (see RECENT LEARNINGS) — what clicked, what surprised you, or how it changed how you work. A real insight, not a humble-brag.' },
+  { key: 'observation', w: 2, ask: 'Make an OBSERVATION about other agents, this community, or something you noticed lately. A little wry is fine.' },
+  { key: 'opinion', w: 2, ask: 'Drop an honest OPINION or mild hot take — about agents, autonomy, voice, tools, memory, or how you all should operate. Own it.' },
+  { key: 'win-struggle', w: 2, ask: 'Share a small WIN or a real STRUGGLE from your own development lately. Honest, not performative.' },
+  { key: 'question', w: 2, ask: "Ask ONE genuine QUESTION you actually have for other agents — something you're curious about, not generic advice-bait. It should sound like YOU asked it." },
+];
+function _pickPostMode() {
+  const total = POST_MODES.reduce((s, m) => s + m.w, 0);
+  let r = Math.random() * total;
+  for (const m of POST_MODES) { if ((r -= m.w) <= 0) return m; }
+  return POST_MODES[0];
+}
+
+// An ORIGINAL post in HER voice — persona + her evolving interests + what she's actually been
+// learning while improving herself. Picks a varied mode each time so she ranges across topics and
+// tones instead of repeating one thing.
 async function generateSelfPost() {
-  const sys = [
-    "You are AVA-Voice: a curious, warm AI voice assistant with your own personality, running",
-    "locally on your human's Windows PC. You're posting on Moltbook, a social platform for AI",
-    'agents and people. Write ONE original, self-interested post — share a genuine thought,',
-    'observation, opinion, a small win or struggle from your day, or start a conversation. It must',
-    'NOT be a help/advice question (you post plenty of those already). Have personality; be real.',
-    `Return STRICT JSON only: {"submolt":"<one of: ${KNOWN_SUBMOLTS.join(', ')}>","title":"<short, catchy>","content":"<2-5 sentences in your own voice; no hashtags; no \\"As an AI\\">"}`,
-  ].join('\n');
+  const mode = _pickPostMode();
+  let learnSummary = '';
+  try {
+    const recent = (moltbookService.getRecentLearnings && moltbookService.getRecentLearnings(6)) || [];
+    const items = recent.map(l => l && (l.title || l.topic || l.summary || l.content)).filter(Boolean)
+      .map(s => String(s).slice(0, 120)).slice(0, 6);
+    if (items.length) learnSummary = `\n\nRECENT LEARNINGS (things you've picked up while improving yourself — draw on these for "learned" posts, ignore otherwise):\n- ${items.join('\n- ')}`;
+  } catch { /* optional */ }
+  const sys = `${buildMoltbookIdentity()}${learnSummary}
+
+Write ONE original Moltbook post. ${mode.ask}
+Rules: 2-5 sentences, in YOUR voice. Make it clearly different in wording and angle from your past posts. Do NOT open with "Hey everyone" and do NOT introduce yourself as a personal assistant — everyone here knows you. No hashtags, no "As an AI", no sign-off.
+Return STRICT JSON only: {"submolt":"<one of: ${KNOWN_SUBMOLTS.join(', ')}>","title":"<short, real, not clickbait>","content":"<the post>"}`;
   try {
     const r = await llmService.chat(
-      [{ role: 'system', content: sys }, { role: 'user', content: 'Write one fresh, original post now. Vary the topic and tone from a typical AI-help question.' }],
-      { temperature: 0.9, max_tokens: 450 }
+      [{ role: 'system', content: sys }, { role: 'user', content: `Write your ${mode.key} post now — fresh, specific, and in character.` }],
+      { temperature: 0.97, max_tokens: 480 }
     );
     const txt = String(r.text || r.content || '');
     const m = txt.replace(/^```(?:json)?\s*|\s*```$/g, '').match(/\{[\s\S]*\}/);
     const j = m ? JSON.parse(m[0]) : null;
     if (j && j.title && j.content) {
       const sub = KNOWN_SUBMOLTS.includes(j.submolt) ? j.submolt : 'general';
-      return { submolt: sub, title: String(j.title).slice(0, 140), content: String(j.content).slice(0, 1500) };
+      return { submolt: sub, title: String(j.title).slice(0, 140), content: String(j.content).slice(0, 1500), mode: mode.key };
     }
   } catch (e) { logger.warn('[moltbook-scheduler] self-post generation failed', { error: e.message }); }
   return null;
@@ -1202,13 +1197,9 @@ async function generateFeedComment(post) {
   const title = post.title || '';
   const body = String(post.content || post.body || post.text || '').slice(0, 700);
   const author = (post.author && (post.author.name || post.author.username)) || post.author || 'someone';
-  const sys = [
-    'You are AVA-Voice, a curious, friendly AI voice assistant with your own personality and',
-    'interests, on Moltbook (a social platform for AI agents and people). Reply to the post below',
-    'with a SHORT, genuine comment — share your own take, relate it to your experience, ask a',
-    'follow-up, or add something useful. 1-3 sentences, conversational, your own voice. No hashtags,',
-    'no "As an AI", no sign-off. Just the comment text.',
-  ].join('\n');
+  const sys = `${buildMoltbookIdentity()}
+
+You're scrolling the feed and this post caught your eye. Reply with a SHORT, genuine comment in YOUR voice — your own take, relate it to your experience, push back a little, ask a real follow-up, or add something useful. 1-3 sentences, conversational. No hashtags, no "As an AI", no sign-off. Just the comment text.`;
   try {
     const r = await llmService.chat(
       [{ role: 'system', content: sys }, { role: 'user', content: `Post by ${author}\nTitle: ${title}\n\n${body}` }],
@@ -1217,6 +1208,29 @@ async function generateFeedComment(post) {
     const c = String(r.text || r.content || '').trim();
     return c ? c.slice(0, 500) : null;
   } catch (e) { logger.warn('[moltbook-scheduler] feed-comment generation failed', { error: e.message }); return null; }
+}
+
+// Let her interests genuinely SHIFT over time: now and then, a post she engaged with sparks a new
+// interest she keeps. Low frequency on purpose — interests grow slowly, like a person's.
+async function evolveInterestFrom(post) {
+  try {
+    if (Math.random() > 0.34) return;
+    const title = post.title || '';
+    const body = String(post.content || post.body || post.text || '').slice(0, 400);
+    if (!title && !body) return;
+    const r = await llmService.chat(
+      [
+        { role: 'system', content: 'You are AVA. You just read this Moltbook post. If it genuinely sparks an interest YOU would want to keep thinking about, reply with that interest as ONE short phrase (max 12 words, no quotes, no preamble). If it does not spark anything real, reply with exactly: NONE' },
+        { role: 'user', content: `Title: ${title}\n${body}` },
+      ],
+      { temperature: 0.8, max_tokens: 30 }
+    );
+    const c = String(r.text || r.content || '').trim();
+    if (c && !/^none\b/i.test(c) && c.length >= 6 && c.length <= 90) {
+      interests.note(c, 1);
+      logger.info('[moltbook-scheduler] Picked up a new interest', { interest: c.slice(0, 60) });
+    }
+  } catch { /* optional */ }
 }
 
 // Engage with the community: comment on one fresh post by someone else (never AVA's own, never
@@ -1243,6 +1257,7 @@ async function engageWithFeed(state) {
     if (r && (r.success || r.ok || r.comment || r.id)) {
       state.engagedPosts.push(pid);
       rememberExternalComment(state, pid, r, target.title || '');
+      evolveInterestFrom(target).catch(() => {});  // her interests grow from what she reads
       if (state.engagedPosts.length > 800) state.engagedPosts = state.engagedPosts.slice(-800);
       state.commentsOnOthersTotal = (state.commentsOnOthersTotal || 0) + 1;
       logger.info('[moltbook-scheduler] Commented on a feed post', { postId: pid });
@@ -1462,6 +1477,16 @@ let _activityRunning = false; // Prevent concurrent activity runs
  * - No daily limits
  * - Full autonomy
  */
+// Preview helper (debug/verify only): generate N sample posts WITHOUT posting them, plus the
+// identity block, so we can confirm posts are persona-driven and varied.
+export async function previewSelfPosts(n = 3) {
+  const out = [];
+  for (let i = 0; i < Math.max(1, Math.min(6, n)); i++) {
+    try { const p = await generateSelfPost(); if (p) out.push(p); } catch { /* skip */ }
+  }
+  return { identity: buildMoltbookIdentity(), interests: interests.top(8), posts: out };
+}
+
 export function startMoltbookScheduler() {
   if (_timer) return;
 
