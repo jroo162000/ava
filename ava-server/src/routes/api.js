@@ -823,6 +823,13 @@ async function handleSelfModVoice(userText) {
   const wantsProof = /\b(proof|prove|evidence|receipt)\b/.test(t)
     || ((/\b(show me|verify|confirm|did|does|is|was)\b/.test(t))
         && /\b(actually|really|went through|go through|took? effect|applied|land(ed)?|on disk|in the file)\b/.test(t));
+  // RECOMMENDATIONS from a (usually rejected) proposal she announced: surface the reason/diff she
+  // gave, OR re-propose based on it. "give me your recommendations to fix proposal X", "what did you
+  // recommend", "do a proposal based on your recommendation".
+  const wantsReproposeFromRec = /\b(do|make|create|draft|generate|build|run|write|turn)\b[\s\S]{0,50}\b(proposal|change|fix|patch|it)\b/.test(t)
+    && /\b(based on|from|using|out of|on)\b[\s\S]{0,30}\b(recommendation|recommendations|suggestion|suggestions|advice|that|your|the same)\b/.test(t);
+  const wantsRecommendations = /\b(recommendation|recommendations|recommend|suggestion|suggestions|suggest|advice|how (would |to )?(you )?(fix|rework|redo|improve|approach))\b/.test(t)
+    && (mentionsMod || !!idMatch || /\b(rejection|rejected|proposal|that one|that change)\b/.test(t));
   const hasObject = mentionsMod || !!idMatch || /\b(it|that|this one|the change|all of them|all|them)\b/.test(t);
   // Unambiguous verbs that need no object — a bare "I approve" / "approved" / "apply it" / "reject".
   const clearApprove = /\bapprove(d|al)?\b/.test(t)
@@ -832,9 +839,9 @@ async function handleSelfModVoice(userText) {
   // A bare affirmation — only treated as approval when exactly one change is pending.
   const bareAffirm = /\b(yes|yep|yeah|do it|proceed|sounds good|please do|go for it)\b/.test(t);
 
-  if (wantsCreateProposal && !wantsApprove && !wantsReject && !wantsUndo) return null;
+  if (wantsCreateProposal && !wantsApprove && !wantsReject && !wantsUndo && !wantsReproposeFromRec) return null;
   const clearIntent = clearApprove || clearReject || ((wantsApprove || wantsReject) && hasObject);
-  if (!wantsList && !clearIntent && !bareAffirm && !wantsUndo && !wantsProof) return null;
+  if (!wantsList && !clearIntent && !bareAffirm && !wantsUndo && !wantsProof && !wantsRecommendations && !wantsReproposeFromRec) return null;
 
   let lp;
   try { lp = await pythonWorker.selfMod({ action: 'list_pending' }); } catch { return null; }
@@ -845,6 +852,44 @@ async function handleSelfModVoice(userText) {
   // Bare "yes/do it" with no explicit verb: only act when exactly one change is pending; otherwise
   // let the normal brain answer (so a stray "yes" doesn't approve something).
   if (!clearIntent && bareAffirm && pending.length !== 1) return null;
+
+  // RECOMMENDATIONS from a proposal she announced — surface the stored reason/diff she gave, or
+  // re-propose from it. Checked BEFORE the approve/reject routing because "the REJECTED proposal"
+  // contains "rejected" (descriptive), which must not trigger an actual reject.
+  if (wantsReproposeFromRec || wantsRecommendations) {
+    let all = [];
+    try { const la = await pythonWorker.selfMod({ action: 'list_all' }); all = (la && (la.all || (la.result && la.result.all))) || []; } catch { /* fall through */ }
+    all = Array.isArray(all) ? all : [];
+    const byRecent = (a, b) => new Date(b.applied_at || b.updated_at || b.created || 0) - new Date(a.applied_at || a.updated_at || a.created || 0);
+    let mod = null;
+    if (idMatch) mod = all.find(m => m.id === idMatch[1] || String(m.id).startsWith(idMatch[1]));
+    if (!mod) { const rej = all.filter(m => /reject/i.test(String(m.status || ''))).sort(byRecent); mod = rej[0]; }
+    if (!mod) mod = all.slice().sort(byRecent)[0];
+    if (!mod) return "I don't have any proposals on record yet, so there's no recommendation of mine to pull up.";
+    const f = base(mod.file || mod.file_path || '');
+    const reason = String(mod.reason || (mod.metadata && mod.metadata.reason) || '').trim() || '(no rationale was recorded for that one)';
+    const diff = String(mod.diff || '').trim();
+    const diffLines = diff ? diff.split('\n').filter(l => /^[+-]/.test(l) && !/^[+-]{3}/.test(l)).slice(0, 8) : [];
+    const diffText = diffLines.length ? `\n\nWhat it would change in ${f}:\n\`\`\`\n${diffLines.join('\n')}\n\`\`\`` : '';
+    if (wantsReproposeFromRec) {
+      let r = null;
+      try {
+        r = await selfImprove.runScan({
+          reason: `Re-propose a tighter, more approvable version of ${mod.id} for ${f}. Original rationale: ${reason}`,
+          diag: { issues: [{ category: 'reproposal_from_recommendation', description: reason, context: JSON.stringify({ from: mod.id, file: mod.file || mod.file_path, prior_status: mod.status }) }] }
+        });
+      } catch (e) { r = { ok: false, error: e.message }; }
+      r = (r && (r.result || r)) || {};
+      if (r.proposed || r.id) {
+        return `Done — I drafted a fresh proposal${r.id ? ` (${r.id})` : ''} based on my recommendation for ${mod.id} (${f}). It's in your Proposed Changes panel to approve or reject.${diffText}`;
+      }
+      if (/already running/i.test(String(r.error || r.note || ''))) {
+        return `A self-improvement scan is already running, so I couldn't seed one this second. Give it a moment and ask again — I'll base the new proposal on my recommendation for ${mod.id} (${f}): ${reason}${diffText}`;
+      }
+      return `I tried to draft a proposal from my recommendation for ${mod.id} (${f}), but ${r.error || r.note || 'nothing concrete enough got staged yet'}. The recommendation was: ${reason}${diffText}`;
+    }
+    return `Here's the recommendation I gave with ${mod.id} (${f}):\n- ${reason}${diffText}\n\nWant me to act on it? Say "do a proposal based on that recommendation" and I'll draft a fresh one.`;
+  }
 
   // UNDO / REVERT an already-applied change — the thing reject can't do.
   if (wantsUndo) {
@@ -1051,7 +1096,8 @@ router.post('/respond', async (req, res) => {
       }});
     }
 
-    if (isManualProposalRequest(userText)) {
+    if (isManualProposalRequest(userText)
+        && !/\bbased on (your |the )?(recommendation|suggestion|advice|that)\b/i.test(userText)) {
       const result = await selfImprove.runScan({
         reason: `manual voice proposal request: ${userText.slice(0, 240)}`
       });
@@ -1125,10 +1171,14 @@ router.post('/respond', async (req, res) => {
     try {
       const smReply = await handleSelfModVoice(userText);
       if (smReply) {
-        const finalText = shapeSpokenReply(smReply, req.body || {});
-        try { conversationLogger.logAssistantMessage(finalText, { sessionId, responseType: 'self-mod-approval' }); } catch {}
-        return res.json({ ok: true, output_text: String(finalText || '').slice(0, 20000), agent: {
-          id: 'selfmod-' + Date.now(), status: 'success', steps: 0, result: finalText, errors: []
+        // DISPLAY vs SPOKEN split: the SCREEN keeps real IDs and filenames (e.g. "a355aef5",
+        // "screen_ops.py"); only the SPOKEN copy gets shaped (which spells IDs out char-by-char
+        // for TTS). Logging the DISPLAY copy also stops the model echoing spelled-out IDs later.
+        const spokenText = shapeSpokenReply(smReply, req.body || {});
+        const displayText = String(smReply || '').trim();
+        try { conversationLogger.logAssistantMessage(displayText, { sessionId, responseType: 'self-mod-approval' }); } catch {}
+        return res.json({ ok: true, output_text: String(spokenText || '').slice(0, 20000), display_text: displayText.slice(0, 20000), agent: {
+          id: 'selfmod-' + Date.now(), status: 'success', steps: 0, result: displayText, errors: []
         }});
       }
     } catch (e) { logger.warn('[respond] self-mod voice path error', { error: e.message }); }
@@ -1243,10 +1293,12 @@ router.post('/respond', async (req, res) => {
         finalText = parts.filter(Boolean).join('\n');
       } catch (e) { finalText = ''; }
       if (finalText && finalText.length > 12) {
-        finalText = shapeSpokenReply(finalText, req.body || {});
-        try { conversationLogger.logAssistantMessage(finalText, { sessionId, responseType: 'self-diagnostics' }); } catch {}
-        return res.json({ ok: true, output_text: String(finalText || '').slice(0, 20000), display_text: finalText,
-          agent: { id: 'selfdiag-' + Date.now(), status: 'success', steps: 1, result: finalText, errors: [] } });
+        // Screen keeps real commit hashes/filenames; only the spoken copy is shaped for TTS.
+        const spokenDiag = shapeSpokenReply(finalText, req.body || {});
+        const displayDiag = String(finalText || '').trim();
+        try { conversationLogger.logAssistantMessage(displayDiag, { sessionId, responseType: 'self-diagnostics' }); } catch {}
+        return res.json({ ok: true, output_text: String(spokenDiag || '').slice(0, 20000), display_text: displayDiag.slice(0, 20000),
+          agent: { id: 'selfdiag-' + Date.now(), status: 'success', steps: 1, result: displayDiag, errors: [] } });
       }
       // tool failed → fall through to normal handling
     }
