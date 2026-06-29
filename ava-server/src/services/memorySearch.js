@@ -7,6 +7,7 @@ import path from 'path';
 import os from 'os';
 import curatedMemory from './curatedMemory.js';
 import skillStore from './skillStore.js';
+import ftsIndex from './ftsIndex.js';
 
 const STOP = new Set(['the', 'a', 'an', 'and', 'or', 'but', 'what', 'did', 'we', 'about', 'you',
   'your', 'our', 'do', 'does', 'have', 'has', 'is', 'are', 'to', 'of', 'on', 'in', 'for', 'me',
@@ -50,37 +51,52 @@ export function search(query, limit = 8) {
   // 1b) saved skills (reusable how-tos)
   try { for (const s of skillStore.searchSkills(query, ts)) results.push(s); } catch { /* optional */ }
 
-  // 2) conversation logs, newest day first
-  let files = [];
+  // 2) conversation logs — use the SQLite FTS5 index when available (scales to large histories
+  // without re-scanning every line), else fall back to the original linear keyword scan.
+  let usedFts = false;
   try {
-    files = fs.readdirSync(logsDir()).filter((f) => /^conversation-.*\.jsonl$/.test(f)).sort().reverse();
-  } catch { /* none */ }
-  let scanned = 0;
-  const MAX_SCAN = 8000;
-  for (const f of files) {
-    if (scanned >= MAX_SCAN) break;
-    let lines = [];
-    try { lines = fs.readFileSync(path.join(logsDir(), f), 'utf8').split('\n'); } catch { continue; }
-    const date = (f.match(/conversation-(.*)\.jsonl/) || [])[1] || '';
-    for (const ln of lines) {
-      if (!ln.trim()) continue;
-      scanned++; if (scanned >= MAX_SCAN) break;
-      let e; try { e = JSON.parse(ln); } catch { continue; }
-      if (e.type && e.type !== 'message') continue;
-      const content = String(e.content || '');
-      if (!content) continue;
-      const low = content.toLowerCase();
-      const score = ts.reduce((s, t) => s + (low.includes(t) ? 1 : 0), 0) + (ql && low.includes(ql) ? 2 : 0);
-      if (score > 0) {
-        const who = (e.direction || e.role) === 'assistant' ? 'AVA' : 'You';
-        let ld = date, tm = '';
-        const ms = Date.parse(e.timestamp);
-        if (!isNaN(ms)) {
-          const off = parseInt(process.env.AVA_TZ_OFFSET_MIN || '-300', 10);
-          const iso = new Date(ms + off * 60000).toISOString();
-          ld = iso.slice(0, 10); tm = iso.slice(11, 16);
+    if (ftsIndex.available()) {
+      const hits = ftsIndex.query(query, limit);
+      if (Array.isArray(hits)) {
+        usedFts = true;
+        for (const h of hits) if (h.source === 'conversation') results.push(h);
+      }
+    }
+  } catch { /* fall through to linear scan */ }
+
+  if (!usedFts) {
+    // newest day first
+    let files = [];
+    try {
+      files = fs.readdirSync(logsDir()).filter((f) => /^conversation-.*\.jsonl$/.test(f)).sort().reverse();
+    } catch { /* none */ }
+    let scanned = 0;
+    const MAX_SCAN = 8000;
+    for (const f of files) {
+      if (scanned >= MAX_SCAN) break;
+      let lines = [];
+      try { lines = fs.readFileSync(path.join(logsDir(), f), 'utf8').split('\n'); } catch { continue; }
+      const date = (f.match(/conversation-(.*)\.jsonl/) || [])[1] || '';
+      for (const ln of lines) {
+        if (!ln.trim()) continue;
+        scanned++; if (scanned >= MAX_SCAN) break;
+        let e; try { e = JSON.parse(ln); } catch { continue; }
+        if (e.type && e.type !== 'message') continue;
+        const content = String(e.content || '');
+        if (!content) continue;
+        const low = content.toLowerCase();
+        const score = ts.reduce((s, t) => s + (low.includes(t) ? 1 : 0), 0) + (ql && low.includes(ql) ? 2 : 0);
+        if (score > 0) {
+          const who = (e.direction || e.role) === 'assistant' ? 'AVA' : 'You';
+          let ld = date, tm = '';
+          const ms = Date.parse(e.timestamp);
+          if (!isNaN(ms)) {
+            const off = parseInt(process.env.AVA_TZ_OFFSET_MIN || '-300', 10);
+            const iso = new Date(ms + off * 60000).toISOString();
+            ld = iso.slice(0, 10); tm = iso.slice(11, 16);
+          }
+          results.push({ source: 'conversation', label: ld, date: ld, time: tm, who, score, text: content.slice(0, 240) });
         }
-        results.push({ source: 'conversation', label: ld, date: ld, time: tm, who, score, text: content.slice(0, 240) });
       }
     }
   }

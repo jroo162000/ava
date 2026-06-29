@@ -15,6 +15,9 @@ import selfImprove from '../services/selfImprove.js';
 import selfRestart from '../services/selfRestart.js';
 import { verifyFileSyntax } from '../utils/verifyFileSyntax.js';
 import workflowEngine from '../services/workflowEngine.js';
+import contextCompression from '../services/contextCompression.js';
+import ftsIndex from '../services/ftsIndex.js';
+import memorySearch from '../services/memorySearch.js';
 import { triggerMoltbookSelfPost, triggerMoltbookEngage, getPendingVerifications, submitMoltbookVerification, previewSelfPosts } from '../services/moltbookScheduler.js';
 import llmService from '../services/llm.js';
 
@@ -663,5 +666,25 @@ router.get('/workflow/:id', (req, res) => {
 router.get('/workflows', (_req, res) => { res.json({ ok: true, workflows: workflowEngine.list() }); });
 // Resume a paused/incomplete workflow on demand.
 router.post('/workflow/:id/resume', (req, res) => { res.json(workflowEngine.resume(req.params.id)); });
+
+// ---- Context compression + lineage (Hermes-style) ----
+// Force/trigger a rolling-summary compression for a session and return the result.
+router.post('/context/compress', async (req, res) => {
+  try {
+    const sessionId = req.body?.sessionId || req.body?.session_id || 'default';
+    res.json({ ok: true, ...(await contextCompression.maybeCompress(sessionId, { force: !!req.body?.force })) });
+  } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+});
+// Inspect the lineage chain (parent->child summary generations) for a session.
+router.get('/context/lineage/:sessionId', (req, res) => { res.json({ ok: true, ...contextCompression.lineage(req.params.sessionId) }); });
+
+// ---- FTS memory search (SQLite FTS5) ----
+// Search memory + conversation history; reports whether the FTS index served it.
+router.get('/memory/search', (req, res) => {
+  try {
+    const q = req.query.q || req.query.query || '';
+    res.json({ ok: true, fts: ftsIndex.available(), ...memorySearch.search(String(q), parseInt(req.query.limit || '8', 10)) });
+  } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+});
 
 export default router;

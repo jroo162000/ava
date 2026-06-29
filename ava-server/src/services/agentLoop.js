@@ -36,6 +36,7 @@ const MAX_CONSECUTIVE_ERRORS = 3;
  */
 const DecisionType = {
   TOOL_CALL: 'tool_call',
+  PARALLEL: 'parallel',     // run several INDEPENDENT read-only tool_calls concurrently
   ASK_USER: 'ask_user',
   STOP: 'stop'
 };
@@ -357,6 +358,10 @@ RESPOND WITH EXACTLY ONE JSON OBJECT (no markdown, no explanation):
 For tool execution:
 {"decision": "tool_call", "tool": "tool_name", "args": {...}, "reasoning": "why this action"}
 
+For SEVERAL INDEPENDENT read-only lookups at once (none depending on another's result, e.g. search memory AND read a file AND check system state), run them concurrently:
+{"decision": "parallel", "tool_calls": [{"tool": "tool_a", "args": {...}}, {"tool": "tool_b", "args": {...}}], "reasoning": "why"}
+Use "parallel" ONLY for read-only tools that change nothing and don't depend on each other. Anything that writes/sends/opens/deletes or needs confirmation must be a single "tool_call".
+
 For clarification needed:
 {"decision": "ask_user", "question": "what you need to know", "reasoning": "why you need this"}
 
@@ -364,7 +369,7 @@ For task complete:
 {"decision": "stop", "result": "summary of what was accomplished", "success": true/false}
 
 CRITICAL RULES:
-1. Execute ONE tool at a time
+1. Execute ONE tool at a time — EXCEPT you may use the "parallel" form to run several INDEPENDENT read-only lookups concurrently
 2. If a tool failed, try an alternative approach  
 3. If you lack information, ask the user
 4. After ${state.step_limit} steps, you must stop
@@ -431,6 +436,16 @@ async function decide(state, observations) {
     const text = response.text || response.content || '';
     
     const decision = parseDecisionJson(text);
+
+    // Parallel fan-out: if the model returned a `tool_calls` array, route it to the PARALLEL path
+    // (multiple) or collapse a single entry into a normal tool_call.
+    if (Array.isArray(decision.tool_calls) && decision.tool_calls.filter(c => c && c.tool).length > 1) {
+      decision.decision = DecisionType.PARALLEL;
+    } else if (Array.isArray(decision.tool_calls) && decision.tool_calls.length === 1 && decision.tool_calls[0] && decision.tool_calls[0].tool && !decision.tool) {
+      decision.tool = decision.tool_calls[0].tool;
+      decision.args = decision.tool_calls[0].args || {};
+      decision.decision = DecisionType.TOOL_CALL;
+    }
 
     // Tolerant recovery: the model sometimes puts the TOOL NAME in `decision`
     // (e.g. decision:"memory_search") instead of decision:"tool_call", tool:"memory_search".
@@ -633,6 +648,31 @@ async function act(state, decision) {
           state.current_context.pending_confirmation = null;
         }
         break;
+
+      case DecisionType.PARALLEL: {
+        if (!state.runTools) { result = { status: 'skipped', message: 'Tool execution disabled (run_tools=false)' }; break; }
+        const calls = (decision.tool_calls || []).filter(c => c && c.tool).slice(0, 6);
+        action.tool_calls = calls;
+        // Only NON-destructive, no-confirm tools run concurrently. Anything that writes or needs
+        // confirmation is returned as 'deferred' so the model re-issues it as a normal single
+        // tool_call (which passes through the full autonomy + confirmation gates). This gives the
+        // read fan-out speed-up WITHOUT ever running an unconfirmed side effect in parallel.
+        const DESTRUCTIVE = /^(fs_|ps_exec|file_gen|app_control|web_|comm_|voice_|camera_)/;
+        const parResults = await Promise.all(calls.map(async (c) => {
+          try {
+            const t = await toolsService.getTool(c.tool);
+            if (!t) return { tool: c.tool, result: { status: 'error', message: `Tool not found: ${c.tool}` } };
+            const unsafe = t.requires_confirm || DESTRUCTIVE.test(c.tool) || (t.risk_level && t.risk_level !== 'low');
+            if (unsafe) return { tool: c.tool, result: { status: 'deferred', message: `${c.tool} needs sequential/confirmed execution — issue it as a single tool_call` } };
+            const r = await toolsService.executeTool(c.tool, c.args || {}, false, { source: state.eventSource || '' });
+            return { tool: c.tool, result: r.result || r };
+          } catch (e) { return { tool: c.tool, result: { status: 'error', message: e.message } }; }
+        }));
+        const okN = parResults.filter(r => String(r.result.status).toLowerCase() === 'ok').length;
+        result = { status: okN ? 'ok' : 'error', parallel: true, results: parResults, message: parResults.map(r => `${r.tool}: ${r.result.status}`).join('; ') };
+        logger.info('[agent] Parallel tools executed', { count: calls.length, ok: okN });
+        break;
+      }
 
       case DecisionType.ASK_USER:
         action.question = decision.question;

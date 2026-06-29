@@ -16,6 +16,7 @@ import actionHistory from '../services/actionHistory.js';
 import curatedMemory from '../services/curatedMemory.js';
 import memorySearch from '../services/memorySearch.js';
 import conversationHistory from '../services/conversationHistory.js';
+import contextCompression from '../services/contextCompression.js';
 import memoryReviewer from '../services/memoryReviewer.js';
 import skillStore from '../services/skillStore.js';
 import skillCapture from '../services/skillCapture.js';
@@ -1671,6 +1672,11 @@ router.post('/respond', async (req, res) => {
     // TOOL PATH: Full agent loop for tool-enabled requests
     const loopOptions = { source: 'voice' };  // tag tool events so the live UI mirrors them
     try { loopOptions.environment = await environmentContext.buildEnvironmentBlock(); } catch { /* optional */ }
+    // Inject the rolling summary of older (compressed-away) conversation so dropped context isn't lost.
+    try {
+      const _sum = contextCompression.summaryFor(sessionId);
+      if (_sum) loopOptions.environment = (loopOptions.environment || '') + `\n\nEARLIER-CONVERSATION SUMMARY (older context, compressed so it isn't lost):\n${_sum}`;
+    } catch { /* optional */ }
     if (memory_filter) loopOptions.memoryFilter = memory_filter;
     // Give the agent loop recent conversation context ONLY when the request refers to
     // something prior ("open it", "yes", "that screenshot"). Injecting history into a
@@ -1692,6 +1698,8 @@ router.post('/respond', async (req, res) => {
     // Record what she actually DID this turn into the queryable action history (so "what did you
     // just do?" and the live-environment "recent actions" come from a real log).
     try { actionHistory.recordTurn(sessionId, state); } catch (e) { /* optional */ }
+    // Compress older turns into the rolling lineage summary once the session has grown (best-effort).
+    try { contextCompression.maybeCompress(sessionId).catch(() => {}); } catch (e) { /* optional */ }
     let finalText = state.final_result || '';
 
     // VOICE + HONESTY: ground the spoken reply in what the tools ACTUALLY returned, so
