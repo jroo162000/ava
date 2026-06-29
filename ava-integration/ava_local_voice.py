@@ -54,6 +54,37 @@ except Exception:
 
 APP_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = APP_DIR / "ava_voice_config.json"
+
+# --- Spoken-pronunciation lexicon, applied right before TTS so EVERY spoken path is covered
+# (server replies, proactive announcements, local speech). Seeded with her own name:
+# "AVA"/"Ava" -> "Aiva" which this Piper pronounces /ˈeɪvə/ ("AY-vuh") instead of "AH-vuh" or
+# spelled-out "A. V. A.". Extend ava_pronunciations.json (case-insensitive whole words; keys
+# starting with _ are ignored) to teach new names. Only changes how things SOUND, not the text.
+_PRON_LEXICON = None
+def _load_pron_lexicon() -> dict:
+    global _PRON_LEXICON
+    if _PRON_LEXICON is not None:
+        return _PRON_LEXICON
+    lex = {"ava": "Aiva"}  # built-in seed so her name is always right
+    try:
+        p = APP_DIR / "ava_pronunciations.json"
+        if p.is_file():
+            data = json.loads(p.read_text(encoding="utf-8"))
+            for k, v in (data or {}).items():
+                if k and not k.startswith("_") and isinstance(v, str) and v.strip():
+                    lex[k.lower()] = v.strip()
+    except Exception:
+        pass
+    _PRON_LEXICON = lex
+    return lex
+
+def _apply_pron_lexicon(text: str) -> str:
+    if os.environ.get("AVA_PRON_LEXICON_OFF") == "1":
+        return text or ""
+    s = text or ""
+    for word, say in _load_pron_lexicon().items():
+        s = re.sub(r"\b" + re.escape(word) + r"\b", say, s, flags=re.IGNORECASE)
+    return s
 DEFAULT_SERVER_URL = "http://127.0.0.1:5051/respond"
 TARGET_ASR_RATE = 16000
 SAMPLE_WIDTH = 2
@@ -1268,10 +1299,11 @@ class LocalVoiceRunner:
         self.last_spoken_text = text or ""
         if not text or self.tts is None:
             return
+        spoken = _apply_pron_lexicon(text)  # fix pronunciations (e.g. "AVA" -> "Aiva") right before TTS
         with self._speak_lock:
             playback_rate = int((self.config.get("audio") or {}).get("playback_rate") or 44100)
             source_rate = int(getattr(self.tts, "current_sample_rate", playback_rate) or playback_rate)
-            _log(f"state=SPEAKING text={text[:80]!r}")
+            _log(f"state=SPEAKING text={spoken[:80]!r}")
 
             def on_chunk(pcm: bytes) -> None:
                 if not pcm:
@@ -1280,7 +1312,7 @@ class LocalVoiceRunner:
                     out = _resample_pcm16(pcm, source_rate, playback_rate)
                     self.output_stream.write(out)
 
-            self.tts.speak(text, on_chunk, frame_ms=100)
+            self.tts.speak(spoken, on_chunk, frame_ms=100)
             _log("state=COOLDOWN")
             time.sleep(0.35)
 

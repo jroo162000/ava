@@ -18,6 +18,12 @@ echo Say: Hey Ava, what is today?
 echo Press Ctrl+C to stop.
 echo.
 
-python ava_local_voice.py
+REM Use the project venv python (it has faster-whisper/pyaudio/etc.); bare "python" resolves to
+REM the Microsoft Store stub on a fresh console and fails.
+if exist "%~dp0.venv\Scripts\python.exe" (
+    "%~dp0.venv\Scripts\python.exe" ava_local_voice.py
+) else (
+    python ava_local_voice.py
+)
 
 pause

@@ -11,6 +11,8 @@ import pythonWorker from '../services/pythonWorker.js';
 import conversationLogger from '../services/conversationLogger.js';
 import artifactMemory from '../services/artifactMemory.js';
 import personaSvc from '../services/persona.js';
+import environmentContext from '../services/environmentContext.js';
+import actionHistory from '../services/actionHistory.js';
 import curatedMemory from '../services/curatedMemory.js';
 import memorySearch from '../services/memorySearch.js';
 import conversationHistory from '../services/conversationHistory.js';
@@ -567,6 +569,46 @@ function disambiguateHomographs(text) {
   return out;
 }
 
+// Pronunciation lexicon (TTS): word -> respelling the voice engine actually says correctly.
+// Seeded with her OWN name — the engine says "AVA"/"Ava" as "AH-vuh" (/ˈɑːvə/) or spells out
+// "A. V. A.", but she's "Aiva" = /ˈeɪvə/ ("AY-vuh"). This is a pronunciation dictionary, not a
+// behavioral hardcode: it's case-insensitive, whole-word, spoken-copy-ONLY (the on-screen text
+// keeps the real "AVA" spelling), and EXTENSIBLE/learnable via ava-integration/ava_pronunciations.json
+// (add "name": "respelling" entries to teach her new names; keys starting with _ are ignored).
+let _pronLexicon = null;
+function loadPronunciationLexicon() {
+  if (_pronLexicon) return _pronLexicon;
+  const lex = { ava: 'Aiva' };  // built-in seed so her own name is always right
+  try {
+    const candidates = [
+      config.AVA_INTEGRATION_DIR ? path.join(config.AVA_INTEGRATION_DIR, 'ava_pronunciations.json') : null,
+      path.join(process.cwd(), '..', 'ava-integration', 'ava_pronunciations.json'),
+      path.join(os.homedir(), 'ava', 'ava-integration', 'ava_pronunciations.json'),
+    ].filter(Boolean);
+    for (const p of candidates) {
+      if (fs.existsSync(p)) {
+        const data = JSON.parse(fs.readFileSync(p, 'utf8'));
+        for (const [k, v] of Object.entries(data || {})) {
+          if (k && !k.startsWith('_') && typeof v === 'string' && v.trim()) lex[k.toLowerCase()] = v.trim();
+        }
+        break;
+      }
+    }
+  } catch { /* fall back to the built-in seed */ }
+  _pronLexicon = lex;
+  return lex;
+}
+function applyPronunciationLexicon(text) {
+  if (process.env.AVA_PRON_LEXICON_OFF === '1') return text;
+  const lex = loadPronunciationLexicon();
+  let s = String(text || '');
+  for (const [word, say] of Object.entries(lex)) {
+    const esc = word.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    s = s.replace(new RegExp(`\\b${esc}\\b`, 'gi'), say);
+  }
+  return s;
+}
+
 // Make spoken text TTS-friendly: drop stray markdown symbols and voice numbers by context.
 function normalizeForSpeech(text) {
   let s = String(text || '');
@@ -579,6 +621,8 @@ function normalizeForSpeech(text) {
        .replace(/\*([^*]+)\*/g, '$1')
        .replace(/__([^_]+)__/g, '$1').replace(/_([^_]+)_/g, '$1')
        .replace(/~~([^~]+)~~/g, '$1');
+  // (a.4) Apply the pronunciation lexicon (her name "AVA" -> "Aiva", plus any learned names).
+  s = applyPronunciationLexicon(s);
   // (a.5) Fix the handful of homographs the TTS engine mispronounces (read-past, lead-metal,
   // close/excuse verbs, wind/bow/dove/minute) — measured + verified, spoken copy only.
   s = disambiguateHomographs(s);
@@ -1369,7 +1413,9 @@ router.post('/respond', async (req, res) => {
         ? ` Keep replies under ${spokenReplyBudget.maxWords} words and ${spokenReplyBudget.maxSentences} sentences unless safety or accuracy requires more.`
         : '';
       const _memBlock = curatedMemory.buildMemoryBlock();
-      const sysPrompt = `${personaSvc.buildPersonaBlockText()}${_memBlock ? '\n\n' + _memBlock : ''}\n\nThis reply is BOTH spoken aloud AND shown on screen. Keep it natural and conversational — short enough to say out loud (a sentence or two is usually enough). For the screen you may use LIGHT Markdown: a **bold** key term, or a short "- " bullet list when you name several things — but no big headings or tables, and never sound like a written report. Give a complete answer when the question calls for it.${budgetPrompt}${context ? '\n\nContext: ' + context : ''}`;
+      let _envBlock = '';
+      try { _envBlock = await environmentContext.buildEnvironmentBlock(); } catch { _envBlock = ''; }
+      const sysPrompt = `${personaSvc.buildPersonaBlockText()}${_memBlock ? '\n\n' + _memBlock : ''}${_envBlock ? '\n\n' + _envBlock : ''}\n\nThis reply is BOTH spoken aloud AND shown on screen. Keep it natural and conversational — short enough to say out loud (a sentence or two is usually enough). For the screen you may use LIGHT Markdown: a **bold** key term, or a short "- " bullet list when you name several things — but no big headings or tables, and never sound like a written report. Give a complete answer when the question calls for it.${budgetPrompt}${context ? '\n\nContext: ' + context : ''}`;
       // Capability awareness: list the real tools so AVA can answer "what can you
       // do?" accurately even on this no-execution conversational path. (Previously
       // this prompt omitted tools, so she'd say she had none.)
@@ -1446,6 +1492,7 @@ router.post('/respond', async (req, res) => {
 
     // TOOL PATH: Full agent loop for tool-enabled requests
     const loopOptions = { source: 'voice' };  // tag tool events so the live UI mirrors them
+    try { loopOptions.environment = await environmentContext.buildEnvironmentBlock(); } catch { /* optional */ }
     if (memory_filter) loopOptions.memoryFilter = memory_filter;
     // Give the agent loop recent conversation context ONLY when the request refers to
     // something prior ("open it", "yes", "that screenshot"). Injecting history into a
@@ -1464,6 +1511,9 @@ router.post('/respond', async (req, res) => {
     const state = await (await import('../services/agentLoop.js')).default.runAgentLoop(userText, loopOptions);
     // Remember structured outputs (file paths, ids, urls) from this turn for later refs.
     try { artifactMemory.recordFromHistory(sessionId, state.history); } catch (e) { /* artifacts optional */ }
+    // Record what she actually DID this turn into the queryable action history (so "what did you
+    // just do?" and the live-environment "recent actions" come from a real log).
+    try { actionHistory.recordTurn(sessionId, state); } catch (e) { /* optional */ }
     let finalText = state.final_result || '';
 
     // VOICE + HONESTY: ground the spoken reply in what the tools ACTUALLY returned, so

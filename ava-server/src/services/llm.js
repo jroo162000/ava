@@ -300,7 +300,7 @@ class LLMService {
     return {
       content,
       usage: data.usageMetadata,
-      model: 'gemini-2.0-flash',
+      model: data.modelVersion || mdl,
       provider: 'gemini'
     };
   }
@@ -425,7 +425,7 @@ class LLMService {
     const chain = [
       { name: 'claude/' + (env.AVA_SM_CLAUDE || 'claude-opus-4-8'), run: () => this.createCompletionClaude({ messages: conv, system, maxTokens, model: env.AVA_SM_CLAUDE || 'claude-opus-4-8' }) },
       ...openAIModels.map(model => ({ name: 'openai/' + model, run: () => this._openaiCompat({ baseURL: 'https://api.openai.com/v1', apiKey: key('OPENAI_API_KEY'), model, system, messages: conv, maxTokens }) })),
-      { name: 'gemini/' + (env.AVA_SM_GEMINI || 'gemini-3-pro-preview'), run: () => this.createCompletionGemini({ messages: conv, system, maxTokens, model: env.AVA_SM_GEMINI || 'gemini-3-pro-preview' }) },
+      { name: 'gemini/' + (env.AVA_SM_GEMINI || 'gemini-pro-latest'), run: () => this.createCompletionGemini({ messages: conv, system, maxTokens, model: env.AVA_SM_GEMINI || 'gemini-pro-latest' }) },
       { name: 'deepseek/' + (env.AVA_SM_DEEPSEEK || 'deepseek-reasoner'), run: () => this._openaiCompat({ baseURL: 'https://api.deepseek.com', apiKey: key('DEEPSEEK_API_KEY'), model: env.AVA_SM_DEEPSEEK || 'deepseek-reasoner', system, messages: conv, maxTokens }) },
       { name: 'grok/' + (env.AVA_SM_GROK || 'grok-4'), run: () => this._openaiCompat({ baseURL: 'https://api.x.ai/v1', apiKey: key('GROK_API_KEY'), model: env.AVA_SM_GROK || 'grok-4', system, messages: conv, maxTokens }) },
     ];

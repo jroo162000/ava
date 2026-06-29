@@ -462,6 +462,15 @@ async function runScan({ reason = 'scheduled', max = 1, avoid = [], diag: trigge
       'If the strongest idea repeats a recently rejected file/reason, choose the next best distinct',
       'source signal instead. Preference order for variety: real failures, user corrections, Moltbook',
       'agent engineering lessons, diagnostics, then small polish fixes.',
+      'UPGRADE DIRECTION (the developer explicitly asked for this — weigh it heavily when no urgent',
+      'failure dominates): favor concrete, high-impact self-UPGRADES that make AVA more capable and',
+      'reliable, not just tiny polish. Strongly preferred directions: deeper local-environment',
+      'integration (live foreground-window / system-state awareness), tighter browser & desktop-app',
+      'control (reliable tab switching, URL/login/captcha handling, File Explorer mapping, open/close/',
+      'save/export on common apps), better self-diagnostics, smarter memory & governance, and richer',
+      'visualization/interaction with the user. Fix a real failure or diagnosis first when present;',
+      'otherwise propose ONE of these capability upgrades as a small, safe, concrete code change that',
+      'is a genuine step toward the capability (never a vague stub or placeholder).',
     ].join('\n') + lessonsBlock;
     const planUser = `SIGNALS:\n${JSON.stringify(signals).slice(0, 24000)}\n\nCANDIDATE_FILES (choose one, copy its name exactly):\n${listing}`;
     let plan = null;

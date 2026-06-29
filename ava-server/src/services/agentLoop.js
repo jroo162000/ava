@@ -171,6 +171,7 @@ function createAgentState(goal, options = {}) {
     history: [],
     recentHistory: options.recentHistory || [],  // recent conversation turns for context
     recentArtifacts: options.recentArtifacts || [],  // exact paths/ids from recent turns
+    environment: options.environment || '',  // live OS-awareness block (foreground window, CPU/RAM, recent actions)
     memoryFilter: options.memoryFilter || null,
     eventSource: options.source || '',  // tags tool events for the live UI (e.g. 'voice')
     created_at: new Date().toISOString(),
@@ -323,6 +324,7 @@ function buildDecisionPrompt(state, observations) {
   const artifactContext = (Array.isArray(state.recentArtifacts) && state.recentArtifacts.length)
     ? `\nRECENT FILES/ITEMS you just created or used — when the user refers to "it", "that file", "the screenshot/picture you just took", "the one you made", use the EXACT value below (do NOT ask the user for a name/path that's listed here):\n${state.recentArtifacts.map(a => `- ${a.kind}: ${a.value}`).join('\n')}\n`
     : '';
+  const envContext = state.environment ? `\n${state.environment}\n` : '';
   const _mem = curatedMemory.buildMemoryBlock();
   let _skills = '';
   try { _skills = skillStore.buildSkillsIndex(); } catch { /* optional */ }
@@ -333,7 +335,7 @@ function buildDecisionPrompt(state, observations) {
 You are AVA, executing a task step by step. The personality above shapes only the words you SPEAK to the user — it never changes which tool you pick, and never lets you fake or over-claim a result.
 
 GOAL: ${state.goal}
-${recentContext}${artifactContext}
+${recentContext}${artifactContext}${envContext}
 
 CURRENT DATE & TIME: ${nowStr} (timezone ${_tz}, UTC${_offStr}). Use this to resolve "today", "tonight", "tomorrow", "this week", "next Monday", etc. — never assume a date from training data. When specifying event start/end times, use full ISO 8601 WITH this offset, e.g. ${_now.getFullYear()}-06-24T15:00:00${_offStr}.
 

@@ -408,17 +408,24 @@ router.post('/selfmod/probe', async (_req, res) => {
   const stableOpenAI = env.AVA_SM_OPENAI_FALLBACK || 'gpt-5.1';
   const openAIModels = [...new Set([primaryOpenAI, stableOpenAI].filter(Boolean))];
   const tests = [
-    ...openAIModels.map(model => ['openai/' + model, () => llmService._openaiCompat({ baseURL: 'https://api.openai.com/v1', apiKey: k('OPENAI_API_KEY'), model, system: 'You reply tersely.', messages: msgs, maxTokens: 50 })]),
-    ['gemini/' + (env.AVA_SM_GEMINI || 'gemini-3-pro-preview'), () => llmService.createCompletionGemini({ messages: msgs, system: 'You reply tersely.', maxTokens: 50, model: env.AVA_SM_GEMINI || 'gemini-3-pro-preview' })],
-    ['deepseek/' + (env.AVA_SM_DEEPSEEK || 'deepseek-reasoner'), () => llmService._openaiCompat({ baseURL: 'https://api.deepseek.com', apiKey: k('DEEPSEEK_API_KEY'), model: env.AVA_SM_DEEPSEEK || 'deepseek-reasoner', system: 'You reply tersely.', messages: msgs, maxTokens: 50 })],
-    ['grok/' + (env.AVA_SM_GROK || 'grok-4'), () => llmService._openaiCompat({ baseURL: 'https://api.x.ai/v1', apiKey: k('GROK_API_KEY'), model: env.AVA_SM_GROK || 'grok-4', system: 'You reply tersely.', messages: msgs, maxTokens: 50 })],
+    // Claude is the PRIMARY self-mod model — probe it FIRST so we can see if it's healthy.
+    ['claude/' + (env.AVA_SM_CLAUDE || 'claude-opus-4-8'), () => llmService.createCompletionClaude({ messages: msgs, system: 'You reply tersely.', maxTokens: 50, model: env.AVA_SM_CLAUDE || 'claude-opus-4-8' })],
+    ...openAIModels.map(model => ['openai/' + model, () => llmService._openaiCompat({ baseURL: 'https://api.openai.com/v1', apiKey: k('OPENAI_API_KEY'), model, system: 'You reply tersely.', messages: msgs, maxTokens: 512 })]),
+    ['gemini/' + (env.AVA_SM_GEMINI || 'gemini-pro-latest'), () => llmService.createCompletionGemini({ messages: msgs, system: 'You reply tersely.', maxTokens: 512, model: env.AVA_SM_GEMINI || 'gemini-pro-latest' })],
+    ['deepseek/' + (env.AVA_SM_DEEPSEEK || 'deepseek-reasoner'), () => llmService._openaiCompat({ baseURL: 'https://api.deepseek.com', apiKey: k('DEEPSEEK_API_KEY'), model: env.AVA_SM_DEEPSEEK || 'deepseek-reasoner', system: 'You reply tersely.', messages: msgs, maxTokens: 512 })],
+    ['grok/' + (env.AVA_SM_GROK || 'grok-4'), () => llmService._openaiCompat({ baseURL: 'https://api.x.ai/v1', apiKey: k('GROK_API_KEY'), model: env.AVA_SM_GROK || 'grok-4', system: 'You reply tersely.', messages: msgs, maxTokens: 512 })],
   ];
   const out = [];
   for (const [name, fn] of tests) {
     try { const r = await fn(); out.push({ name, ok: !!String(r.content || r.text || '').trim(), sample: String(r.content || r.text || '').slice(0, 40) }); }
     catch (e) { out.push({ name, ok: false, error: String(e.message || e).slice(0, 170) }); }
   }
-  res.json({ ok: true, chain: out });
+  // The decisive check: run the ACTUAL self-mod chain once and report which model actually wins
+  // (this is exactly what gets recorded as the proposal's decision model).
+  let chainWinner = null;
+  try { const r = await llmService.chatSelfMod(msgs, { max_tokens: 512 }); chainWinner = r.provider || r.model || null; }
+  catch (e) { chainWinner = 'chain-failed: ' + String(e.message || e).slice(0, 160); }
+  res.json({ ok: true, chainWinner, chain: out });
 });
 
 // Judge ONE proposed self-modification for accuracy/safety (strong-model code review).

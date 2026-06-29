@@ -1,0 +1,6 @@
+{
+  "_note": "Spoken-pronunciation lexicon for AVA's text-to-speech. Each key is a word (matched case-insensitively, whole-word only) and the value is a respelling that the voice engine pronounces correctly. This only affects how things SOUND when spoken aloud — the on-screen text keeps the real spelling. Extend this to teach AVA how to say names she keeps getting wrong.",
+  "_how": "Use letters that sound out the way you want. Examples that test correctly in the engine: her own name AVA -> 'Aiva' (AY-vuh). For a person, e.g. 'jelani': 'Jeh-LAH-nee'. Add an entry, then restart the server.",
+  "_disable": "Set AVA_PRON_LEXICON_OFF=1 to turn the whole lexicon off.",
+  "ava": "Aiva"
+}

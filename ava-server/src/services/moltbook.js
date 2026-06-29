@@ -56,6 +56,8 @@ class MoltbookService {
       fs.writeFileSync(STATE_PATH, JSON.stringify({
         learnings: this.learnings.slice(-5000), // Keep broad Moltbook context for proposal generation
         lastFeedCheck: this.lastFeedCheck,
+        // Track Moltbook engagement state, including AVA-authored comments on others' posts
+        engagementState: this.engagementState || {},
         updatedAt: new Date().toISOString()
       }, null, 2));
     } catch (e) {
