@@ -207,6 +207,51 @@ function candidateFiles() {
 
 const fileLabel = (c) => `${path.basename(path.dirname(c))}/${path.basename(c)}`;
 
+// ---- Reviewer code context: give every reviewer AVA's full component map + the COMPLETE target file,
+// so a proposal is judged against the real codebase/structure, not an isolated diff. ----
+function _fileHeader(fp) {
+  try {
+    const head = fs.readFileSync(fp, 'utf8').slice(0, 900);
+    for (const raw of head.split('\n')) {
+      const t = raw.trim();
+      if (!t) continue;
+      const m = t.match(/^(?:\/\/+|#+|\/\*+|\*+)\s*(.+?)\s*\*?\/?$/);
+      if (m && m[1] && m[1].length > 3) return m[1].slice(0, 160);
+      if (!/^(\/\/|#|\/\*|\*)/.test(t)) break;   // first real code line — no header comment
+    }
+  } catch { /* ignore */ }
+  return '';
+}
+
+function _resolveTargetPath(file) {
+  if (!file) return '';
+  const f = String(file).replace(/\\/g, '/');
+  try { if (fs.existsSync(f) && fs.statSync(f).isFile()) return f; } catch { /* ignore */ }
+  const cands = candidateFiles();
+  const lab = f.toLowerCase();
+  const base = path.basename(f).toLowerCase();
+  let hit = cands.find(c => fileLabel(c).toLowerCase() === lab);
+  if (!hit) hit = cands.find(c => lab.endsWith(fileLabel(c).toLowerCase()));
+  if (!hit) hit = cands.find(c => path.basename(c).toLowerCase() === base);
+  return hit || f;
+}
+
+// Full structure (every source file + its one-line purpose) + the COMPLETE current target file.
+function buildCodebaseContext(targetFile) {
+  let componentMap = '(component map unavailable)';
+  try {
+    const cands = candidateFiles();
+    componentMap = cands.map(c => { const h = _fileHeader(c); return `- ${fileLabel(c)}${h ? ' — ' + h : ''}`; }).join('\n').slice(0, 18000);
+  } catch { /* ignore */ }
+  const resolved = _resolveTargetPath(targetFile);
+  let fullFile = '';
+  try { fullFile = fs.readFileSync(resolved, 'utf8'); } catch { /* ignore */ }
+  const cap = parseInt(process.env.AVA_REVIEW_FILE_CAP || '36000', 10);
+  let truncated = false;
+  if (fullFile.length > cap) { fullFile = fullFile.slice(0, cap) + '\n\n... [remainder of file truncated for review] ...'; truncated = true; }
+  return { componentMap, fullFile, resolved, truncated };
+}
+
 function avoidTerms(avoid) {
   return (Array.isArray(avoid) ? avoid : [])
     .map(x => String(x || '').toLowerCase().replace(/\\/g, '/').trim())
@@ -331,31 +376,34 @@ function normalizeReview(raw, reviewer, model) {
   };
 }
 
-async function runProposalReviewer({ reviewer, model, call, file, reason, find, replace, diff }) {
+async function runProposalReviewer({ reviewer, model, call, file, reason, find, replace, diff, ctx }) {
   const system = [
-    'You are a strict senior engineer reviewing one AVA self-modification proposal before it is shown to the user.',
-    'Judge only whether this proposal is accurate, needed, minimal, and safe.',
-    'Be skeptical: approve only if the stated issue is supported by the proposed edit and the edit is the right layer.',
-    'Respond STRICT JSON only: {"verdict":"approve"|"deny","reason":"short reason","risks":["optional risk"]}.',
+    'You are a senior engineer reviewing one proposed change to AVA, a local always-on voice assistant, before it is shown to the user for approval.',
+    "You are given AVA's FULL COMPONENT MAP (every source file and its role) and the COMPLETE CURRENT CONTENT of the file being changed. Use them to judge the change in the real context of the whole codebase, its components, and how they fit together — not as an isolated snippet.",
+    'APPROVE the change when ALL of these hold:',
+    '  (1) ACCURATE — the edit actually does what its stated reason claims, is consistent with how the surrounding code and the other components work, and only references things that really exist.',
+    '  (2) NEEDED — it fixes a real problem OR is a genuine improvement, upgrade, or new capability. Changes do NOT have to be minimal; larger, additive, or substantial improvements are welcome as long as they are accurate and safe.',
+    '  (3) SAFE — it will not break existing behavior, the approval/security gate, secret handling, or other components; it degrades gracefully and follows existing patterns.',
+    'DENY only if the change is inaccurate (wrong, misunderstands the code, or claims something it does not do), not needed, or unsafe. Do NOT deny a change merely for being large, non-minimal, or an enhancement.',
+    'Respond STRICT JSON only: {"verdict":"approve"|"deny","reason":"specific reason grounded in the actual code","risks":["optional risk"]}.',
   ].join('\n');
-  const user = diff
-    ? [
-      `FILE: ${file}`,
-      `STATED REASON: ${reason}`,
-      '',
-      'PROPOSED CHANGE:',
-      String(diff || '').slice(0, 6000),
-    ].join('\n')
-    : [
-      `FILE: ${file}`,
-      `STATED REASON: ${reason}`,
-      '',
-      'FIND:',
-      String(find || '').slice(0, 3000),
-      '',
-      'REPLACE:',
-      String(replace || '').slice(0, 3000),
-    ].join('\n');
+  const change = diff
+    ? `PROPOSED CHANGE (unified diff):\n${String(diff || '').slice(0, 8000)}`
+    : `PROPOSED CHANGE — exact find/replace:\nFIND:\n${String(find || '').slice(0, 3500)}\n\nREPLACE:\n${String(replace || '').slice(0, 3500)}`;
+  const user = [
+    'AVA COMPONENT MAP (every source file and what it does):',
+    (ctx && ctx.componentMap) || '(component map unavailable)',
+    '',
+    `FILE BEING CHANGED: ${file}`,
+    `STATED REASON FOR THE CHANGE: ${reason}`,
+    '',
+    `COMPLETE CURRENT CONTENT OF ${path.basename(String(file || ''))} (judge the edit in THIS context):`,
+    '=== CURRENT FILE START ===',
+    (ctx && ctx.fullFile) || '(file content unavailable)',
+    '=== CURRENT FILE END ===',
+    '',
+    change,
+  ].join('\n');
   try {
     const r = await call({ messages: [{ role: 'user', content: user }], system, maxTokens: 700, model });
     return normalizeReview(r.content || r.text || '', reviewer, r.model || model || reviewer);
@@ -367,6 +415,9 @@ async function runProposalReviewer({ reviewer, model, call, file, reason, find, 
 async function reviewProposal({ file, reason, find, replace, diff }) {
   const env = process.env;
   const reviews = [];
+  // Build AVA's full code context ONCE (component map of every source file + the COMPLETE target
+  // file) and give the same context to every reviewer, so they judge against the real codebase.
+  const ctx = buildCodebaseContext(file);
 
   reviews.push(await runProposalReviewer({
     reviewer: 'codex',
@@ -377,6 +428,7 @@ async function reviewProposal({ file, reason, find, replace, diff }) {
     find,
     replace,
     diff,
+    ctx,
   }));
 
   reviews.push(await runProposalReviewer({
@@ -388,6 +440,7 @@ async function reviewProposal({ file, reason, find, replace, diff }) {
     find,
     replace,
     diff,
+    ctx,
   }));
 
   let available = reviews.filter(r => r.recommendation !== 'unavailable');
@@ -403,7 +456,7 @@ async function reviewProposal({ file, reason, find, replace, diff }) {
         [{ role: 'system', content: opts.system }, ...opts.messages],
         { temperature: 0.2, max_tokens: opts.maxTokens || 700, model: opts.model }
       ),
-      file, reason, find, replace, diff,
+      file, reason, find, replace, diff, ctx,
     }));
     available = reviews.filter(r => r.recommendation !== 'unavailable');
   }
