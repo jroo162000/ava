@@ -259,6 +259,21 @@ function priorMistakeLessons() {
   return readLessons().map(rule => ({ source: 'rejected_proposal_or_review', lesson: rule }));
 }
 
+// When the REVIEWER denies a proposal, capture its concern/recommendation as actionable feedback so
+// the NEXT proposals incorporate it. It flows back via readLessons() -> the LESSONS block fed into
+// both the planner and the editor prompts, and via priorMistakeLessons() in the signals.
+function recordReviewerFeedback(file, changeReason, review) {
+  try {
+    if (!review) return;
+    const rec = String(review.recommendation || '').toLowerCase();
+    if (!/deny|reject|needs|concern|block|caution|revise/.test(rec)) return;  // only on a negative review
+    const why = String(review.reason || '').trim();
+    if (!why) return;
+    const f = file ? path.basename(String(file)) : 'a file';
+    addLesson(`Reviewer DENIED a change to ${f} ("${String(changeReason || '').slice(0, 100)}") because: ${why.slice(0, 280)}. When you propose changes to ${f} (or similar), incorporate this — fix the concern, don't repeat it.`);
+  } catch { /* optional */ }
+}
+
 function proposalTestLessons() {
   try {
     const repo = path.resolve(process.cwd(), '..');
@@ -440,7 +455,7 @@ async function runScan({ reason = 'scheduled', max = 1, avoid = [], diag: trigge
     const listing = cands.map(fileLabel).join('\n');
     const lessons = readLessons();
     const lessonsBlock = lessons.length
-      ? '\n\nLESSONS — past proposals of yours were REJECTED for these mistakes; do NOT repeat any of them:\n' + lessons.map(l => '- ' + l).join('\n')
+      ? '\n\nREVIEWER FEEDBACK & LESSONS — past proposals were denied/rejected for these reasons. AVOID repeating the mistakes AND incorporate the suggested fixes when you propose:\n' + lessons.map(l => '- ' + l).join('\n')
       : '';
     const planSys = [
       "You are AVA's self-improvement engine, improving a local voice assistant (Node server +",
@@ -571,6 +586,8 @@ async function runScan({ reason = 'scheduled', max = 1, avoid = [], diag: trigge
       find: edit.find,
       replace: edit.replace,
     });
+    // If the reviewer denied it, feed that concern back so the next proposals incorporate it.
+    recordReviewerFeedback(plan.file, plan.reason, proposalReview);
 
     // Stage the proposal (gate independently refuses protected files).
     const decisionModel = planModel && editModel && planModel !== editModel ? `${planModel} -> ${editModel}` : (editModel || planModel || '');
@@ -692,6 +709,7 @@ async function reproposeForFile({ file, intent = '', rejectionReason = '', fromI
 
   const reasonText = edit.reason || `Re-proposal of ${fromId || 'a rejected change'} for ${path.basename(target)} — addresses the rejection.`;
   const proposalReview = await reviewProposal({ file: target, reason: reasonText, find: edit.find, replace: edit.replace });
+  recordReviewerFeedback(target, reasonText, proposalReview);
   const metadata = {
     decisionModel: editModel, editModel,
     generatorReason: `reproposal of ${fromId || 'rejected change'}`,
