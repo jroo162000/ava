@@ -11,6 +11,8 @@ const LOGS_DIR = path.join(__dirname, '..', '..', 'logs');
 class SessionLogger {
   constructor() {
     this.currentSession = null;
+    this.sequence = 0;
+    this.runId = `${process.pid}-${Date.now()}`;
     this.ensureLogsDirectory();
     this.startNewSession();
   }
@@ -49,7 +51,7 @@ class SessionLogger {
     if (!this.currentSession) this.startNewSession();
 
     const entry = {
-      id: Date.now(),
+      id: `${this.runId}-${++this.sequence}`,
       timestamp: new Date().toISOString(),
       type, // 'user', 'assistant', 'system'
       content,
@@ -70,7 +72,7 @@ class SessionLogger {
     if (!this.currentSession) this.startNewSession();
 
     const entry = {
-      id: Date.now(),
+      id: `${this.runId}-${++this.sequence}`,
       timestamp: new Date().toISOString(),
       command,
       result: result?.substring?.(0, 1000) || result, // Truncate large outputs
@@ -92,7 +94,7 @@ class SessionLogger {
     if (!this.currentSession) this.startNewSession();
 
     const entry = {
-      id: Date.now(),
+      id: `${this.runId}-${++this.sequence}`,
       timestamp: new Date().toISOString(),
       filePath,
       operation, // 'create', 'update', 'delete'
@@ -118,7 +120,7 @@ class SessionLogger {
     if (!this.currentSession) this.startNewSession();
 
     const entry = {
-      id: Date.now(),
+      id: `${this.runId}-${++this.sequence}`,
       timestamp: new Date().toISOString(),
       message: error.message,
       stack: error.stack,

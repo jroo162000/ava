@@ -520,6 +520,14 @@ async function runScan({ reason = 'scheduled', max = 1, avoid = [], diag: trigge
       'or {"skip":true,"why":"..."}.',
       'Rules: "find" must be copied exactly from the file (same whitespace) and be unique. Keep the',
       'change minimal and correct. Do not reformat unrelated code.',
+      'COMPLETE & FUNCTIONAL (critical — past proposals failed here): your "replace" must be finished,',
+      'working code, not a sketch. If you add a function, field, command, parameter, branch, or doc',
+      'line, you MUST also include the code that actually IMPLEMENTS and USES it in the SAME edit.',
+      'NEVER produce: a docstring/comment describing behavior that is not implemented; a declared',
+      'variable/field that nothing reads; a function defined but never called; a TODO/placeholder/stub',
+      'or pass-only body; or a partial change that needs a follow-up to work. If a complete, working',
+      'change does not fit in one exact edit, SKIP instead. The result must run and do exactly what',
+      'your "reason" claims, with no further edits required.',
     ].join('\n') + lessonsBlock;
     const editUser = `CHANGE TO MAKE: ${plan.issue}\n\nFILE: ${plan.file}\n\n<<<FILE CONTENT>>>\n${content.slice(0, 18000)}\n<<<END>>>`;
     let edit = null;
@@ -657,6 +665,7 @@ async function reproposeForFile({ file, intent = '', rejectionReason = '', fromI
     'Output STRICT JSON only: {"find":"<substring copied VERBATIM from the file, appearing exactly once>","replace":"<corrected text>","reason":"<one line: what you changed and how it addresses the rejection>"}',
     'or {"skip":true,"why":"..."} if the rejection means this change should NOT be made to this file at all (e.g. it belongs in a different file).',
     'Rules: "find" must be copied exactly (same whitespace) and be unique. Keep it minimal and correct; do not reformat unrelated code.',
+    'COMPLETE & FUNCTIONAL: "replace" must be finished, working code. If you add a function/field/command/branch/doc, also include the code that IMPLEMENTS and USES it in the same edit. No docstrings without implementation, no unused declarations, no stubs/TODOs/placeholders, no partial change that needs a follow-up. It must run and do what your reason claims with no further edits — otherwise skip.',
   ].join('\n');
   const editUser = `ORIGINAL INTENT: ${intent || '(not recorded)'}\n\nWHY THE PREVIOUS PROPOSAL WAS REJECTED: ${rejectionReason || '(not recorded — infer the likely objections: wrong file/layer, too broad, mixed concerns, unsafe, or unverified — and avoid them)'}\n\nFILE: ${target}\n\n<<<FILE CONTENT>>>\n${content.slice(0, 18000)}\n<<<END>>>`;
 

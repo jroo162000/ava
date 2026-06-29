@@ -22,7 +22,7 @@ import skillCapture from '../services/skillCapture.js';
 import lessonLearner from '../services/lessonLearner.js';
 import sandbox from '../services/sandbox.js';
 import trainingGuidance from '../services/trainingGuidance.js';
-import { execSync, spawn } from 'child_process';
+import { execSync, spawn, execFile } from 'child_process';
 import crypto from 'crypto';
 import os from 'os';
 import agentLoop from '../services/agentLoop.js';
@@ -793,6 +793,39 @@ const router = express.Router();
 // Spoken approval/rejection/listing of AVA's proposed self-modifications. Returns a reply
 // string when the utterance is a self-mod intent, otherwise null (so /respond continues).
 // All actions go through the same worker store the UI panel reads, so voice + UI stay in sync.
+// Verify an APPLIED self-mod file actually PARSES (JS via `node --check`, Python via py_compile,
+// JSON via parse) — so we never tell the user a change is "done" when it left broken/unloadable
+// code on disk. Returns {ok} or {ok:false, error}.
+function verifyFileSyntax(file) {
+  return new Promise((resolve) => {
+    try {
+      if (!file || !fs.existsSync(file)) return resolve({ ok: true, skipped: true });
+      const ext = path.extname(String(file)).toLowerCase();
+      // Pull the meaningful error line (the SyntaxError), not node's "Node.js vXX" version footer.
+      const pickErr = (s) => {
+        const lines = String(s || '').split('\n').map(x => x.trim()).filter(Boolean);
+        return (lines.find(l => /error|invalid|unexpected/i.test(l)) || lines[lines.length - 1] || 'syntax check failed').slice(0, 220);
+      };
+      if (['.js', '.mjs', '.cjs', '.jsx'].includes(ext)) {
+        execFile(process.execPath, ['--check', file], { timeout: 10000, windowsHide: true }, (err, _so, se) => {
+          resolve(err ? { ok: false, error: pickErr(se || err.message) } : { ok: true });
+        });
+      } else if (ext === '.py') {
+        const venvPy = path.join(process.cwd(), '..', 'ava-integration', '.venv', 'Scripts', 'python.exe');
+        const py = fs.existsSync(venvPy) ? venvPy : (process.env.AVA_PYTHON || 'python');
+        execFile(py, ['-m', 'py_compile', file], { timeout: 12000, windowsHide: true }, (err, _so, se) => {
+          resolve(err ? { ok: false, error: pickErr(se || err.message) } : { ok: true });
+        });
+      } else if (ext === '.json') {
+        try { JSON.parse(fs.readFileSync(file, 'utf8')); resolve({ ok: true }); }
+        catch (e) { resolve({ ok: false, error: String(e.message).slice(0, 220) }); }
+      } else {
+        resolve({ ok: true, skipped: true });
+      }
+    } catch (e) { resolve({ ok: true, skipped: true }); }
+  });
+}
+
 async function handleSelfModVoice(userText) {
   const t = String(userText || '').toLowerCase();
   // CODE INTROSPECTION ≠ PROPOSAL QUEUE. "read your actual code", "have you been modified/upgraded
@@ -1017,6 +1050,10 @@ async function handleSelfModVoice(userText) {
     } else { const verb = wantsReject && !wantsApprove ? 'reject' : 'approve'; return `You have ${pending.length} changes pending. Which one — say the id, like "${verb} change ${pending[0].id}", or "${verb} all".`; }
   }
 
+  // Capture each pending change's file BEFORE applying, so we can syntax-verify it after.
+  const fileById = {};
+  for (const m of pending) fileById[m.id] = m.file || m.file_path;
+
   const action = (clearReject || (wantsReject && !wantsApprove)) ? 'reject' : 'approve';
   const results = [];
   for (const id of targets) {
@@ -1024,17 +1061,37 @@ async function handleSelfModVoice(userText) {
     catch (e) { results.push({ id, r: { status: 'error', message: e.message } }); }
   }
   if (action === 'approve') {
-    const ok = results.filter(x => x.r.status === 'success').map(x => x.id);
+    let ok = results.filter(x => x.r.status === 'success').map(x => x.id);
     const denied = results.filter(x => x.r.status === 'denied');
     const failed = results.filter(x => x.r.status !== 'success' && x.r.status !== 'denied');
     if (!ok.length && denied.length) return `I couldn't apply ${denied.map(x => x.id).join(', ')} — ${denied[0].r.message}`;
     if (!ok.length) return `I wasn't able to apply that — ${(results[0] && results[0].r.message) || 'unknown error'}. It's still in the queue for you.`;
+    // VERIFY each applied file actually PARSES; auto-revert any that don't. We do NOT tell the user
+    // a change is "done" when the code it left on disk is broken or wouldn't load.
+    const reverted = [];
+    const verified = [];
+    for (const id of ok) {
+      const hit = results.find(x => x.id === id);
+      const f = (hit && hit.r && (hit.r.file || hit.r.file_path)) || fileById[id];
+      const v = await verifyFileSyntax(f);
+      if (v.ok) verified.push(id);
+      else {
+        try { await pythonWorker.selfMod({ action: 'undo', modification_id: id }); } catch { /* best effort */ }
+        reverted.push({ id, file: base(f), error: v.error });
+      }
+    }
+    ok = verified;
     const tail = failed.length ? ` ${failed.length} couldn't apply and ${failed.length > 1 ? 'are' : 'is'} still waiting in the queue.` : '';
+    if (!ok.length && reverted.length) {
+      const r0 = reverted[0];
+      return `I applied ${reverted.length === 1 ? 'the change' : `${reverted.length} changes`}, but ${reverted.length === 1 ? 'it' : 'they'} failed a syntax check, so I reverted ${reverted.length === 1 ? 'it' : 'them'} — I won't say it's done when the code is broken.${r0 && r0.error ? ` (${r0.file}: ${r0.error})` : ''}${tail}`;
+    }
+    const revTail = reverted.length ? ` I also reverted ${reverted.length} that didn't pass a syntax check (${reverted.map(r => r.file).join(', ')}) rather than leave broken code in place.` : '';
     const restart = selfRestart.scheduleServerRestart({ reason: `voice approved proposal ${ok.join(', ')}` });
     const restartText = restart.scheduled
       ? ' I am refreshing my server now so the change can load; the voice runner stays up.'
       : ' Restart me when you are ready and the change will take effect.';
-    return `Done — I applied ${ok.length} change${ok.length > 1 ? 's' : ''} (${ok.join(', ')}) and backed up the original first.${tail}${restartText}`;
+    return `Done — I applied ${ok.length} change${ok.length > 1 ? 's' : ''} (${ok.join(', ')}), backed up the original, and verified ${ok.length > 1 ? 'they parse' : 'it parses'} cleanly.${revTail}${tail}${restartText}`;
   }
   const ok = results.filter(x => x.r.status === 'success').map(x => x.id);
   return `Okay — rejected ${ok.length} change${ok.length > 1 ? 's' : ''} (${ok.join(', ')}). Nothing was applied.`;
