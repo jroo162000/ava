@@ -872,21 +872,19 @@ async function handleSelfModVoice(userText) {
     const diffLines = diff ? diff.split('\n').filter(l => /^[+-]/.test(l) && !/^[+-]{3}/.test(l)).slice(0, 8) : [];
     const diffText = diffLines.length ? `\n\nWhat it would change in ${f}:\n\`\`\`\n${diffLines.join('\n')}\n\`\`\`` : '';
     if (wantsReproposeFromRec) {
+      // Targeted re-proposal: rework THIS rejected change (its own file, even if not in the
+      // autonomous candidate list) into a NEW edit that fixes why it was denied. Request-only.
+      const rejReason = String(mod.review_reason || mod.reviewReason
+        || (mod.metadata && (mod.metadata.reviewReason || mod.metadata.review_reason)) || '').trim();
       let r = null;
       try {
-        r = await selfImprove.runScan({
-          reason: `Re-propose a tighter, more approvable version of ${mod.id} for ${f}. Original rationale: ${reason}`,
-          diag: { issues: [{ category: 'reproposal_from_recommendation', description: reason, context: JSON.stringify({ from: mod.id, file: mod.file || mod.file_path, prior_status: mod.status }) }] }
-        });
+        r = await selfImprove.reproposeForFile({ file: mod.file || mod.file_path, intent: reason, rejectionReason: rejReason, fromId: mod.id });
       } catch (e) { r = { ok: false, error: e.message }; }
       r = (r && (r.result || r)) || {};
       if (r.proposed || r.id) {
-        return `Done — I drafted a fresh proposal${r.id ? ` (${r.id})` : ''} based on my recommendation for ${mod.id} (${f}). It's in your Proposed Changes panel to approve or reject.${diffText}`;
+        return `Done — I reworked ${mod.id} into a fresh proposal${r.id ? ` (${r.id})` : ''} for ${f}, this time fixing what got it rejected. It's in your Proposed Changes panel to approve or reject.`;
       }
-      if (/already running/i.test(String(r.error || r.note || ''))) {
-        return `A self-improvement scan is already running, so I couldn't seed one this second. Give it a moment and ask again — I'll base the new proposal on my recommendation for ${mod.id} (${f}): ${reason}${diffText}`;
-      }
-      return `I tried to draft a proposal from my recommendation for ${mod.id} (${f}), but ${r.error || r.note || 'nothing concrete enough got staged yet'}. The recommendation was: ${reason}${diffText}`;
+      return `I took another run at ${mod.id} (${f}), but ${r.note || r.error || "I couldn't land a clean fix that addresses the rejection"}. My recommendation was: ${reason}${diffText}`;
     }
     return `Here's the recommendation I gave with ${mod.id} (${f}):\n- ${reason}${diffText}\n\nWant me to act on it? Say "do a proposal based on that recommendation" and I'll draft a fresh one.`;
   }

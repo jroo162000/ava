@@ -622,6 +622,95 @@ async function runScan({ reason = 'scheduled', max = 1, avoid = [], diag: trigge
   }
 }
 
+// Re-propose a REJECTED change with a NEW edit that fixes WHY it was denied. Unlike runScan, the
+// target file is GIVEN (the rejected proposal's own file), so it works even when that file isn't in
+// CANDIDATE_FILES. This is REQUEST-ONLY (a person explicitly asks to re-propose); the autonomous
+// scan still stays inside the candidate allowlist. The approval/safety gate is still respected.
+const REPROPOSE_PROTECTED = ['ava_self_modification.py', 'learning.js', 'security.js', 'autonomyPolicy.js'];
+
+async function reproposeForFile({ file, intent = '', rejectionReason = '', fromId = '' } = {}) {
+  if (!pythonWorker.isReady || !pythonWorker.isReady()) return { ok: false, error: 'python worker not ready' };
+  if (!file) return { ok: false, error: 'no file to re-propose for' };
+  // Resolve to an existing absolute path (accept absolute, repo-relative, or basename).
+  let target = String(file);
+  try {
+    if (!fs.existsSync(target)) {
+      const base = path.basename(target);
+      const all = candidateFiles();
+      target = all.find(c => path.basename(c) === base)
+        || all.find(c => fileLabel(c) === target.replace(/\\/g, '/').split('/').slice(-2).join('/'))
+        || target;
+    }
+  } catch { /* ignore */ }
+  if (!fs.existsSync(target)) return { ok: false, error: `couldn't locate the file to re-propose (${path.basename(String(file))})` };
+  if (REPROPOSE_PROTECTED.includes(path.basename(target))) {
+    return { ok: false, error: `${path.basename(target)} is a protected safety/approval file — I won't re-propose changes to it.` };
+  }
+  let content = null;
+  try { content = fs.readFileSync(target, 'utf8'); } catch (e) { return { ok: false, error: `couldn't read ${path.basename(target)}: ${e.message}` }; }
+  if (content == null || content.trim().length < 20) return { ok: false, error: `couldn't read a usable ${path.basename(target)}` };
+
+  const editSys = [
+    'You are revising a previously REJECTED change to the file below. Produce ONE small, safe, exact find/replace edit that:',
+    '1) achieves the ORIGINAL INTENT, AND',
+    '2) directly FIXES the reason the earlier proposal was rejected — do not repeat that mistake.',
+    'Output STRICT JSON only: {"find":"<substring copied VERBATIM from the file, appearing exactly once>","replace":"<corrected text>","reason":"<one line: what you changed and how it addresses the rejection>"}',
+    'or {"skip":true,"why":"..."} if the rejection means this change should NOT be made to this file at all (e.g. it belongs in a different file).',
+    'Rules: "find" must be copied exactly (same whitespace) and be unique. Keep it minimal and correct; do not reformat unrelated code.',
+  ].join('\n');
+  const editUser = `ORIGINAL INTENT: ${intent || '(not recorded)'}\n\nWHY THE PREVIOUS PROPOSAL WAS REJECTED: ${rejectionReason || '(not recorded — infer the likely objections: wrong file/layer, too broad, mixed concerns, unsafe, or unverified — and avoid them)'}\n\nFILE: ${target}\n\n<<<FILE CONTENT>>>\n${content.slice(0, 18000)}\n<<<END>>>`;
+
+  let edit = null, editModel = '';
+  try {
+    const r = await llmService.chatSelfMod(
+      [{ role: 'system', content: editSys }, { role: 'user', content: editUser }],
+      { temperature: 0.1, max_tokens: 1800, model: process.env.AVA_SELFMOD_MODEL || 'claude-opus-4-8' }
+    );
+    editModel = r.provider || r.model || '';
+    edit = parseJsonLoose(String(r.text || r.content || ''));
+  } catch (e) {
+    return { ok: false, error: `couldn't draft the revised edit: ${e.message}` };
+  }
+  if (!edit || edit.skip || !edit.find || edit.replace == null) {
+    return { ok: true, proposed: 0, note: (edit && edit.why) || "on a second look, a clean fix for that rejection on this file isn't obvious — I'd rather not propose a guess." };
+  }
+  const occ = content.split(edit.find).length - 1;
+  if (occ !== 1) return { ok: true, proposed: 0, note: `the spot to change appears ${occ} times in ${path.basename(target)} — too ambiguous to edit cleanly.` };
+  let newContent = content.replace(edit.find, edit.replace);
+  if (content.includes('\r\n')) newContent = newContent.replace(/\r\n/g, '\n').replace(/\n/g, '\r\n');
+  else newContent = newContent.replace(/\r\n/g, '\n');
+  if (newContent === content) return { ok: true, proposed: 0, note: 'the revised change came out as a no-op.' };
+
+  const reasonText = edit.reason || `Re-proposal of ${fromId || 'a rejected change'} for ${path.basename(target)} — addresses the rejection.`;
+  const proposalReview = await reviewProposal({ file: target, reason: reasonText, find: edit.find, replace: edit.replace });
+  const metadata = {
+    decisionModel: editModel, editModel,
+    generatorReason: `reproposal of ${fromId || 'rejected change'}`,
+    proposedAt: new Date().toISOString(),
+    reviewRecommendation: proposalReview.recommendation,
+    reviewReason: proposalReview.reason,
+    reviewers: proposalReview.reviewers,
+    repropose_of: fromId || '',
+    addresses_rejection: String(rejectionReason || '').slice(0, 400),
+  };
+  const pf = await pythonWorker.selfMod({ action: 'propose_fix', file: target, content: newContent, reason: reasonText, metadata });
+  const res = (pf && (pf.result || pf)) || {};
+  if (res.status === 'proposed') {
+    logger.info('[selfImprove] queued a RE-proposal', { id: res.modification_id, file: path.basename(target), from: fromId });
+    try {
+      announceQueue.pushAnnouncement(await composeProposalAnnouncement({
+        file: target, reason: reasonText, recommendation: proposalReview.recommendation,
+        reviewReason: proposalReview.reason, id: res.modification_id,
+      }));
+    } catch { /* announce optional */ }
+    return {
+      ok: true, proposed: 1, id: res.modification_id, file: target, reason: reasonText, status: 'proposed',
+      reviewRecommendation: proposalReview.recommendation, reviewReason: proposalReview.reason,
+    };
+  }
+  return { ok: true, proposed: 0, status: res.status, note: res.message || "the revised proposal wasn't staged (the gate may have refused this file)." };
+}
+
 // --- Scheduling --------------------------------------------------------------
 function start() {
   if (process.env.AVA_SELF_IMPROVE_OFF === '1') { logger.info('[selfImprove] disabled via env'); return; }
@@ -633,5 +722,5 @@ function start() {
   logger.info('[selfImprove] scheduled', { everyMinutes: everyMs / 60000 });
 }
 
-export default { runScan, start, reviewProposal };
-export { runScan, start, reviewProposal };
+export default { runScan, start, reviewProposal, reproposeForFile };
+export { runScan, start, reviewProposal, reproposeForFile };
