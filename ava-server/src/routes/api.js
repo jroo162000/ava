@@ -209,12 +209,32 @@ function isSelfDescriptionRequest(text = '') {
   );
 }
 
+// True when the user is asking about HER OWN code — whether she's been upgraded/modified, what
+// changed, or to "self-diagnose" her code. These must NOT be treated as a generic tool request
+// (the word "diagnostic" otherwise shoves them at the agent, which mis-decides). Routed to the
+// conversational path, where the live env block (recent commits to her code) + persona answer
+// them reliably. Tool-HEALTH checks ("is your camera working") are intentionally excluded.
+function looksLikeCodeDiagnostics(text = '') {
+  const t = String(text || '').toLowerCase().trim();
+  if (!t) return false;
+  if (/\b(pending|proposed|proposal|waiting|approve)\b/.test(t)) return false;  // that's the proposal queue
+  const ownCode = /\b(your|my)\b[\s\S]{0,14}\bcode(base|s)?\b/.test(t)
+    || /\b(actual|real|source|own)\s+code\b/.test(t)
+    || /\bself.?diagnostic/.test(t)
+    || /\bbeen (modified|upgraded|updated|changed)\b/.test(t)
+    || /\b(have|did|were) you (been )?(get|got|been )?(upgrad|updat|modif)/.test(t)
+    || /\byou been (upgraded|modified|updated)\b/.test(t);
+  const changeIntent = /\b(modif|chang|updat|upgrad|diagnos|differ|new|recent|lately|on disk|integrity|commit|version)\b/.test(t);
+  return ownCode && changeIntent;
+}
+
 // True when a question implies a tool/data action that the runner's verb-based
 // gate misses (e.g. "what's on my calendar?", "do I have any emails?"). Lets such
 // question-phrased turns reach the tool path instead of just being described.
 function looksLikeToolRequest(text = '') {
   const t = String(text || '').toLowerCase().trim();
   if (!t) return false;
+  if (looksLikeCodeDiagnostics(t)) return false;  // answer from the env block, don't send to the agent
   return (
     /\b(calendar|schedule|agenda|appointments?|my events?|my meetings?|free time)\b/.test(t) ||
     /\b(emails?|inbox|gmail|unread|send (a |an )?(text|sms|message)|text my|message my)\b/.test(t) ||
@@ -775,6 +795,15 @@ const router = express.Router();
 // All actions go through the same worker store the UI panel reads, so voice + UI stay in sync.
 async function handleSelfModVoice(userText) {
   const t = String(userText || '').toLowerCase();
+  // CODE INTROSPECTION ≠ PROPOSAL QUEUE. "read your actual code", "have you been modified/upgraded
+  // lately", "what changed in your code", "run a self-diagnostic" are about her REAL source on disk —
+  // they must reach the agent (which has the self_diagnostics tool), NOT the canned "no proposed code
+  // changes waiting" reply. Only the proposal queue owns words like pending/proposed/waiting/approve.
+  const aboutProposalQueue = /\b(pending|proposed|propose|waiting|queue|queued|to (approve|review)|awaiting|outstanding|apply)\b/.test(t);
+  const stronglyActualCode = /\b(actual code|real code|read(?:ing)? (?:your|my|the) (?:own )?code|source code|code ?base|self.?diagnostic|diagnostics?|been (?:modified|upgraded|updated)|on disk|integrity)\b/.test(t);
+  const wantsCodeIntrospection = stronglyActualCode
+    || (/\b(your codes?|been changed|what(?:'s| has| was)? (?:changed|modified|updated)|recent (?:changes|modifications))\b/.test(t) && !aboutProposalQueue);
+  if (wantsCodeIntrospection) return null;
   const mentionsMod = /\b(change|changes|modification|modifications|code (change|edit|update|fix|fixes)|proposal|proposals|self.?mod|improvement|improvements)\b/.test(t);
   const idMatch = userText.match(/\b([0-9a-f]{6,8})\b/);
   const wantsCreateProposal = /\b(make|create|draft|generate|queue|run|do)\b[\s\S]{0,60}\b(proposal|proposed change|code change|fix|self.?mod|improvement)\b/.test(t)
@@ -1148,6 +1177,36 @@ router.post('/respond', async (req, res) => {
           }});
         }
       }
+    }
+
+    // CODE SELF-DIAGNOSTICS PATH: "do a self-diagnostic / full diagnosis of your code / integrity
+    // check" — run the self_diagnostics tool DIRECTLY and report her REAL recent changes. The word
+    // "diagnostic" otherwise shoves these at the agent, which mis-decides and falls back. Only the
+    // diagnostic-FRAMED code questions land here; plain "have you been upgraded?" / "what changed in
+    // your code?" stay on the warm conversational path (the env block answers those).
+    if (looksLikeCodeDiagnostics(userText)
+        && /\b(diagnos|integrity|full (diagnosis|scan)|check your (own )?code|inspect your code)\b/i.test(String(userText || ''))) {
+      let finalText = '';
+      try {
+        const r = await toolsService.executeTool('self_diagnostics', { hours: 72, limit: 12 },
+          false, { source: 'voice', bypassIdempotency: true });
+        const dr = (r && (r.result || r)) || {};
+        const inner = (dr.result && typeof dr.result === 'object') ? dr.result : dr;
+        const commits = Array.isArray(inner.recent_commits) ? inner.recent_commits.slice(0, 5) : [];
+        const files = Array.isArray(inner.recently_modified)
+          ? inner.recently_modified.slice(0, 8).map(f => f && f.file).filter(Boolean) : [];
+        const parts = [inner.message || ''];
+        if (commits.length) parts.push('Recent commits: ' + commits.join(' | '));
+        if (files.length) parts.push('Files I changed recently: ' + files.join(', '));
+        finalText = parts.filter(Boolean).join('\n');
+      } catch (e) { finalText = ''; }
+      if (finalText && finalText.length > 12) {
+        finalText = shapeSpokenReply(finalText, req.body || {});
+        try { conversationLogger.logAssistantMessage(finalText, { sessionId, responseType: 'self-diagnostics' }); } catch {}
+        return res.json({ ok: true, output_text: String(finalText || '').slice(0, 20000), display_text: finalText,
+          agent: { id: 'selfdiag-' + Date.now(), status: 'success', steps: 1, result: finalText, errors: [] } });
+      }
+      // tool failed → fall through to normal handling
     }
 
     // DIAGNOSE PATH: "diagnose / check / is your <X> tool working" — run self_awareness's

@@ -5,6 +5,7 @@
 // reality instead of a guess. Heavy bits (psutil CPU, window list) refresh in the BACKGROUND
 // so they never add latency to a reply. Toggle off with AVA_ENV_AWARENESS_OFF=1.
 import os from 'os';
+import { execFile } from 'child_process';
 import toolsService from './tools.js';
 import artifactMemory from './artifactMemory.js';
 import actionHistory from './actionHistory.js';
@@ -12,6 +13,33 @@ import logger from '../utils/logger.js';
 
 let _cache = { ts: 0, cpu: '', window: '', disk: '' };
 let _refreshing = false;
+
+// Recent changes to HER OWN source code (so she KNOWS when she's been upgraded instead of
+// insisting she's "the same as before"). git log from the server dir (inside the repo); cached
+// 5 min, refreshed in the background. Falls back to the standard Git-for-Windows path.
+let _codeCache = { ts: 0, text: '' };
+let _codeRefreshing = false;
+function _refreshCode() {
+  if (_codeRefreshing) return;
+  if (_codeCache.text && Date.now() - _codeCache.ts < 300000) return;
+  _codeRefreshing = true;
+  const dir = process.cwd();
+  const gitArgs = ['-C', dir, 'log', '-n', '6', '--pretty=format:%h %ad %s', '--date=short'];
+  const opts = { timeout: 6000, windowsHide: true };
+  const finish = (out) => {
+    const lines = String(out || '').trim().split('\n').filter(Boolean).slice(0, 6);
+    _codeCache = { ts: Date.now(), text: lines.join(' | ') || _codeCache.text };
+    _codeRefreshing = false;
+  };
+  execFile('git', gitArgs, opts, (err, stdout) => {
+    if (!err && stdout) return finish(stdout);
+    execFile('C:\\Program Files\\Git\\cmd\\git.exe', gitArgs, opts, (e2, out2) => {
+      if (!e2 && out2) return finish(out2);
+      _codeCache = { ts: Date.now(), text: _codeCache.text };
+      _codeRefreshing = false;
+    });
+  });
+}
 
 async function _refresh() {
   if (_refreshing) return;
@@ -82,6 +110,15 @@ export async function buildEnvironmentBlock() {
       const items = recent.map(a => a && (a.value || a.path || a.url || a.id)).filter(Boolean)
         .map(x => String(x).split(/[\\/]/).pop()).slice(0, 5);
       if (items.length) lines.push(`Things you just produced/opened this session (most recent last): ${items.join('; ')}`);
+    }
+  } catch { /* optional */ }
+  // Recent changes to HER OWN source code — so she KNOWS she's actively being upgraded and never
+  // says "I'm the same as before / I haven't received the upgrades". For "have you been upgraded?",
+  // "what changed in your code?", run the self_diagnostics tool for the full picture.
+  try {
+    _refreshCode();
+    if (_codeCache.text) {
+      lines.push(`Recent changes to YOUR OWN source code (git, newest first) — you ARE being upgraded; for a full "what changed in my code" report run the self_diagnostics tool: ${_codeCache.text}`);
     }
   } catch { /* optional */ }
   if (!lines.length) return '';

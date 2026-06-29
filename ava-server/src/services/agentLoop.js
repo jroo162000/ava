@@ -444,7 +444,44 @@ async function decide(state, observations) {
         decision.decision = DecisionType.TOOL_CALL;
         logger.warn('[agent] Invalid decision type but tool present; assuming tool_call', { tool: decision.tool });
       } else {
-        throw new Error(`Invalid decision type: ${decision.decision}`);
+        // No recognizable decision type and no tool. The model occasionally returns prose or an
+        // empty envelope for a perfectly clear request (e.g. "do a self-diagnostic"). Retry ONCE
+        // with a stricter, example-led nudge before giving up — a general robustness win.
+        let retried = null;
+        try {
+          const r2 = await llmService.chat([
+            { role: 'system', content: 'You are a task execution agent. Respond with EXACTLY ONE JSON object and no prose. To use a tool: {"decision":"tool_call","tool":"<tool_name>","args":{...}}. To answer directly: {"decision":"stop","result":"<your answer>","success":true}.' },
+            { role: 'user', content: prompt }
+          ], {
+            temperature: 0.2,
+            max_tokens: parseInt(process.env.AVA_DECISION_MAX_TOKENS || '', 10) || 4000,
+            model: process.env.AVA_DECISION_MODEL || 'gpt-5.1'
+          });
+          retried = parseDecisionJson(r2.text || r2.content || '');
+        } catch { retried = null; }
+
+        if (retried && retried.decision && Object.values(DecisionType).includes(retried.decision)) {
+          Object.assign(decision, retried);
+          logger.warn('[agent] Decision retry succeeded', { type: decision.decision, tool: decision.tool });
+        } else if (retried && retried.tool) {
+          decision.tool = retried.tool;
+          decision.args = retried.args || decision.args;
+          decision.decision = DecisionType.TOOL_CALL;
+          logger.warn('[agent] Decision retry produced a tool', { tool: decision.tool });
+        } else {
+          // Still nothing usable — answer directly rather than HARD-FAIL the turn (which used to
+          // surface as "I encountered an error deciding the next step: Invalid decision type").
+          const fallbackText = String(
+            decision.result || decision.answer || decision.message || decision.response
+            || decision.reasoning || decision.question
+            || (typeof text === 'string' && !text.trim().startsWith('{') ? text.trim() : '')
+            || ''
+          ).trim();
+          decision.decision = DecisionType.STOP;
+          decision.result = fallbackText || "Let me answer that directly — could you say a little more about what you'd like me to check?";
+          decision.success = !!fallbackText;
+          logger.warn('[agent] Invalid/empty decision after retry; answering directly', { hadText: !!fallbackText });
+        }
       }
     }
 
