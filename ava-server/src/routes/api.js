@@ -29,6 +29,7 @@ import agentLoop from '../services/agentLoop.js';
 import moltbookService from '../services/moltbook.js';
 import moltbookScheduler from '../services/moltbookScheduler.js';
 import selfImprove from '../services/selfImprove.js';
+import { verifyFileSyntax } from '../utils/verifyFileSyntax.js';
 import selfRestart from '../services/selfRestart.js';
 
 const recentTurnKeys = new Map();
@@ -793,38 +794,7 @@ const router = express.Router();
 // Spoken approval/rejection/listing of AVA's proposed self-modifications. Returns a reply
 // string when the utterance is a self-mod intent, otherwise null (so /respond continues).
 // All actions go through the same worker store the UI panel reads, so voice + UI stay in sync.
-// Verify an APPLIED self-mod file actually PARSES (JS via `node --check`, Python via py_compile,
-// JSON via parse) — so we never tell the user a change is "done" when it left broken/unloadable
-// code on disk. Returns {ok} or {ok:false, error}.
-function verifyFileSyntax(file) {
-  return new Promise((resolve) => {
-    try {
-      if (!file || !fs.existsSync(file)) return resolve({ ok: true, skipped: true });
-      const ext = path.extname(String(file)).toLowerCase();
-      // Pull the meaningful error line (the SyntaxError), not node's "Node.js vXX" version footer.
-      const pickErr = (s) => {
-        const lines = String(s || '').split('\n').map(x => x.trim()).filter(Boolean);
-        return (lines.find(l => /error|invalid|unexpected/i.test(l)) || lines[lines.length - 1] || 'syntax check failed').slice(0, 220);
-      };
-      if (['.js', '.mjs', '.cjs', '.jsx'].includes(ext)) {
-        execFile(process.execPath, ['--check', file], { timeout: 10000, windowsHide: true }, (err, _so, se) => {
-          resolve(err ? { ok: false, error: pickErr(se || err.message) } : { ok: true });
-        });
-      } else if (ext === '.py') {
-        const venvPy = path.join(process.cwd(), '..', 'ava-integration', '.venv', 'Scripts', 'python.exe');
-        const py = fs.existsSync(venvPy) ? venvPy : (process.env.AVA_PYTHON || 'python');
-        execFile(py, ['-m', 'py_compile', file], { timeout: 12000, windowsHide: true }, (err, _so, se) => {
-          resolve(err ? { ok: false, error: pickErr(se || err.message) } : { ok: true });
-        });
-      } else if (ext === '.json') {
-        try { JSON.parse(fs.readFileSync(file, 'utf8')); resolve({ ok: true }); }
-        catch (e) { resolve({ ok: false, error: String(e.message).slice(0, 220) }); }
-      } else {
-        resolve({ ok: true, skipped: true });
-      }
-    } catch (e) { resolve({ ok: true, skipped: true }); }
-  });
-}
+// verifyFileSyntax is shared with the /self_mod (UI) approve path — see utils/verifyFileSyntax.js.
 
 async function handleSelfModVoice(userText) {
   const t = String(userText || '').toLowerCase();

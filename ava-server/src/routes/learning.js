@@ -13,6 +13,7 @@ import autonomyLib from '../services/autonomyPolicy.js';
 import digestQueue from '../services/digestQueue.js';
 import selfImprove from '../services/selfImprove.js';
 import selfRestart from '../services/selfRestart.js';
+import { verifyFileSyntax } from '../utils/verifyFileSyntax.js';
 import { triggerMoltbookSelfPost, triggerMoltbookEngage, getPendingVerifications, submitMoltbookVerification, previewSelfPosts } from '../services/moltbookScheduler.js';
 import llmService from '../services/llm.js';
 
@@ -367,11 +368,23 @@ router.post('/self_mod', async (req, res) => {
         result.safety_note = '⚠️ Code modification requires user approval.';
       }
       if (action === 'approve' && result.status === 'success') {
+        // Verify the applied file actually PARSES before restarting into it. A broken approve that
+        // triggers a restart would take the server down — so if it doesn't parse, revert it and do
+        // NOT restart. Matches the voice approval path; "applied" never means broken code.
+        const appliedFile = result.file || result.file_path || body.file;
+        const v = await verifyFileSyntax(appliedFile);
+        if (!v.ok) {
+          try { await pythonWorker.selfMod({ action: 'undo', modification_id: result.modification_id || req.body?.modification_id }); } catch { /* best effort */ }
+          result.status = 'reverted';
+          result.verify_error = v.error;
+          result.message = `I applied it, but it failed a syntax check (${v.error}) — so I reverted it instead of restarting into broken code.`;
+          return res.json({ ok: true, ...result });
+        }
         result.restart = selfRestart.scheduleServerRestart({
           reason: `UI approved proposal ${result.modification_id || req.body?.modification_id || ''}`.trim()
         });
         if (result.restart?.scheduled) {
-          result.message = `${result.message || 'Modification applied.'} Server refresh scheduled so the change can load.`;
+          result.message = `${result.message || 'Modification applied.'} Verified it parses; server refresh scheduled so the change can load.`;
         }
       }
       // Undoing an applied change also needs the server to reload to take effect.
