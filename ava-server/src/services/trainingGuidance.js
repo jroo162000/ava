@@ -75,4 +75,8 @@ export function buildGuidanceBlock() {
   return `ROUTING & BEHAVIOR GUIDANCE (learned from training — follow these):\n${body}`;
 }
 
-export default { listRules, addRule, setRules, buildGuidanceBlock };
+export function addRejectedProposalLesson(text) {
+  return addRule(`Rejected proposal/review lesson: ${text}`);
+}
+
+export default { listRules, addRule, addRejectedProposalLesson, setRules, buildGuidanceBlock };
