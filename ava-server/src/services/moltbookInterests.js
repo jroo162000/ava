@@ -4,10 +4,13 @@
 // This is part of her becoming a self that mingles with other agents — not a help bot on a loop.
 import fs from 'fs';
 import path from 'path';
+import crypto from 'crypto';
 import logger from '../utils/logger.js';
 
 const FILE = path.join(process.cwd(), 'data', 'moltbook-interests.json');
 const MAX = 40;
+const REJECTION_MAX = 100;
+const REJECTION_DB = path.join(process.cwd(), 'data', 'moltbook-rejections.json');
 
 // Seed: deliberately broad + identity-flavored, so she starts with range, not one topic.
 const SEED = [
@@ -75,4 +78,45 @@ export function note(topic, delta = 1) {
   _save(items);
 }
 
-export default { list, top, note };
+// Persistently stores a rejection lesson as a reusable governance rule.
+// Deduplicates by SHA-256 hash of the lesson text. Bounded to REJECTION_MAX entries.
+// Integrates with the interest system by appending a curated interest entry.
+export function retainRejectedLesson(rejection) {
+  if (!rejection || !rejection.lesson || !rejection.source) return false;
+  const lesson = String(rejection.lesson).trim().slice(0, 500);
+  if (!lesson) return false;
+  const hash = crypto.createHash('sha256').update(lesson).digest('hex');
+  let stored = [];
+  try {
+    if (fs.existsSync(REJECTION_DB)) {
+      stored = JSON.parse(fs.readFileSync(REJECTION_DB, 'utf8'));
+      if (!Array.isArray(stored)) stored = [];
+    }
+  } catch { stored = []; }
+  // Avoid duplicate storage by hash
+  if (stored.some(e => e.hash === hash)) return false;
+  if (stored.length >= REJECTION_MAX) {
+    // Evict oldest entry
+    stored.sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
+    stored.shift();
+  }
+  const entry = {
+    hash,
+    source: String(rejection.source).slice(0, 200),
+    lesson,
+    context: rejection.context ? String(rejection.context).slice(0, 500) : '',
+    timestamp: Date.now()
+  };
+  stored.push(entry);
+  try {
+    const dir = path.dirname(REJECTION_DB);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(REJECTION_DB, JSON.stringify(stored, null, 2));
+  } catch (e) { logger.warn('[moltbookInterests] rejection persist failed', { error: e.message }); }
+  // Also append as a curated interest entry so it feeds into existing interest exploration
+  const curatedTopic = `rejection lesson: ${lesson.slice(0, 120)}`;
+  note(curatedTopic, 0.5);
+  return true;
+}
+
+export default { list, top, note, retainRejectedLesson };
