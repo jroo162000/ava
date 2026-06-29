@@ -390,7 +390,23 @@ async function reviewProposal({ file, reason, find, replace, diff }) {
     diff,
   }));
 
-  const available = reviews.filter(r => r.recommendation !== 'unavailable');
+  let available = reviews.filter(r => r.recommendation !== 'unavailable');
+  // BOTH primary reviewers unavailable (e.g. OpenAI 429 + Claude out of credits)? The reviewers
+  // call those providers DIRECTLY, so they don't fall through the resilient chain on their own —
+  // which left proposals unreviewed (defaulting to 'review'). Add a fallback reviewer that uses
+  // chatSelfMod, which routes through Gemini/DeepSeek/Grok, so a real verdict is still produced.
+  if (!available.length) {
+    reviews.push(await runProposalReviewer({
+      reviewer: 'fallback-chain',
+      model: env.AVA_SELFMOD_MODEL || 'claude-opus-4-8',
+      call: (opts) => llmService.chatSelfMod(
+        [{ role: 'system', content: opts.system }, ...opts.messages],
+        { temperature: 0.2, max_tokens: opts.maxTokens || 700, model: opts.model }
+      ),
+      file, reason, find, replace, diff,
+    }));
+    available = reviews.filter(r => r.recommendation !== 'unavailable');
+  }
   const denies = available.filter(r => r.recommendation === 'deny');
   const approves = available.filter(r => r.recommendation === 'approve');
   const recommendation = denies.length ? 'deny' : (approves.length ? 'approve' : 'review');
