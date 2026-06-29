@@ -14,6 +14,7 @@ import digestQueue from '../services/digestQueue.js';
 import selfImprove from '../services/selfImprove.js';
 import selfRestart from '../services/selfRestart.js';
 import { verifyFileSyntax } from '../utils/verifyFileSyntax.js';
+import workflowEngine from '../services/workflowEngine.js';
 import { triggerMoltbookSelfPost, triggerMoltbookEngage, getPendingVerifications, submitMoltbookVerification, previewSelfPosts } from '../services/moltbookScheduler.js';
 import llmService from '../services/llm.js';
 
@@ -642,5 +643,25 @@ router.post('/learn', async (req, res) => {
     res.json({ ok: true, learning: true });
   } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
 });
+
+// ---- Long-horizon WORKFLOWS: plan a big goal into stages, run them with checkpointing + replanning ----
+// Start a workflow: AVA plans the goal into stages and begins running them in the background.
+router.post('/workflow/start', async (req, res) => {
+  try {
+    const goal = req.body?.goal || req.body?.text;
+    if (!goal || String(goal).trim().length < 4) return res.status(400).json({ ok: false, error: 'goal required' });
+    res.json(await workflowEngine.start(goal));
+  } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+});
+// Status of one workflow (stages, progress, log).
+router.get('/workflow/:id', (req, res) => {
+  const wf = workflowEngine.get(req.params.id);
+  if (!wf) return res.status(404).json({ ok: false, error: 'not found' });
+  res.json({ ok: true, ...wf });
+});
+// List recent workflows.
+router.get('/workflows', (_req, res) => { res.json({ ok: true, workflows: workflowEngine.list() }); });
+// Resume a paused/incomplete workflow on demand.
+router.post('/workflow/:id/resume', (req, res) => { res.json(workflowEngine.resume(req.params.id)); });
 
 export default router;

@@ -24,6 +24,7 @@ import doctorService from './services/doctor.js';
 import digestScheduler from './services/digestScheduler.js';
 import moltbookScheduler from './services/moltbookScheduler.js';
 import selfImprove from './services/selfImprove.js';
+import workflowEngine from './services/workflowEngine.js';
 
 // Phase 7: Security audit at startup
 const isProd = process.env.NODE_ENV === 'production';
@@ -164,6 +165,14 @@ server.listen(PORT, HOST, () => {
     selfImprove.start();
   } catch (e) {
     logger.warn('Failed to start self-improvement loop', { error: e.message });
+  }
+
+  // Long-horizon workflows: resume any multi-stage workflow that was mid-run when we last stopped,
+  // picking up from its last checkpoint. This is what makes long workflows survive restarts.
+  try {
+    workflowEngine.resumeIncomplete();
+  } catch (e) {
+    logger.warn('Failed to resume incomplete workflows', { error: e.message });
   }
 
   // Moltbook learning/posting loop — user wants it running even in voice mode. Idempotent

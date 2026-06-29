@@ -149,7 +149,7 @@ function isMultiStepGoal(goal) {
 
 function createAgentState(goal, options = {}) {
   return {
-    _multiStep: isMultiStepGoal(goal),
+    _multiStep: options.multiStep !== undefined ? !!options.multiStep : isMultiStepGoal(goal),
     id: `agent-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
     goal,
     status: AgentStatus.RUNNING,
