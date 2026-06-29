@@ -818,6 +818,11 @@ async function handleSelfModVoice(userText) {
   // UNDO/REVERT is distinct from reject: reject drops a still-PENDING proposal; undo reverses a
   // change that was ALREADY APPLIED (restores the file to its pre-change state).
   const wantsUndo = /\b(undo|revert|roll ?back|reverse|put (it|that) back|take (it|that) back|restore (it|that|the change))\b/.test(t);
+  // PROVE an applied change actually went through — distinct from listing pending proposals.
+  // "show me proof the last change was applied", "did that change actually go through", "verify it landed".
+  const wantsProof = /\b(proof|prove|evidence|receipt)\b/.test(t)
+    || ((/\b(show me|verify|confirm|did|does|is|was)\b/.test(t))
+        && /\b(actually|really|went through|go through|took? effect|applied|land(ed)?|on disk|in the file)\b/.test(t));
   const hasObject = mentionsMod || !!idMatch || /\b(it|that|this one|the change|all of them|all|them)\b/.test(t);
   // Unambiguous verbs that need no object — a bare "I approve" / "approved" / "apply it" / "reject".
   const clearApprove = /\bapprove(d|al)?\b/.test(t)
@@ -829,7 +834,7 @@ async function handleSelfModVoice(userText) {
 
   if (wantsCreateProposal && !wantsApprove && !wantsReject && !wantsUndo) return null;
   const clearIntent = clearApprove || clearReject || ((wantsApprove || wantsReject) && hasObject);
-  if (!wantsList && !clearIntent && !bareAffirm && !wantsUndo) return null;
+  if (!wantsList && !clearIntent && !bareAffirm && !wantsUndo && !wantsProof) return null;
 
   let lp;
   try { lp = await pythonWorker.selfMod({ action: 'list_pending' }); } catch { return null; }
@@ -876,6 +881,43 @@ async function handleSelfModVoice(userText) {
       return `Nothing's been applied, so there's nothing to undo. You do have ${pending.length} change${pending.length > 1 ? 's' : ''} pending — say "reject change ${pending[0].id}" to drop ${pending.length > 1 ? 'them' : 'it'}.`;
     }
     return "There's nothing applied to undo right now — nothing's been changed that I'd need to put back.";
+  }
+
+  // PROVE AN APPLIED CHANGE WENT THROUGH — show real evidence (file, applied-at time, a diff,
+  // and a fresh read-back of the file), not the pending list. This backs up "I applied it".
+  if (wantsProof && !clearIntent) {
+    let all = [];
+    try { const la = await pythonWorker.selfMod({ action: 'list_all' }); all = (la && (la.all || (la.result && la.result.all))) || []; } catch {}
+    const applied = (Array.isArray(all) ? all : []).filter(m => String(m.status || '') === 'applied');
+    if (!applied.length) {
+      return "Nothing's been applied yet, so there's no applied change for me to prove. I only change a file after you approve a proposal — and right now I don't have an applied one to point to.";
+    }
+    let mod = null;
+    if (idMatch) mod = applied.find(m => m.id === idMatch[1] || String(m.id).startsWith(idMatch[1]));
+    if (!mod) mod = applied.slice().sort((a, b) => new Date(b.applied_at || b.created || 0) - new Date(a.applied_at || a.created || 0))[0];
+    const file = mod.file || mod.file_path || '';
+    const when = mod.applied_at ? new Date(mod.applied_at).toLocaleString() : 'an unknown time';
+    const diff = String(mod.diff || '').trim();
+    const addedLines = diff ? diff.split('\n').filter(l => /^\+/.test(l) && !/^\+{3}/.test(l)).map(l => l.replace(/^\+/, '')) : [];
+    // READ-BACK: confirm the change is actually in the file on disk, using a distinctive ADDED line
+    // from the diff (list_all carries the diff even when it omits the full new_content).
+    let presentNote = '';
+    let verified = false;
+    try {
+      const cur = fs.readFileSync(file, 'utf8');
+      const probeCandidates = addedLines.map(s => s.trim()).filter(s => s.length > 12);
+      const fromNew = String(mod.new_content || '').trim().split('\n').map(s => s.trim()).filter(s => s.length > 12);
+      const probe = probeCandidates.length ? probeCandidates[probeCandidates.length - 1] : (fromNew.length ? fromNew[fromNew.length - 1] : '');
+      if (probe && cur.includes(probe)) { verified = true; presentNote = `I just re-opened ${base(file)} and the new code IS in the file — verified it's actually on disk.`; }
+      else if (probe) { presentNote = `But re-opening ${base(file)}, I couldn't find that new line in it — the change may not have really landed. Worth a closer look.`; }
+      else { presentNote = `I re-opened ${base(file)} to check it.`; }
+    } catch (e) { presentNote = `I couldn't re-open ${base(file)} to double-check it (${e.code || e.message}).`; }
+    const diffLines = diff ? diff.split('\n').filter(l => /^[+-]/.test(l) && !/^[+-]{3}/.test(l)).slice(0, 6) : [];
+    const diffText = diffLines.length ? `\n\nWhat changed:\n\`\`\`\n${diffLines.join('\n')}\n\`\`\`` : '';
+    const head = verified
+      ? `Here's the proof for change ${mod.id} — it went through.`
+      : `Here's what I have on change ${mod.id}.`;
+    return `${head}\n- File: ${base(file)}\n- Status: applied at ${when}.\n- ${presentNote}${diffText}\n\nThe file is written the moment I apply it; it only goes LIVE in my running process after a restart.`;
   }
 
   // LIST
