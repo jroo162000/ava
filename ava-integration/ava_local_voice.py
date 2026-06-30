@@ -801,6 +801,17 @@ class LocalVoiceRunner:
                 stop_floor = max(stop_floor, _cfg_int(vad_cfg, "AVA_LOCAL_VAD_REALTEK_STOP_RMS", "local_realtek_stop_rms", 1800))
         start = max(int(noise_floor * start_mult), int(median * median_start_mult), start_floor)
         stop = max(int(noise_floor * stop_mult), int(median * median_stop_mult), stop_floor)
+        if sensitive_device:
+            # Close-talk USB/headset mics: cap the auto-calibrated trigger so a noisy moment at
+            # startup can't push vad_start so high that normal speech never crosses it (we saw it
+            # calibrate to 1606 once, blocking speech that was getting through). The non-sensitive
+            # path already has its own ceiling below; sensitive devices had none. Tunable; 0=off.
+            sens_start_ceiling = _cfg_int(vad_cfg, "AVA_LOCAL_VAD_SENSITIVE_MAX_START_RMS", "local_sensitive_max_start_rms", 900)
+            if sens_start_ceiling > 0:
+                start = min(start, max(start_floor, sens_start_ceiling))
+            sens_stop_ceiling = _cfg_int(vad_cfg, "AVA_LOCAL_VAD_SENSITIVE_MAX_STOP_RMS", "local_sensitive_max_stop_rms", 500)
+            if sens_stop_ceiling > 0:
+                stop = min(stop, max(stop_floor, sens_stop_ceiling))
         if not sensitive_device:
             start_ceiling = _cfg_int(vad_cfg, "AVA_LOCAL_VAD_BUILTIN_MAX_START_RMS", "local_builtin_max_start_rms", 850)
             stop_ceiling = _cfg_int(vad_cfg, "AVA_LOCAL_VAD_BUILTIN_MAX_STOP_RMS", "local_builtin_max_stop_rms", 500)
