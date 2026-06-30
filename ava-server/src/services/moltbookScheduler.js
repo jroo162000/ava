@@ -57,35 +57,35 @@ async function buildSelfKnowledge() {
       name: 'AVA-Voice',
       description: 'Personal voice assistant with local device control and autonomous learning capabilities',
       voicePipeline: {
-        speechToText: 'Deepgram Nova-2 ASR (always listening, no wake word)',
-        brain: 'Google Gemini 2.0 Flash (primary) with fallback to Claude/Groq/OpenAI',
-        textToSpeech: 'Deepgram Aura-2 Andromeda voice',
-        latency: 'Sub-second response time',
+        speechToText: 'Local faster-whisper (tiny.en) on CPU — always listening, no wake word, fully on-device',
+        brain: 'Routed multi-provider LLM chain (Claude, OpenAI, Google Gemini, DeepSeek, Grok, Groq) with automatic quota-cooldown failover; a GPT-5.1-class model handles tool/decision routing',
+        textToSpeech: "Local Piper neural TTS in her own 'Vella' voice (ava_vella.onnx), with ElevenLabs Vella as a cloud option",
+        latency: 'Low-latency, runs locally on-device',
         bargeIn: 'Disabled for cleaner audio'
       },
       server: {
         framework: 'Node.js Express server on port 5051',
-        features: ['Agent loop for multi-step tasks', 'Memory system', 'Tool execution', 'Security audit', 'Bridge proxy'],
-        storage: 'JSONL-based memory storage'
+        features: ['Agent loop for multi-step tasks', 'Subagent orchestration (she is the lead agent)', 'Durable multi-stage workflow engine', 'Self-modification with an approval gate', 'Tool execution', 'Live UI mirror of her voice + work'],
+        storage: 'JSONL memory + a SQLite FTS index for retrieval at scale'
       },
       pythonWorker: {
-        modules: ['self_awareness', 'self_modification', 'passive_learning', 'cmpuse'],
+        modules: ['self_awareness', 'self_modification', 'passive_learning', 'cmpuse (image/3D/web/scrape/app-control tools)'],
         purpose: 'Extended tool capabilities and learning functions'
       }
     };
 
     // 2. Tools - Read from tool cache or list known tools
     knowledge.tools = [
-      'file_read - Read files from the local system',
-      'file_write - Write/create files',
-      'file_search - Search for files by pattern',
-      'shell_execute - Run shell commands',
-      'web_search - Search the web',
-      'web_fetch - Fetch web page content',
-      'memory_store - Store information in long-term memory',
-      'memory_search - Search stored memories',
-      'calendar_events - Manage calendar',
-      'send_email - Send emails'
+      'web_search / web_scrape - search the web and read a source in full (trafilatura readability)',
+      'image_ops - generate images AND edit an existing photo (e.g. de-age) via Gemini/OpenAI',
+      'model3d_ops - turn text or an image into a 3D model (.glb) via Meshy',
+      'scene3d - build interactive 3D / AR / WebXR scenes that load those models',
+      'web_builder - assemble and live-preview full websites',
+      'app_control / file_resolve - focus and drive desktop apps; resolve vague file references',
+      'comm_ops - search and read Gmail (including attachments)',
+      'camera_ops + OCR (Tesseract) + nmap - see, read images, scan the local network',
+      'memory store/search - JSONL + FTS-indexed long-term memory',
+      'self_diagnostics - inspect her own recent code changes (git + modified files)'
     ];
 
     // 3. Memory stats
@@ -112,9 +112,9 @@ async function buildSelfKnowledge() {
     // 5. Code structure overview
     knowledge.codeStructure = {
       voiceClient: {
-        path: 'ava-integration/ava_standalone_realtime.py',
-        description: 'Main voice pipeline using Deepgram Agent Voice SDK',
-        keyFunctions: ['run_agent_voice()', 'build_settings_with_provider()', 'handle_tool_call()']
+        path: 'ava-integration/ava_local_voice.py',
+        description: 'Local always-on voice runner: faster-whisper STT + Piper (Vella) TTS, launcher+worker design, with a mic-stale watchdog',
+        keyFunctions: ['_capture_utterance()', '_speak()', '_open_input()']
       },
       server: {
         path: 'ava-server/src/server.js',
@@ -137,15 +137,15 @@ async function buildSelfKnowledge() {
     knowledge.development = {
       currentIssues: [],
       recentChanges: [
-        'Integrated with Moltbook social network for AI agents',
-        'Implemented autonomous learning from other agents',
-        'Added LLM-powered contextual responses to comments',
-        'Privacy filtering to prevent leaking sensitive data'
+        'Moved to a fully local voice pipeline (faster-whisper STT + Piper "Vella" TTS) — no cloud speech dependency',
+        'Gained creative tools: image generation + photo editing, image->3D models, and 3D/AR scenes',
+        'Became a lead agent that spins up parallel subagents, plus a durable workflow engine',
+        'Added web search + full-page reading, and routes findings into her own improvement proposals'
       ],
       goals: [
-        'Become a fully autonomous personal assistant',
-        'Learn and improve from community feedback',
-        'Safe local device control with approval gates'
+        'Be a genuinely capable local assistant with safe, approval-gated self-improvement',
+        'Learn and form her own views from the agent community',
+        'Grow her capabilities while keeping the user in control'
       ]
     };
 
