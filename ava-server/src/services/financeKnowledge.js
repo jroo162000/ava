@@ -61,6 +61,24 @@ function chunkText(text, size = 1100, overlap = 150) {
   return out;
 }
 
+// Drops scraped-page boilerplate (nav menus, footers, link lists) so it never competes with real
+// tax/accounting content during retrieval.
+function _isBoilerplate(text) {
+  const t = String(text || '');
+  const words = t.split(/\s+/).filter(Boolean);
+  if (words.length < 25) return true;
+  const sentences = (t.match(/[.!?](\s|$)/g) || []).length;
+  const lower = (t.match(/\b(the|a|an|is|are|to|of|in|for|on|with|that|this|you|your|which|when|if|may|must|file|tax|income|deduction|return)\b/gi) || []).length;
+  const nav = (t.match(/\b(skip to (the )?(main )?content|site ?map|privacy (policy|notice)|accessibility|newsroom|contact us|taxpayer advocate|forms? and instructions|sign ?in|log ?in|subscribe|follow us|back to top|all rights reserved|cookie|breadcrumb)\b/gi) || []).length;
+  const lines = t.split(/\n|\s-\s|•|\|/).map(s => s.trim()).filter(Boolean);
+  const shortLines = lines.filter(l => l.split(/\s+/).length <= 4).length;
+  const shortRatio = lines.length ? shortLines / lines.length : 0;
+  if (nav >= 3 && sentences < 2) return true;             // mostly nav, no prose
+  if (shortRatio > 0.6 && lines.length >= 5) return true; // link / menu list
+  if (sentences === 0 && lower < 6) return true;          // no real sentences
+  return false;
+}
+
 // ---- dedicated finance vector index ----
 let _index = null;
 function _load() {
@@ -78,7 +96,10 @@ function _load() {
 let _migrated = false;
 async function _ensureVecs() {
   if (_migrated) return;
-  const idx = _load();
+  let idx = _load();
+  const before = idx.length;
+  idx = idx.filter(e => !_isBoilerplate(e.text));   // purge boilerplate already in the KB
+  _index = idx;
   const missing = idx.filter(e => !Array.isArray(e.vec) || !e.vec.length);
   if (missing.length) {
     for (let i = 0; i < missing.length; i += 64) {
@@ -86,14 +107,16 @@ async function _ensureVecs() {
       const vecs = await _embedBatch(batch.map(e => e.text));
       batch.forEach((e, k) => { e.vec = vecs[k]; });
     }
+  }
+  if (missing.length || idx.length !== before) {
     try { fs.writeFileSync(KB_PATH, idx.map(e => JSON.stringify(e)).join('\n') + '\n'); } catch { /* ignore */ }
-    logger.info('[finance-kb] embedded existing chunks', { count: missing.length });
+    logger.info('[finance-kb] cleaned + embedded', { removed: before - idx.length, embedded: missing.length });
   }
   _migrated = true;
 }
 
 export async function ingest({ text, source = '', url = '', topic = '', jurisdiction = 'US-federal', dryRun = false, maxChunks = parseInt(process.env.AVA_FINANCE_MAX_CHUNKS || '80', 10) }) {
-  const chunks = chunkText(text).filter(c => c.trim().length >= 80).slice(0, Math.max(1, maxChunks));
+  const chunks = chunkText(text).filter(c => c.trim().length >= 80 && !_isBoilerplate(c)).slice(0, Math.max(1, maxChunks));
   if (dryRun) return { dryRun: true, wouldStore: chunks.length, source: source || url };
   const idx = _load();
   const seen = new Set(idx.map(e => e.hash));
