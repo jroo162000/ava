@@ -809,6 +809,14 @@ async function handleSelfModVoice(userText) {
     || (/\b(your codes?|been changed|what(?:'s| has| was)? (?:changed|modified|updated)|recent (?:changes|modifications))\b/.test(t) && !aboutProposalQueue);
   if (wantsCodeIntrospection) return null;
   const mentionsMod = /\b(change|changes|modification|modifications|code (change|edit|update|fix|fixes)|proposal|proposals|self.?mod|improvement|improvements)\b/.test(t);
+  // A request to BUILD/CREATE a CONTENT artifact (image, 3D, hologram, avatar, scene, site, UI,
+  // picture, video) is NOT a self-mod approval — even when it contains "go ahead"/"yes"/"that"
+  // (which otherwise satisfy wantsApprove + hasObject and falsely approve a pending proposal).
+  // Route it to the agent's creative tools (image_ops/scene3d/model3d_ops/web_builder) instead.
+  // Fixes: "yes go ahead and build that 3D hologram for your UI" applying a code change.
+  const wantsCreativeBuild = /\b(build|create|make|draw|design|generate|render|model|turn (it|that|this))\b/.test(t)
+    && /\b(hologram|holographic|avatar|image|images|picture|portrait|photo|3 ?d|three.?d|scene|environment|model|website|web ?page|web ?site|\bui\b|interface|video|art|graphic|logo|render)\b/.test(t);
+  if (wantsCreativeBuild && !mentionsMod) return null;
   const idMatch = userText.match(/\b([0-9a-f]{6,8})\b/);
   const wantsCreateProposal = /\b(make|create|draft|generate|queue|run|do)\b[\s\S]{0,60}\b(proposal|proposed change|code change|fix|self.?mod|improvement)\b/.test(t)
     || /\b(proposal|proposed change|code change|fix|self.?mod|improvement)\b[\s\S]{0,60}\b(for|from|about|based on)\b/.test(t);
