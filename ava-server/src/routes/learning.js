@@ -21,6 +21,8 @@ import memorySearch from '../services/memorySearch.js';
 import { triggerMoltbookSelfPost, triggerMoltbookEngage, getPendingVerifications, submitMoltbookVerification, previewSelfPosts } from '../services/moltbookScheduler.js';
 import llmService from '../services/llm.js';
 import avaSelf from '../services/avaSelf.js';
+import financeKnowledge from '../services/financeKnowledge.js';
+import toolsService from '../services/tools.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -290,6 +292,39 @@ router.get('/self/theme', (_req, res) => {
 });
 router.get('/self/board', (_req, res) => {
   try { res.json({ ok: true, ...avaSelf.getBoard() }); }
+  catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+});
+
+// Finance/bookkeeping/tax knowledge harness (RAG). Ingest an authoritative source (scraped via
+// web_scrape, or pass text directly) into the finance KB; search it; check coverage.
+router.post('/finance/ingest', async (req, res) => {
+  try {
+    const { url, source, topic, jurisdiction, text } = req.body || {};
+    let bodyText = text;
+    if (!bodyText && url) {
+      const r = await toolsService.executeTool('web_scrape', { url }, false, { source: 'finance', bypassIdempotency: true });
+      const inner = (r && (r.result || r)) || {};
+      bodyText = inner.text || inner.content || inner.article || inner.markdown
+        || (inner.result && (inner.result.text || inner.result.content || inner.result.article)) || '';
+    }
+    if (!bodyText || String(bodyText).trim().length < 80) {
+      return res.status(400).json({ ok: false, error: 'no usable text (provide text, or a url web_scrape can read)' });
+    }
+    const out = await financeKnowledge.ingest({
+      text: bodyText, source: source || url || '', url: url || '', topic: topic || '', jurisdiction: jurisdiction || 'US-federal'
+    });
+    res.json({ ok: true, ...out });
+  } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+});
+router.post('/finance/search', async (req, res) => {
+  try {
+    const { q, k } = req.body || {};
+    const hits = await financeKnowledge.search(String(q || ''), k || 6);
+    res.json({ ok: true, count: hits.length, results: hits.map(h => ({ text: String(h.text || '').slice(0, 320), score: h.score, tags: h.tags })) });
+  } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+});
+router.get('/finance/stats', (_req, res) => {
+  try { res.json({ ok: true, ...financeKnowledge.stats() }); }
   catch (e) { res.status(500).json({ ok: false, error: e.message }); }
 });
 

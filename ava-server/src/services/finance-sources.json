@@ -1,0 +1,18 @@
+{
+  "jurisdiction": "US-federal",
+  "note": "Authoritative, public, citable sources. AVA ingests these via web_scrape into the finance KB. Re-fetch yearly — tax tables, brackets, and standard deductions change each tax year. State-specific sources get added once the state is chosen.",
+  "sources": [
+    { "source": "IRS Publication 17 — Your Federal Income Tax (For Individuals)", "url": "https://www.irs.gov/publications/p17", "topic": "personal-income-tax" },
+    { "source": "IRS Publication 334 — Tax Guide for Small Business", "url": "https://www.irs.gov/publications/p334", "topic": "small-business-tax" },
+    { "source": "IRS Publication 583 — Starting a Business and Keeping Records", "url": "https://www.irs.gov/publications/p583", "topic": "recordkeeping" },
+    { "source": "IRS Publication 535 — Business Expenses", "url": "https://www.irs.gov/forms-pubs/about-publication-535", "topic": "business-expenses" },
+    { "source": "IRS Publication 946 — How To Depreciate Property", "url": "https://www.irs.gov/publications/p946", "topic": "depreciation" },
+    { "source": "IRS Publication 463 — Travel, Gift, and Car Expenses", "url": "https://www.irs.gov/publications/p463", "topic": "deductions" },
+    { "source": "IRS Publication 538 — Accounting Periods and Methods", "url": "https://www.irs.gov/publications/p538", "topic": "accounting-methods" },
+    { "source": "IRS Publication 542 — Corporations", "url": "https://www.irs.gov/publications/p542", "topic": "entity-corporations" },
+    { "source": "IRS Schedule C Instructions (Form 1040)", "url": "https://www.irs.gov/instructions/i1040sc", "topic": "schedule-c" },
+    { "source": "IRS Self-Employed Individuals Tax Center", "url": "https://www.irs.gov/businesses/small-businesses-self-employed/self-employed-individuals-tax-center", "topic": "self-employment" },
+    { "source": "IRS Estimated Taxes", "url": "https://www.irs.gov/businesses/small-businesses-self-employed/estimated-taxes", "topic": "estimated-taxes" },
+    { "source": "SEC Investor.gov — How to read a financial statement", "url": "https://www.investor.gov/introduction-investing/investing-basics/how-stock-markets-work/how-read-financial-statement", "topic": "financial-statements" }
+  ]
+}
