@@ -14,6 +14,7 @@ import toolsService from './tools.js';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const KB_PATH = path.join(__dirname, '..', '..', '..', 'ava-integration', 'memory', 'finance-kb.jsonl');
 const SOURCES_PATH = path.join(__dirname, 'finance-sources.json');
+const STATES_PATH = path.join(__dirname, 'finance-sources-states.json');
 
 const STATES = [
   'Alabama', 'Alaska', 'Arizona', 'Arkansas', 'California', 'Colorado', 'Connecticut', 'Delaware',
@@ -125,7 +126,9 @@ export function runPopulate() {
   if (_pop.running) return { already: true, ..._pop };
   let federal = [];
   try { federal = JSON.parse(fs.readFileSync(SOURCES_PATH, 'utf8')).sources || []; } catch { /* ignore */ }
-  _pop = { running: true, total: federal.length + STATES.length, done: 0, ok: 0, failed: 0, lastSource: '', startedAt: new Date().toISOString(), finishedAt: null };
+  let states = [];
+  try { states = JSON.parse(fs.readFileSync(STATES_PATH, 'utf8')).states || []; } catch { /* ignore */ }
+  _pop = { running: true, total: federal.length + states.length, done: 0, ok: 0, failed: 0, lastSource: '', startedAt: new Date().toISOString(), finishedAt: null };
 
   (async () => {
     for (const s of federal) {
@@ -134,14 +137,17 @@ export function runPopulate() {
       if (txt && txt.length >= 200) { try { await ingest({ text: txt, source: s.source, url: s.url, topic: s.topic, jurisdiction: 'US-federal' }); ok = true; } catch { /* skip */ } }
       _pop.done++; _pop.lastSource = s.source; ok ? _pop.ok++ : _pop.failed++;
     }
-    for (const st of STATES) {
+    for (const st of states) {
       let ok = false;
-      const url = await _findStateUrl(st);
-      if (url) {
-        const txt = await _scrapeText(url);
-        if (txt && txt.length >= 200) { try { await ingest({ text: txt, source: `${st} state tax authority`, url, topic: 'state-income-tax', jurisdiction: `US-${st}` }); ok = true; } catch { /* skip */ } }
+      // Curated official URL first; fall back to a per-state web_search lookup if that yields nothing.
+      let txt = await _scrapeText(st.url);
+      let usedUrl = st.url;
+      if (!(txt && txt.length >= 200)) {
+        const alt = await _findStateUrl(st.state);
+        if (alt) { const t2 = await _scrapeText(alt); if (t2 && t2.length >= 200) { txt = t2; usedUrl = alt; } }
       }
-      _pop.done++; _pop.lastSource = st; ok ? _pop.ok++ : _pop.failed++;
+      if (txt && txt.length >= 200) { try { await ingest({ text: txt, source: `${st.state} — ${st.agency}`, url: usedUrl, topic: 'state-tax', jurisdiction: `US-${st.state}` }); ok = true; } catch { /* skip */ } }
+      _pop.done++; _pop.lastSource = st.state; ok ? _pop.ok++ : _pop.failed++;
     }
     _pop.running = false; _pop.finishedAt = new Date().toISOString();
     logger.info('[finance-kb] populate complete', { ok: _pop.ok, failed: _pop.failed, total: _pop.total });
