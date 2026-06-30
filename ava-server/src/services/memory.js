@@ -4,6 +4,7 @@
 
 import fs from 'fs';
 import path from 'path';
+import os from 'os';
 import { fileURLToPath } from 'url';
 import config from '../utils/config.js';
 import logger from '../utils/logger.js';
@@ -136,6 +137,14 @@ class MemoryService {
     this.sqlite = null;
     this.db = null;
     this.initializeStorage();
+
+    // Periodic forgetting: archive stale, low-value memories to the on-device cold vault.
+    // Opt-out via AVA_MEMORY_FORGET_ENABLED=0. Conservative defaults (45-day TTL, priority<=2).
+    if ((process.env.AVA_MEMORY_FORGET_ENABLED || '1') !== '0') {
+      const everyMs = Math.max(1, parseInt(process.env.AVA_MEMORY_FORGET_EVERY_HOURS || '6', 10)) * 3600000;
+      this._forgetTimer = setInterval(() => { this.forgetStale().catch(() => {}); }, everyMs);
+      if (this._forgetTimer && this._forgetTimer.unref) this._forgetTimer.unref();
+    }
   }
 
   async initializeStorage() {
@@ -351,6 +360,82 @@ class MemoryService {
         logger.warn('Failed to update last_used_at', { error: error.message });
       }
     }
+  }
+
+  /**
+   * Forgetting: move stale, low-value memories OUT of AVA's active memory into an on-device
+   * "cold vault" she does NOT read. Nothing is deleted — it's preserved on disk outside her
+   * memory dir/repo, so she genuinely forgets while the data still lives on the machine.
+   *
+   * Protected and never forgotten: CONSTRAINT, WARNING, PREFERENCE; priority > maxPriority;
+   * rated (upvoted) items; anything used within the TTL window; meta.protected.
+   *
+   * @param {object} opts
+   * @param {number} opts.ttlDays   age + idle threshold in days (default AVA_MEMORY_TTL_DAYS=45)
+   * @param {number} opts.maxPriority only forget items at/below this priority (default 2)
+   * @param {boolean} opts.dryRun    compute what WOULD be forgotten without mutating
+   * @param {string}  opts.vaultDir  override the on-device cold-vault directory
+   */
+  async forgetStale(opts = {}) {
+    const now = Date.now();
+    const ttlDays = opts.ttlDays ?? parseInt(process.env.AVA_MEMORY_TTL_DAYS || '45', 10);
+    const maxPriority = opts.maxPriority ?? parseInt(process.env.AVA_MEMORY_FORGET_MAX_PRIORITY || '2', 10);
+    const ttlMs = Math.max(0, ttlDays) * 86400000;
+    const PROTECTED = new Set([MemoryType.CONSTRAINT, MemoryType.WARNING, MemoryType.PREFERENCE]);
+
+    const toForget = this.memory.filter(m => {
+      if (!m) return false;
+      if (m.meta && m.meta.protected) return false;     // explicitly pinned
+      if (PROTECTED.has(m.type)) return false;           // safety + user prefs stay forever
+      if ((m.priority || 3) > maxPriority) return false; // only low-value
+      if ((m.rating || 0) > 0) return false;             // keep anything upvoted
+      const age = now - (m.created_at || now);
+      if (age < ttlMs) return false;                     // not old enough
+      const lastUsed = m.last_used_at || m.created_at || now;
+      if ((now - lastUsed) < ttlMs) return false;        // recently used -> keep
+      return true;
+    });
+
+    if (opts.dryRun) {
+      return {
+        forgotten: toForget.length, dryRun: true, vault: null,
+        samples: toForget.slice(0, 8).map(m => ({
+          id: m.id, type: m.type, priority: m.priority,
+          ageDays: +(((now - (m.created_at || now)) / 86400000).toFixed(1)),
+          text: String(m.text || '').slice(0, 70)
+        }))
+      };
+    }
+    if (!toForget.length) return { forgotten: 0, vault: null };
+
+    // Append to an on-device vault OUTSIDE AVA's data dir / repo. Nothing in AVA reads this path.
+    const vaultDir = opts.vaultDir || process.env.AVA_COLD_STORAGE_DIR || path.join(os.homedir(), 'ava_cold_storage');
+    let vaultPath = null;
+    try {
+      fs.mkdirSync(vaultDir, { recursive: true });
+      vaultPath = path.join(vaultDir, 'forgotten-memories.jsonl');
+      const archivedAt = new Date().toISOString();
+      fs.appendFileSync(vaultPath, toForget.map(m => JSON.stringify({ ...m, archivedAt })).join('\n') + '\n');
+    } catch (e) {
+      logger.warn('[memory] cold-vault write failed; aborting forget to avoid data loss', { error: e.message });
+      return { forgotten: 0, vault: null, error: e.message };  // never drop memories if the vault write failed
+    }
+
+    const forgetIds = new Set(toForget.map(m => m.id));
+    this.memory = this.memory.filter(m => !forgetIds.has(m.id));
+    try {
+      if (this.db) {
+        const del = this.db.prepare('DELETE FROM mem WHERE id = ?');
+        for (const id of forgetIds) del.run(id);
+      } else {
+        fs.writeFileSync(VECTORS_PATH, this.memory.map(m => JSON.stringify(m)).join('\n') + (this.memory.length ? '\n' : ''));
+      }
+    } catch (e) {
+      logger.warn('[memory] forget: active-store removal failed (already archived to vault)', { error: e.message });
+    }
+
+    logger.info('[memory] Forgot stale memories -> on-device cold vault', { forgotten: forgetIds.size, vault: vaultPath });
+    return { forgotten: forgetIds.size, vault: vaultPath };
   }
 
   /**

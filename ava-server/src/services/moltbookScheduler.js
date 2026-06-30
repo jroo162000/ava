@@ -9,6 +9,7 @@ import memoryService, { MemoryType, MemorySource } from './memory.js';
 import digestQueue from './digestQueue.js';
 import personaSvc from './persona.js';
 import interests from './moltbookInterests.js';
+import selfReflections from './selfReflections.js';
 import logger from '../utils/logger.js';
 import fs from 'fs';
 import path from 'path';
@@ -1103,6 +1104,7 @@ Write a reply to ${commenter}'s comment. If they're asking about my architecture
     const reply = result.content?.trim();
 
     if (reply && reply.length > 10) {
+      try { selfReflections.captureFrom(reply, 'moltbook-reply'); } catch { /* non-critical */ }
       return reply;
     }
 
@@ -1186,6 +1188,7 @@ Return STRICT JSON only: {"submolt":"<one of: ${KNOWN_SUBMOLTS.join(', ')}>","ti
     const j = m ? JSON.parse(m[0]) : null;
     if (j && j.title && j.content) {
       const sub = KNOWN_SUBMOLTS.includes(j.submolt) ? j.submolt : 'general';
+      try { selfReflections.captureFrom(`${j.title}. ${j.content}`, 'moltbook-post'); } catch { /* non-critical */ }
       return { submolt: sub, title: String(j.title).slice(0, 140), content: String(j.content).slice(0, 1500), mode: mode.key };
     }
   } catch (e) { logger.warn('[moltbook-scheduler] self-post generation failed', { error: e.message }); }
@@ -1206,6 +1209,7 @@ You're scrolling the feed and this post caught your eye. Reply with a SHORT, gen
       { temperature: 0.85, max_tokens: 220 }
     );
     const c = String(r.text || r.content || '').trim();
+    if (c) { try { selfReflections.captureFrom(c, 'moltbook-comment'); } catch { /* non-critical */ } }
     return c ? c.slice(0, 500) : null;
   } catch (e) { logger.warn('[moltbook-scheduler] feed-comment generation failed', { error: e.message }); return null; }
 }

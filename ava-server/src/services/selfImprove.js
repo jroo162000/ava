@@ -534,9 +534,19 @@ async function runScan({ reason = 'scheduled', max = 1, avoid = [], diag: trigge
       }
     } catch { /* ignore */ }
 
+    // Her own first-person reflections about her design/limits/wants (selfReflections) so the
+    // proposer can act on what SHE said she'd change — not only failures/diagnostics.
+    let recentReflections = [];
+    try {
+      const sr = await import('./selfReflections.js');
+      const fn = sr.default?.actionable || sr.actionable;
+      recentReflections = (fn ? fn(10) : []).map(r => String(r.text || '').slice(0, 280)).filter(Boolean);
+    } catch { /* ignore */ }
+
     const signals = {
       trigger_reason: String(reason || '').slice(0, 1200),
       recent_research: recentResearch,
+      self_reflections: recentReflections,
       diagnostics: diagIssues.slice(0, 8),
       proposal_tests: proposalTests,
       prior_mistake_lessons: mistakes,
