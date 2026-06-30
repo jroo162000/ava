@@ -9,6 +9,13 @@ import llmService from './llm.js';
 import agentLoop from './agentLoop.js';
 import environmentContext from './environmentContext.js';
 import subagentRoles from './subagentRoles.js';
+import { emitVoiceEvent } from './voiceBus.js';
+
+// Mirror live lead/subagent activity to the UI (the /voice/ws bus) so the user can WATCH the
+// workflow happen — planning, each subagent starting/finishing, and synthesis. Never throws.
+function _emit(phase, label, detail, source = 'lead') {
+  try { emitVoiceEvent('agent.activity', { phase, label, detail: detail ? String(detail).slice(0, 200) : '' }, source); } catch { /* ignore */ }
+}
 
 const FILE = path.join(process.cwd(), 'data', 'orchestrations.json');
 const MAX_SUBAGENTS = parseInt(process.env.AVA_MAX_SUBAGENTS || '6', 10);
@@ -64,6 +71,7 @@ async function runSubagent(sub, sharedCtx) {
   let env = '';
   try { env = await environmentContext.buildEnvironmentBlock(); } catch { env = ''; }
   const roleDef = subagentRoles.getRole(sub.role);
+  _emit('subagent_start', `Subagent: ${roleDef.name}`, sub.goal, 'subagent');
   const goal = [
     roleDef.prompt,  // role's specialized instructions (Claude-SDK style)
     `You are a SUBAGENT (role: ${roleDef.name}) working under AVA, the lead agent. Do ONLY your assigned task, use your (scoped) tools as needed, and report a clear, complete result.`,
@@ -75,6 +83,7 @@ async function runSubagent(sub, sharedCtx) {
     source: 'subagent', canDelegate: false, role: roleDef.name, allowedTools: roleDef.allow,
   });
   const ok = state && state.status === agentLoop.AgentStatus.SUCCESS;
+  _emit('subagent_done', `Subagent ${roleDef.name}: ${ok ? 'done' : 'failed'}`, sub.goal, 'subagent');
   return {
     role: roleDef.name, goal: sub.goal, status: ok ? 'done' : 'failed',
     result: String((state && (state.final_result || (state.last_result && state.last_result.message))) || '').slice(0, 1200),
@@ -115,14 +124,17 @@ async function orchestrate({ goal, subtasks, sharedContext, synthesize: doSynth 
   const subs = _normalizeSubs(raw);
   if (!subs.length) return { ok: false, id, error: "I couldn't break that into subtasks to delegate." };
   logger.info('[subagents] lead spawning subagents', { id, count: subs.length, roles: subs.map(s => s.role), createdRoles });
+  _emit('delegate', `Spinning up ${subs.length} subagent${subs.length > 1 ? 's' : ''}`, subs.map(s => s.role).join(', '), 'lead');
   const t0 = Date.now();
   const results = await _runAll(subs, sharedContext);
+  if (doSynth) _emit('synthesize', 'Combining subagent results', `${results.length} done`, 'lead');
   const synthesis = doSynth ? await synthesize(String(goal || ''), results) : '';
   const rec = { id, goal: String(goal || ''), createdAt: new Date().toISOString(), ms: Date.now() - t0, createdRoles, subagents: results, synthesis };
   _ring.push({ id, goal: rec.goal, count: results.length, at: rec.createdAt });
   if (_ring.length > 50) _ring.shift();
   _persist(rec);
   logger.info('[subagents] orchestration done', { id, subagents: results.length, ms: rec.ms });
+  _emit('done', 'Workflow complete', `${results.length} subagents, ${Math.round(rec.ms / 1000)}s`, 'lead');
   return { ok: true, ...rec };
 }
 
