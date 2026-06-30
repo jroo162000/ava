@@ -479,6 +479,27 @@ class LocalVoiceRunner:
         except Exception:
             pass
 
+    def _reopen_input(self) -> None:
+        """Self-heal a stale/suspended mic stream by closing and reopening it.
+        The USB device tests fine on a fresh open, but a long-held PyAudio stream can fall
+        silent (e.g. after a USB power event); reopening restores live audio. Uses the same
+        device selection as startup (honors AVA_INPUT_DEVICE / config)."""
+        old = self.input_stream
+        self.input_stream = None
+        try:
+            if old is not None:
+                try:
+                    old.stream.stop_stream()
+                except Exception:
+                    pass
+                try:
+                    old.stream.close()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        self.input_stream = self._open_input()
+
     def _device_info(self, idx: int) -> dict:
         return dict(self.audio.get_device_info_by_index(idx))
 
@@ -943,6 +964,29 @@ class LocalVoiceRunner:
                                 f" near_start_peak={near_start_peak}"
                             )
                         _log(f"mic_idle frames={len(idle_rms)} rms={mean} peak={peak} vad_start={start_rms}{near_detail}")
+                        # mic-stale watchdog: a live mic always shows at least a little ambient
+                        # noise. If the stream returns near-digital-silence (peak<=thresh) for
+                        # several heartbeats in a row, the USB input has gone stale/suspended (it
+                        # tests fine on a fresh open), so reopen it to self-heal. Any real signal
+                        # resets the counter.
+                        try:
+                            _dead_peak = int(os.getenv("AVA_LOCAL_MIC_DEAD_PEAK", "4") or "4")
+                            _dead_needed = int(os.getenv("AVA_LOCAL_MIC_DEAD_HEARTBEATS", "4") or "4")
+                        except Exception:
+                            _dead_peak, _dead_needed = 4, 4
+                        if peak <= _dead_peak:
+                            self._mic_dead_beats = getattr(self, "_mic_dead_beats", 0) + 1
+                            if self._mic_dead_beats >= _dead_needed:
+                                _log(f"mic_stale_reopen dead_beats={self._mic_dead_beats} peak={peak}")
+                                try:
+                                    self._reopen_input()
+                                    stream = self.input_stream.stream
+                                    frames_per_buffer = self.input_stream.frames_per_buffer
+                                except Exception as _exc:
+                                    _log(f"mic_reopen_failed={_exc}")
+                                self._mic_dead_beats = 0
+                        else:
+                            self._mic_dead_beats = 0
                         idle_rms.clear()
                         near_start_frames = 0
                         near_start_peak = 0
