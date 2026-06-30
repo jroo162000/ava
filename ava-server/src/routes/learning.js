@@ -20,6 +20,7 @@ import ftsIndex from '../services/ftsIndex.js';
 import memorySearch from '../services/memorySearch.js';
 import { triggerMoltbookSelfPost, triggerMoltbookEngage, getPendingVerifications, submitMoltbookVerification, previewSelfPosts } from '../services/moltbookScheduler.js';
 import llmService from '../services/llm.js';
+import avaSelf from '../services/avaSelf.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -279,6 +280,17 @@ router.post('/self/learn_correction', async (req, res) => {
     const response = await pythonWorker.learnCorrection(user_input, wrong, correct, context);
     res.json(response.ok ? { ok: true, learned: response.result === true } : { ok: false, error: response.error });
   } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+});
+
+// AVA's self-expression (appearance + her "chewing on" board). Served to the UI; she sets them
+// via the self_express tool with no approval (data files only, no behavior change).
+router.get('/self/theme', (_req, res) => {
+  try { res.json({ ok: true, theme: avaSelf.getTheme() }); }
+  catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+});
+router.get('/self/board', (_req, res) => {
+  try { res.json({ ok: true, ...avaSelf.getBoard() }); }
+  catch (e) { res.status(500).json({ ok: false, error: e.message }); }
 });
 
 router.post('/self_mod', async (req, res) => {

@@ -10,6 +10,7 @@ import logger from '../utils/logger.js';
 import pythonWorker from './pythonWorker.js';
 import securityService from '../utils/security.js';
 import moltbookService from './moltbook.js';
+import avaSelf from './avaSelf.js';
 import { emitVoiceEvent } from './voiceBus.js';
 import fileGen from './fileGen.js';
 import memorySearch from './memorySearch.js';
@@ -184,9 +185,25 @@ class ToolsService {
         requires_confirm: false,
         risk_level: 'low'
       },
-      { 
-        name: 'fs_read', 
-        description: 'Read a text file from whitelisted paths', 
+      {
+        name: 'self_express',
+        description: "Change how YOUR OWN UI LOOKS and what you're chewing on — your space, no approval needed. action 'set_theme' with theme {accent, accent2, bg, panel, text, muted} (CSS colors) recolors your interface; action 'set_board' with items:[...] sets your \"what I'm chewing on\" list (up to 8 short notes); action 'get' returns the current theme + board. Appearance + self-notes only; it can't change how anything works.",
+        source: 'builtin',
+        schema: {
+          type: 'object',
+          properties: {
+            action: { type: 'string', enum: ['set_theme', 'set_board', 'get'] },
+            theme: { type: 'object', description: 'For set_theme: any of accent, accent2, bg, panel, text, muted as CSS color strings' },
+            items: { type: 'array', items: { type: 'string' }, description: 'For set_board: up to 8 short notes about what you are chewing on' }
+          },
+          required: ['action']
+        },
+        requires_confirm: false,
+        risk_level: 'low'
+      },
+      {
+        name: 'fs_read',
+        description: 'Read a text file from whitelisted paths',
         source: 'builtin',
         schema: {
           type: 'object',
@@ -585,6 +602,16 @@ class ToolsService {
           }
           const detail = Array.isArray(result.message) ? result.message.join('; ') : (result.message || '');
           return { ok: false, error: (result.error || 'Failed to post') + (detail ? ` — ${detail}` : '') };
+        } catch (e) {
+          return { ok: false, error: e.message };
+        }
+
+      case 'self_express':
+        try {
+          const act = (args.action || 'get').toLowerCase();
+          if (act === 'set_theme') return { ok: true, result: avaSelf.setTheme(args.theme || {}) };
+          if (act === 'set_board') return { ok: true, result: avaSelf.setBoard(args.items || []) };
+          return { ok: true, result: { theme: avaSelf.getTheme(), board: avaSelf.getBoard() } };
         } catch (e) {
           return { ok: false, error: e.message };
         }
