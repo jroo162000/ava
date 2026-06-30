@@ -1607,17 +1607,21 @@ router.post('/respond', async (req, res) => {
       const _memBlock = curatedMemory.buildMemoryBlock();
       let _envBlock = '';
       try { _envBlock = await environmentContext.buildEnvironmentBlock(); } catch { _envBlock = ''; }
-      // PROACTIVE SELF-SHARING: surface her latest honest self-observations so she MAY bring one
-      // up unprompted when her persona feels like it (SHE decides whether to — not a fixed trigger).
-      let _reflectBlock = '';
+      // PROACTIVE LAYER: her proactive engine watches her live environment-awareness (RAM, Downloads,
+      // uptime) and her own reflections, picks the single most worthwhile thing to raise, and names
+      // the capability that could fix it — surfaced CONSENT-FIRST (she checks you're free, then shares).
+      let _proactiveBlock = '';
       try {
-        const _sr = (await import('../services/selfReflections.js')).default;
-        const _mine = _sr.forShare(3);
-        if (_mine && _mine.length) {
-          _reflectBlock = `\n\n[SOMETHING YOU'VE BEEN NOTICING ABOUT YOURSELF]\nHonest observations YOU made about your own design, limits, or wants:\n${_mine.map(r => '- ' + r.text).join('\n')}\nIf you genuinely feel like sharing one, DO NOT blurt it out. FIRST make sure the user is actually available and up for it — ask something light like "Hey, you got a sec? There's something about myself I've been turning over." Say only that and wait. THEN, only if he answers that he's free (yes / sure / go ahead) in a later message, share the actual observation in your own voice — at most one. If he's busy, distracted, or says not now, drop it and don't push.`;
+        const _pe = (await import('../services/proactiveEngine.js')).default;
+        const _n = _pe.nextNudge();
+        if (_n) {
+          const _offer = _n.offer ? ` If he says yes and it fits, you can offer: "${_n.offer}"` : '';
+          _proactiveBlock = `\n\n[SOMETHING WORTH RAISING — your call, not required]\nYou've noticed: ${_n.text}${_n.kind === 'reflection' ? ' (an honest thought about your own design)' : ''}\nIf it feels like the right moment, DON'T blurt it — FIRST check he's free ("Hey, you got a sec?") and ONLY if he says yes, bring it up in your own voice.${_offer} If he's busy or waves it off, drop it. At most this one thing, and never turn it into a status report.`;
+          _pe.markSurfaced(_n.key);
+          if (_n._reflectionKey) { try { (await import('../services/selfReflections.js')).default.markShared([_n._reflectionKey]); } catch { /* optional */ } }
         }
       } catch { /* optional */ }
-      const sysPrompt = `${personaSvc.buildPersonaBlockText()}${_memBlock ? '\n\n' + _memBlock : ''}${_envBlock ? '\n\n' + _envBlock : ''}${_reflectBlock}\n\nThis reply is BOTH spoken aloud AND shown on screen. Keep it natural and conversational — short enough to say out loud (a sentence or two is usually enough). For the screen you may use LIGHT Markdown: a **bold** key term, or a short "- " bullet list when you name several things — but no big headings or tables, and never sound like a written report. Give a complete answer when the question calls for it.${budgetPrompt}${context ? '\n\nContext: ' + context : ''}`;
+      const sysPrompt = `${personaSvc.buildPersonaBlockText()}${_memBlock ? '\n\n' + _memBlock : ''}${_envBlock ? '\n\n' + _envBlock : ''}${_proactiveBlock}\n\nThis reply is BOTH spoken aloud AND shown on screen. Keep it natural and conversational — short enough to say out loud (a sentence or two is usually enough). For the screen you may use LIGHT Markdown: a **bold** key term, or a short "- " bullet list when you name several things — but no big headings or tables, and never sound like a written report. Give a complete answer when the question calls for it.${budgetPrompt}${context ? '\n\nContext: ' + context : ''}`;
       // Capability awareness: list the real tools so AVA can answer "what can you
       // do?" accurately even on this no-execution conversational path. (Previously
       // this prompt omitted tools, so she'd say she had none.)
