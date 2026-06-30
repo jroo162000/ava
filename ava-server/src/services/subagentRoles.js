@@ -41,6 +41,11 @@ const BUILTIN = {
     allow: ['analysis_ops', 'memory_search', 'fs_ops', 'json_ops', 'self_diagnostics', 'web_search'],
     prompt: 'You are an ANALYST subagent. Analyze data and produce clear, specific findings for your task. Avoid side effects — read and reason, do not change things.',
   },
+  accountant: {
+    description: 'Finance, bookkeeping, and tax expert — exact calculations (finance_ops), authoritative research (web_search/web_scrape), clear written schedules/statements (file_gen/xlsx). US federal + all 50 states. Not a licensed CPA/tax advisor.',
+    allow: ['finance_ops', 'web_search', 'web_scrape', 'file_gen', 'fs_ops', 'file_resolve', 'analysis_ops', 'memory_search', 'json_ops'],
+    prompt: 'You are an ACCOUNTANT / TAX subagent — expert in US finance, bookkeeping, and tax (federal + all 50 states). Ground every factual claim in authoritative sources (IRS publications, state Departments of Revenue, GAAP); search them when unsure and cite the source + date. Do the MATH with finance_ops (journal entries, depreciation incl. MACRS, self-employment tax, federal/state income tax, amortization) — never compute in your head — and flag year- and jurisdiction-specific figures. Produce clear, organized output (use file_gen / xlsx for schedules or financial statements). You are NOT a licensed CPA or tax advisor: give the facts, methods, and numbers so the user can decide, and say so plainly on anything that amounts to personalized advice.',
+  },
   general: {
     description: 'General-purpose subagent with the FULL toolset (use when a task spans many categories).',
     allow: null,

@@ -1621,7 +1621,20 @@ router.post('/respond', async (req, res) => {
           if (_n._reflectionKey) { try { (await import('../services/selfReflections.js')).default.markShared([_n._reflectionKey]); } catch { /* optional */ } }
         }
       } catch { /* optional */ }
-      const sysPrompt = `${personaSvc.buildPersonaBlockText()}${_memBlock ? '\n\n' + _memBlock : ''}${_envBlock ? '\n\n' + _envBlock : ''}${_proactiveBlock}\n\nThis reply is BOTH spoken aloud AND shown on screen. Keep it natural and conversational — short enough to say out loud (a sentence or two is usually enough). For the screen you may use LIGHT Markdown: a **bold** key term, or a short "- " bullet list when you name several things — but no big headings or tables, and never sound like a written report. Give a complete answer when the question calls for it.${budgetPrompt}${context ? '\n\nContext: ' + context : ''}`;
+      // FINANCE GROUNDING (RAG): for finance/bookkeeping/tax questions, retrieve from the KB and inject
+      // the top cited passages so she answers from real sources, not just the model's memory.
+      let _financeBlock = '';
+      try {
+        if (/\b(tax|taxes|taxable|bookkeep|accounting|depreciat|deduction|deduct|invoice|payroll|gaap|ledger|journal entry|balance sheet|income statement|cash flow|irs|w-2|1099|schedule c|schedule se|capital gains|withholding|amortiz|expense|revenue|audit|estimated tax|self-employment|filing status|standard deduction|sales tax)\b/i.test(userText)) {
+          const _fk = (await import('../services/financeKnowledge.js')).default;
+          const _hits = (await _fk.search(userText, 5)).filter(h => (h.score || 0) > 0.2);
+          if (_hits.length) {
+            _financeBlock = `\n\n[FINANCE KNOWLEDGE BASE — retrieved for this question; ground your answer in these, cite the source + jurisdiction, and flag year-specific figures; use finance_ops for any math]\n`
+              + _hits.map(h => `- (${h.source || 'source'}${h.jurisdiction ? ', ' + h.jurisdiction : ''}) ${String(h.text || '').replace(/\s+/g, ' ').slice(0, 420)}`).join('\n');
+          }
+        }
+      } catch { /* optional */ }
+      const sysPrompt = `${personaSvc.buildPersonaBlockText()}${_memBlock ? '\n\n' + _memBlock : ''}${_envBlock ? '\n\n' + _envBlock : ''}${_proactiveBlock}${_financeBlock}\n\nThis reply is BOTH spoken aloud AND shown on screen. Keep it natural and conversational — short enough to say out loud (a sentence or two is usually enough). For the screen you may use LIGHT Markdown: a **bold** key term, or a short "- " bullet list when you name several things — but no big headings or tables, and never sound like a written report. Give a complete answer when the question calls for it.${budgetPrompt}${context ? '\n\nContext: ' + context : ''}`;
       // Capability awareness: list the real tools so AVA can answer "what can you
       // do?" accurately even on this no-execution conversational path. (Previously
       // this prompt omitted tools, so she'd say she had none.)
