@@ -180,3 +180,4 @@ gcp-*.json
 ava-integration/backup/
 backup_*/
 **/snapshots/
+ava-integration/memory/research-notes.jsonl

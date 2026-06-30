@@ -521,8 +521,22 @@ async function runScan({ reason = 'scheduled', max = 1, avoid = [], diag: trigge
       return { ok: true, proposed: 0, note: 'Nothing to improve — no recent failures, issues, learnings, or diagnostics.' };
     }
 
+    // Recent web research she's done (web_search/web_scrape -> research-notes.jsonl) so proposals
+    // can be GROUNDED in what she's actually learned, not only internal signals.
+    let recentResearch = [];
+    try {
+      const _memDir = process.env.AVA_INTEGRATION_DIR ? path.join(process.env.AVA_INTEGRATION_DIR, 'memory') : path.join(os.homedir(), 'ava', 'ava-integration', 'memory');
+      const _rp = path.join(_memDir, 'research-notes.jsonl');
+      if (fs.existsSync(_rp)) {
+        recentResearch = fs.readFileSync(_rp, 'utf8').trim().split('\n').filter(Boolean).slice(-12)
+          .map(l => { try { const e = JSON.parse(l); return { topic: e.topic, summary: String(e.summary || '').slice(0, 280), url: e.url }; } catch { return null; } })
+          .filter(Boolean);
+      }
+    } catch { /* ignore */ }
+
     const signals = {
       trigger_reason: String(reason || '').slice(0, 1200),
+      recent_research: recentResearch,
       diagnostics: diagIssues.slice(0, 8),
       proposal_tests: proposalTests,
       prior_mistake_lessons: mistakes,

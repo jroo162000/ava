@@ -49,6 +49,7 @@ function sourceFiles() {
   const files = [];
   try { const p = curatedMemory.paths.userPath(); if (fs.existsSync(p)) files.push({ p, kind: 'memory', label: 'USER profile' }); } catch { /* ignore */ }
   try { const p = curatedMemory.paths.memoryPath(); if (fs.existsSync(p)) files.push({ p, kind: 'memory', label: 'AVA notes' }); } catch { /* ignore */ }
+  try { const p = path.join(path.dirname(curatedMemory.paths.memoryPath()), 'research-notes.jsonl'); if (fs.existsSync(p)) files.push({ p, kind: 'research', label: 'research' }); } catch { /* ignore */ }
   try {
     const dir = logsDir();
     for (const f of fs.readdirSync(dir).filter((f) => /^conversation-.*\.jsonl$/.test(f)).sort()) {
@@ -93,6 +94,13 @@ function _rebuild(files) {
       try { text = fs.readFileSync(f.p, 'utf8'); } catch { continue; }
       if (f.kind === 'memory') {
         for (const line of text.split('\n')) { const t = line.trim(); if (t) ins.run(t, 'memory', f.label, '', '', ''); }
+      } else if (f.kind === 'research') {
+        for (const ln of text.split('\n')) {
+          if (!ln.trim()) continue;
+          let e; try { e = JSON.parse(ln); } catch { continue; }
+          const content = `${e.topic || ''}: ${e.summary || ''}`.trim();
+          if (content.length > 2) ins.run(content.slice(0, 2000), 'research', e.topic || 'research', String(e.ts || '').slice(0, 10), '', 'web');
+        }
       } else {
         for (const ln of text.split('\n')) {
           if (!ln.trim()) continue;
