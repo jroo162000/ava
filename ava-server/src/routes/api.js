@@ -406,6 +406,11 @@ function looksLikeRecall(text = '') {
   const t = String(text || '').toLowerCase().trim();
   if (!t) return false;
   if (/\b(just (say|said|ask|asked|told)|a (second|moment) ago|last thing you (said|asked))\b/.test(t)) return false;
+  // NOT recall: a statement/affirmation that merely CONTAINS time+verb words is not a recall
+  // question. ("yes that's right, it's for me to interact with WHEN I TALK to you" falsely matched
+  // the when+i+talk pattern below and got routed to a recall meta-reply.)
+  if (/^\s*(yes|yeah|yep|ya|ok|okay|sure|right|correct|exactly|that'?s right|sounds good|go ahead|please|no|nope)\b/.test(t)) return false;
+  if (/\bwhen (i|we|you) (talk|speak|chat|interact)\b/.test(t)) return false;  // present/future, not a recall query
   if (/\b(recall|remind me (what|about|when|how)|do you remember|did we (ever )?(talk|discuss|decide|cover|mention|go over|work))\b/.test(t)) return true;
   if (/\b(what|which|when|how|where)\b[\s\S]{0,40}\b(we|you|i)\b[\s\S]{0,40}\b(discuss(ed)?|talk(ed)?|said|say|decide(d)?|mention(ed)?|cover(ed)?|agree(d)?|went over|go over|work(ed)? on|set ?up|configure(d)?|chang(e|ed)|fix(ed)?|built|build|test(ed)?)\b/.test(t)) return true;
   if (/\b(earlier|before|previously|last (time|week|night|session)|yesterday|the other day|past conversation|our (last )?conversation|so far|up to now)\b/.test(t)

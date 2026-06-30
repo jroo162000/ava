@@ -11,6 +11,18 @@ import memoryService from './memory.js';
 import moltbookService from './moltbook.js';
 import personaSvc from './persona.js';
 
+// PROVIDER QUOTA COOLDOWN — when a provider returns a quota / rate-limit / auth error, skip it for a
+// short window so the fallback chain jumps STRAIGHT to a working provider (e.g. DeepSeek) instead of
+// slowly failing through the quota-exhausted premium ones on every request. Recovers automatically
+// after the window. Tunable via AVA_PROVIDER_COOLDOWN_MS (default 5 min).
+const _providerCooldown = {}; // provider name -> epoch ms until which to skip it
+function _isQuotaError(msg) {
+  return /\b(429|quota|rate.?limit|rate limited|too many requests|insufficient|exhaust|over.?(loaded|capacity)|credit|balance|401|403|unauthorized|permission denied|billing)\b/i.test(String(msg || ''));
+}
+function _providerCoolingDown(p) {
+  return (_providerCooldown[p] || 0) > Date.now();
+}
+
 // Load AVA identity if available
 function loadIdentity() {
   try {
@@ -480,9 +492,14 @@ class LLMService {
     else if (/^deepseek/i.test(mdl)) forced = 'deepseek';
     else if (/^grok/i.test(mdl)) forced = 'grok';
     const providers = forced ? [forced, ...DEFAULT_ORDER.filter(p => p !== forced)] : DEFAULT_ORDER;
+    // Skip providers cooling down from a recent quota/auth error so we jump straight to a working one
+    // (e.g. DeepSeek). If that would skip ALL keyed providers, ignore cooldowns and try them anyway.
+    const _keyed = providers.filter(p => this.getApiKey(p));
+    const _warm = _keyed.filter(p => !_providerCoolingDown(p));
+    const _order = _warm.length ? _warm : _keyed;
+    const _cooldownMs = parseInt(process.env.AVA_PROVIDER_COOLDOWN_MS || '', 10) || 300000;
 
-    for (const provider of providers) {
-      if (!this.getApiKey(provider)) continue;
+    for (const provider of _order) {
       const isForced = forced && provider === forced;  // use the requested model only for the forced family
       try {
         switch (provider) {
@@ -511,6 +528,10 @@ class LLMService {
             return await this.createCompletionGroq(options);
         }
       } catch (error) {
+        if (_isQuotaError(error.message)) {
+          _providerCooldown[provider] = Date.now() + _cooldownMs;
+          logger.warn(`[llm] provider ${provider} quota/limit — cooling down ${Math.round(_cooldownMs / 1000)}s`, { error: error.message });
+        }
         errors.push(`${provider}: ${error.message}`);
         logger.warn(`Provider ${provider} failed, trying next...`, { error: error.message });
         continue;
