@@ -24,6 +24,24 @@ import persona from './persona.js';
 import curatedMemory from './curatedMemory.js';
 import skillStore from './skillStore.js';
 import trainingGuidance from './trainingGuidance.js';
+
+// Informational tools whose raw result should be SYNTHESIZED into a real answer (her own knowledge
+// + the findings) rather than returned verbatim -- otherwise a lookup shortens/replaces her answer.
+const INFO_TOOLS = new Set(['web_search', 'web_scrape', 'memory_search', 'finance_search', 'net_ops']);
+async function synthesizeAnswer(goal, tool, result) {
+  try {
+    const r = (result && (result.result || result)) || {};
+    let found = '';
+    if (Array.isArray(r.results)) found = r.results.map((x, i) => `(${i + 1}) ${x.title || ''} - ${x.snippet || x.text || ''} [${x.url || x.href || ''}]`).join('\n');
+    else if (Array.isArray(r.matches)) found = r.matches.map((x, i) => `(${i + 1}) ${x.text || x.snippet || ''}`).join('\n');
+    else found = String(r.text || r.content || r.abstract || r.message || '').slice(0, 6000);
+    if (!found.trim()) return '';
+    const sys = 'You are AVA answering the user. You just looked something up; the findings are below. Write a COMPLETE, genuinely helpful answer in your own natural voice, SYNTHESIZING what you already know WITH these findings. Do not just repeat the search results, and do not shorten your answer merely because you searched -- be as thorough as the question deserves. If the findings are thin or conflict with what you know, say what is reliable. Do not mechanically say "the search results say".';
+    const usr = `The user asked: ${String(goal || '')}\n\nWhat you found (${tool}):\n${found}`;
+    const resp = await llmService.chat([{ role: 'system', content: sys }, { role: 'user', content: usr }], { temperature: 0.5, max_tokens: 1200 });
+    return String((resp && (resp.text || resp.content)) || '').trim();
+  } catch (e) { logger.warn('[agent] synthesis failed', { error: e.message }); return ''; }
+}
 import skillCapture from './skillCapture.js';
 import lessonLearner from './lessonLearner.js';
 
@@ -1014,7 +1032,14 @@ async function runAgentLoop(goal, options = {}) {
           && actionResult && actionResult.result
           && String(actionResult.result.status).toLowerCase() === 'ok') {
         state.status = AgentStatus.SUCCESS;
-        if (!state.final_result) state.final_result = actionResult.result.message || 'Done.';
+        if (!state.final_result) {
+          if (INFO_TOOLS.has(decision.tool)) {
+            const _syn = await synthesizeAnswer(state.goal, decision.tool, actionResult.result);
+            state.final_result = _syn || actionResult.result.message || 'Done.';
+          } else {
+            state.final_result = actionResult.result.message || 'Done.';
+          }
+        }
         logger.info('[agent] Scope: single-action complete, stopping', { goal: String(state.goal).slice(0, 40) });
         break;
       }
@@ -1122,7 +1147,14 @@ async function runAgentLoopFromState(state) {
           && actionResult && actionResult.result
           && String(actionResult.result.status).toLowerCase() === 'ok') {
         state.status = AgentStatus.SUCCESS;
-        if (!state.final_result) state.final_result = actionResult.result.message || 'Done.';
+        if (!state.final_result) {
+          if (INFO_TOOLS.has(decision.tool)) {
+            const _syn = await synthesizeAnswer(state.goal, decision.tool, actionResult.result);
+            state.final_result = _syn || actionResult.result.message || 'Done.';
+          } else {
+            state.final_result = actionResult.result.message || 'Done.';
+          }
+        }
         logger.info('[agent] Scope: single-action complete, stopping', { goal: String(state.goal).slice(0, 40) });
         break;
       }
