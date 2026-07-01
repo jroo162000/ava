@@ -109,7 +109,6 @@ TOOL_RISK_LEVELS = {
     # High risk - destructive or security-sensitive
     'fs_ops': 'high',
     'ps_exec': 'high',
-    'sys_ops': 'high',
     'security_ops': 'high',
     'remote_ops': 'high',
     'boot_repair': 'high',
@@ -130,6 +129,7 @@ TOOL_RISK_LEVELS = {
     'screen_ops': 'low',
     'vision_ops': 'low',
     'memory_system': 'low',
+    'sys_ops': 'low',       # read-only system info (CPU/memory/disk/network) - safe
     'learning_db': 'low',
     'analysis_ops': 'low',
     'json_ops': 'low',
@@ -142,7 +142,6 @@ TOOL_RISK_LEVELS = {
 TOOLS_REQUIRE_CONFIRM = {
     'fs_ops',      # File operations (write/delete)
     'ps_exec',     # PowerShell execution
-    'sys_ops',     # System operations
     'security_ops',
     'remote_ops',
     'boot_repair',
