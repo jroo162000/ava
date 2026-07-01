@@ -57,8 +57,9 @@ const BLOCKED_PATH_PATTERNS = [
  */
 const HIGH_RISK_TOOLS = [
   'fs_ops',
-  'ps_exec', 
-  'sys_ops',
+  'ps_exec',
+  // 'sys_ops' removed: it is READ-ONLY system info (CPU/memory/disk/network) and needs no
+  // confirmation. Gating it made every autonomous system-status check fail as confirmation_required.
   'boot_repair',
   'remote_ops',
   'security_ops'
