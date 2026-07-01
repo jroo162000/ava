@@ -1634,7 +1634,10 @@ router.post('/respond', async (req, res) => {
           }
         }
       } catch { /* optional */ }
-      const sysPrompt = `${personaSvc.buildPersonaBlockText()}${_memBlock ? '\n\n' + _memBlock : ''}${_envBlock ? '\n\n' + _envBlock : ''}${_proactiveBlock}${_financeBlock}\n\nThis reply is BOTH spoken aloud AND shown on screen. Keep it natural and conversational — short enough to say out loud (a sentence or two is usually enough). For the screen you may use LIGHT Markdown: a **bold** key term, or a short "- " bullet list when you name several things — but no big headings or tables, and never sound like a written report. Give a complete answer when the question calls for it.${budgetPrompt}${context ? '\n\nContext: ' + context : ''}`;
+      // GROUND TRUTH: settled facts/preferences/decisions she reads each session (so she doesn't re-ask).
+      let _gtBlock = '';
+      try { _gtBlock = (await import('../services/groundTruth.js')).default.block(); } catch { /* optional */ }
+      const sysPrompt = `${personaSvc.buildPersonaBlockText()}${_gtBlock ? '\n\n' + _gtBlock : ''}${_memBlock ? '\n\n' + _memBlock : ''}${_envBlock ? '\n\n' + _envBlock : ''}${_proactiveBlock}${_financeBlock}\n\nThis reply is BOTH spoken aloud AND shown on screen. Keep it natural and conversational — short enough to say out loud (a sentence or two is usually enough). For the screen you may use LIGHT Markdown: a **bold** key term, or a short "- " bullet list when you name several things — but no big headings or tables, and never sound like a written report. Give a complete answer when the question calls for it.${budgetPrompt}${context ? '\n\nContext: ' + context : ''}`;
       // Capability awareness: list the real tools so AVA can answer "what can you
       // do?" accurately even on this no-execution conversational path. (Previously
       // this prompt omitted tools, so she'd say she had none.)
@@ -1660,6 +1663,24 @@ router.post('/respond', async (req, res) => {
           .filter(x => x.e && x.e.content && (x.dir === 'user' || x.dir === 'assistant'))
           .map(x => ({ role: x.dir === 'assistant' ? 'assistant' : 'user', content: String(x.e.content).slice(0, 500) }));
       } catch (e) { /* history optional */ }
+      // QUICK-CAPTURE: "Ava, file that / remember this / remember: X" -> persist to ground-truth + memory.
+      try {
+        const _u = String(userText || '').trim();
+        let _toFile = null, _m;
+        if ((_m = _u.match(/^(?:ava[\s,!.]*)?(?:please\s+)?(?:file|save|note|jot(?:\s+down)?|log|remember)\s+(?:that|this|it|down)\b\s*[:.\-–]?\s*(.*)$/i))) {
+          _toFile = (_m[1] || '').trim();
+          if (_toFile.length < 4) { const _last = [...priorMessages].reverse().find(x => x.content && x.content.length > 12); _toFile = _last ? _last.content : ''; }
+        } else if ((_m = _u.match(/^(?:ava[\s,!.]*)?(?:please\s+)?(?:remember|file|save|note)\s*[:\-–]\s*(.+)$/i))) {
+          _toFile = (_m[1] || '').trim();
+        }
+        if (_toFile) {
+          try { (await import('../services/groundTruth.js')).default.fileThat(_toFile); } catch { /* optional */ }
+          try { const _mem = (await import('../services/memory.js')).default; await _mem.store({ text: _toFile.slice(0, 500), type: 'fact', priority: 4, source: 'user', tags: ['filed', 'user', 'ground-truth'] }); } catch { /* optional */ }
+          const _msg = "Filed it — I'll treat that as settled from here on.";
+          try { conversationLogger.logAssistantMessage(_msg, { sessionId, responseType: 'quick-capture' }); } catch { /* optional */ }
+          return res.json({ ok: true, output_text: _msg, display_text: _msg, agent: { id: 'conv-' + Date.now(), status: 'success', steps: 0, result: _msg, errors: [] } });
+        }
+      } catch (e) { /* capture optional */ }
       // Natural routing: let the model itself decide if real tools / live data are
       // needed, instead of a brittle keyword gate. In this chat-only mode she must
       // NEVER promise or fake an action — if it needs doing or looking up, she emits
