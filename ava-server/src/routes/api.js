@@ -11,6 +11,8 @@ import pythonWorker from '../services/pythonWorker.js';
 import conversationLogger from '../services/conversationLogger.js';
 import turnGuard from '../services/turnGuard.js';
 import artifactMemory from '../services/artifactMemory.js';
+import artifactBus from '../services/artifactBus.js';
+import visualizer from '../services/visualizer.js';
 import personaSvc from '../services/persona.js';
 import environmentContext from '../services/environmentContext.js';
 import actionHistory from '../services/actionHistory.js';
@@ -1112,6 +1114,9 @@ router.post('/respond', async (req, res) => {
     // slow (agent / conversational) paths below are still working, they'll see they're superseded
     // at their emit point and drop the stale reply instead of speaking over the newer one.
     const _turn = turnGuard.begin(sessionId);
+    // Visual artifact panel (#225): did the user explicitly ask to SEE something? If so we force a
+    // visual; otherwise the visualizer decides on its own whether a diagram/table/summary would help.
+    const _wantsVisual = /\b(show me (a |the )?(diagram|chart|mermaid|table|visual|map)|diagram (this|that|it)|put (that|this|it) (on|up) (the )?(panel|board|screen)|visuali[sz]e|draw (me )?(a )?(diagram|chart)|make (me )?(a )?(diagram|chart|table)|on the (panel|board))\b/i.test(userText);
 
     // Repair STT mishears of "Moltbook" before any intent routing / agent reasoning (original
     // text is already logged above).
@@ -1746,6 +1751,8 @@ router.post('/respond', async (req, res) => {
         if (!turnGuard.isCurrent(sessionId, _turn)) {
           return res.json({ ok: true, superseded: true, output_text: '', display_text: '', agent: { id: 'superseded-' + Date.now(), status: 'superseded', steps: 0, result: '', errors: [] } });
         }
+        // Fire-and-forget: pop a visual reference onto the panel if it would help (never blocks the reply).
+        try { visualizer.maybeVisualize(userText, _convDisplay, { force: _wantsVisual, sessionId }).catch(() => {}); } catch { /* optional */ }
         return res.json({ ok: true, output_text: String(_convSpoken || '').slice(0, 20000), display_text: _convDisplay.slice(0, 20000), agent: {
           id: 'conv-' + Date.now(),
           status: 'success',
@@ -1846,6 +1853,7 @@ Don't read raw tool names, JSON, or status codes, but you MAY describe your heal
     if (!turnGuard.isCurrent(sessionId, _turn)) {
       return res.json({ ok: true, superseded: true, output_text: '', display_text: '', agent: { id: 'superseded-' + Date.now(), status: 'superseded', steps: 0, result: '', errors: [] } });
     }
+    try { visualizer.maybeVisualize(userText, _agentDisplay, { force: _wantsVisual, sessionId }).catch(() => {}); } catch { /* optional */ }
     res.json({ ok: true, output_text: String(_agentSpoken || '').slice(0, 20000), display_text: _agentDisplay.slice(0, 20000), agent: {
       id: state.id,
       status: state.status,
@@ -2882,6 +2890,19 @@ router.post('/memory/upsert', async (req, res) => {
     logger.error('Memory upsert failed', { error: error.message });
     res.status(500).json({ ok: false, error: error.message });
   }
+});
+
+// Visual artifact panel feed (#225): the UI popup panel polls this for anything AVA wants to SHOW
+// (diagrams, tables, web-result summaries, images, notes, the menu). Pass ?since=<ms> to get only new.
+router.get('/artifacts/recent', (req, res) => {
+  try {
+    const s = req.query.since;
+    res.json({ ok: true, now: Date.now(), artifacts: s ? artifactBus.since(s) : artifactBus.recent(20) });
+  } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+});
+router.post('/artifacts/push', (req, res) => {
+  try { res.json({ ok: true, artifact: artifactBus.push(req.body || {}) }); }
+  catch (e) { res.status(500).json({ ok: false, error: e.message }); }
 });
 
 router.post('/memory/search', async (req, res) => {
