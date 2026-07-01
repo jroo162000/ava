@@ -209,6 +209,9 @@ class LLMService {
       case 'groq': return config.GROQ_API_KEY;
       case 'deepseek': return config.DEEPSEEK_API_KEY || process.env.DEEPSEEK_API_KEY;
       case 'grok': return config.GROK_API_KEY || process.env.GROK_API_KEY;
+      // Local model via an OpenAI-compatible server (e.g. LM Studio on http://localhost:1234/v1).
+      // No real key needed; "available" whenever an endpoint is configured (disable with AVA_LOCAL_LLM_OFF=1).
+      case 'local': return process.env.AVA_LOCAL_LLM_OFF === '1' ? null : (process.env.AVA_LOCAL_LLM_URL || 'http://localhost:1234/v1');
       default: return null;
     }
   }
@@ -444,6 +447,8 @@ class LLMService {
       { name: 'gemini/' + (env.AVA_SM_GEMINI || 'gemini-pro-latest'), run: () => this.createCompletionGemini({ messages: conv, system, maxTokens, model: env.AVA_SM_GEMINI || 'gemini-pro-latest' }) },
       { name: 'deepseek/' + (env.AVA_SM_DEEPSEEK || 'deepseek-chat'), run: () => this._openaiCompat({ baseURL: 'https://api.deepseek.com', apiKey: key('DEEPSEEK_API_KEY'), model: env.AVA_SM_DEEPSEEK || 'deepseek-chat', system, messages: conv, maxTokens }) },
       { name: 'grok/' + (env.AVA_SM_GROK || 'grok-4'), run: () => this._openaiCompat({ baseURL: 'https://api.x.ai/v1', apiKey: key('GROK_API_KEY'), model: env.AVA_SM_GROK || 'grok-4', system, messages: conv, maxTokens }) },
+      // Final fallback: the local model (LM Studio). Reached only if every cloud model above is down.
+      ...(env.AVA_LOCAL_LLM_OFF === '1' ? [] : [{ name: 'local/' + (env.AVA_LOCAL_LLM_MODEL || 'lm-studio'), run: () => this._openaiCompat({ baseURL: (env.AVA_LOCAL_LLM_URL || 'http://localhost:1234/v1').replace(/\/$/, ''), apiKey: env.AVA_LOCAL_LLM_KEY || 'lm-studio', model: env.AVA_LOCAL_LLM_MODEL || 'local-model', system, messages: conv, maxTokens }) }]),
     ];
     const errs = [];
     for (const step of chain) {
@@ -479,7 +484,9 @@ class LLMService {
       deepseek: env.AVA_SM_DEEPSEEK || 'deepseek-chat',
       grok: env.AVA_SM_GROK || 'grok-4',
     };
-    const DEFAULT_ORDER = ['claude', 'openai', 'gemini', 'deepseek', 'grok', 'groq'];
+    // 'local' is last: the local LM Studio model only gets used when every cloud provider is
+    // unavailable (quota/credit/outage), i.e. it's a true final fallback.
+    const DEFAULT_ORDER = ['claude', 'openai', 'gemini', 'deepseek', 'grok', 'groq', 'local'];
     const errors = [];
 
     // Route by model FAMILY when a specific model is named (e.g. the agent decision forces gpt-5.1):
@@ -526,6 +533,16 @@ class LLMService {
           }
           case 'groq':
             return await this.createCompletionGroq(options);
+          case 'local': {
+            const base = (env.AVA_LOCAL_LLM_URL || 'http://localhost:1234/v1').replace(/\/$/, '');
+            let lm = env.AVA_LOCAL_LLM_MODEL || this._localModel || '';
+            if (!lm) { try { const mr = await fetch(base + '/models', { signal: AbortSignal.timeout(2500) }); const mj = await mr.json(); lm = (mj && mj.data && mj.data[0] && mj.data[0].id) || ''; this._localModel = lm; } catch { /* endpoint down */ } }
+            const r = await Promise.race([
+              this._openaiCompat({ baseURL: base, apiKey: env.AVA_LOCAL_LLM_KEY || 'lm-studio', model: isForced ? options.model : (lm || 'local-model'), system: options.system, messages: options.messages, maxTokens: options.maxTokens }),
+              new Promise((_, rej) => setTimeout(() => rej(new Error('local llm timeout')), parseInt(env.AVA_LOCAL_LLM_TIMEOUT_MS || '90000', 10)))
+            ]);
+            return { ...r, provider: 'local' };
+          }
         }
       } catch (error) {
         if (_isQuotaError(error.message)) {
