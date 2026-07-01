@@ -12,6 +12,7 @@ import securityService from '../utils/security.js';
 import moltbookService from './moltbook.js';
 import avaSelf from './avaSelf.js';
 import commitments from './commitments.js';
+import artifactBus from './artifactBus.js';
 import { emitVoiceEvent } from './voiceBus.js';
 import fileGen from './fileGen.js';
 import memorySearch from './memorySearch.js';
@@ -207,6 +208,14 @@ class ToolsService {
         description: "Accountability tracker. action 'add' with text (something you or the user committed to; optional due) logs it; action 'list' returns open commitments; action 'done' with text or id marks one complete. Use it to hold the user (and yourself) to things.",
         source: 'builtin',
         schema: { type: 'object', properties: { action: { type: 'string', enum: ['add', 'list', 'done'] }, text: { type: 'string' }, due: { type: 'string' } }, required: ['action'] },
+        requires_confirm: false,
+        risk_level: 'low'
+      },
+      {
+        name: 'panel',
+        description: "Your VISUAL PRESENTER panel. Open cards to SHOW things while you talk or work, then bring the relevant one to the front and close it when done. action 'open' with type (news|image|video|web|mermaid|markdown|table|note) + title + content opens a card and returns its id (news content = JSON array of {title,source,url,image,snippet}; video content = a YouTube url/id or direct video url; image/web content = a url; mermaid/table/markdown content = the source text). action 'focus' with id brings a card to the front. action 'close' with id removes it. action 'clear' removes all. action 'list' returns what's currently on screen.",
+        source: 'builtin',
+        schema: { type: 'object', properties: { action: { type: 'string', enum: ['open', 'focus', 'close', 'clear', 'list'] }, type: { type: 'string' }, title: { type: 'string' }, content: {}, id: { type: 'string' } }, required: ['action'] },
         requires_confirm: false,
         risk_level: 'low'
       },
@@ -631,6 +640,19 @@ class ToolsService {
           if (act === 'add') { const c = commitments.add(args.text, { due: args.due }); return { ok: true, result: c ? { added: c.text, id: c.id } : { error: 'nothing to add' } }; }
           if (act === 'done') { const c = commitments.complete(args.text || args.id); return { ok: true, result: c ? { completed: c.text } : { error: 'no matching open commitment' } }; }
           return { ok: true, result: { open: commitments.list(true).map(c => ({ id: c.id, text: c.text, due: c.due })) } };
+        } catch (e) {
+          return { ok: false, error: e.message };
+        }
+
+      case 'panel':
+        try {
+          const act = (args.action || 'list').toLowerCase();
+          if (act === 'open') { const c = artifactBus.open({ type: args.type, title: args.title, content: args.content }); return { ok: true, result: { opened: c.id, type: c.type, title: c.title } }; }
+          if (act === 'focus') { return { ok: true, result: { focused: artifactBus.focus(args.id) ? args.id : null } }; }
+          if (act === 'close') { return { ok: true, result: { closed: artifactBus.close(args.id) } }; }
+          if (act === 'clear') { artifactBus.clear(); return { ok: true, result: { cleared: true } }; }
+          const st = artifactBus.state();
+          return { ok: true, result: { onScreen: st.cards.map((c, i) => ({ n: i + 1, id: c.id, type: c.type, title: c.title, front: c.id === st.focusedId })) } };
         } catch (e) {
           return { ok: false, error: e.message };
         }

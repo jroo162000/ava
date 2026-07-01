@@ -1,13 +1,14 @@
 import React, { useEffect, useRef, useState } from 'react'
 
-// ArtifactPanel — AVA's visual reference popup. Self-contained: it polls the backend artifact feed
-// (/artifacts/recent), and slides in a collapsible panel that renders whatever she wants to SHOW —
-// Mermaid diagrams, markdown, tables, web-result summaries, images, notes, the menu. It pops open on
-// its own when she surfaces a visual while explaining something, and can be collapsed to a small tab.
+// ArtifactPanel — AVA's visual PRESENTER. Mirrors the backend panel state (/panel/state): multiple
+// small cards at once, one brought to the FRONT (centered) while she talks about it, cyclable, each
+// closeable. Renders news/article cards, photos, autoplay-muted video, web pages, mermaid, markdown,
+// and tables. She drives it (open/focus/close) via the panel tool; the user can also click to cycle.
 
 const SERVER = (import.meta.env.VITE_AVA_SERVER_URL || 'http://127.0.0.1:5051')
+const api = (p, body) => fetch(`${SERVER}${p}`, body ? { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) } : undefined)
 
-// ---- tiny, dependency-free markdown (headers, bold/italic/code, lists, GFM tables) ----
+// ---------- tiny markdown (headers, bold/italic/code, lists, GFM tables) ----------
 function esc(s) { return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;') }
 function inline(s) {
   return esc(s)
@@ -17,29 +18,19 @@ function inline(s) {
     .replace(/\[([^\]]+)\]\((https?:[^)]+)\)/g, '<a href="$2" target="_blank" rel="noreferrer">$1</a>')
 }
 function md2html(src) {
-  const lines = String(src || '').replace(/\r/g, '').split('\n')
-  const out = []
-  let i = 0
+  const lines = String(src || '').replace(/\r/g, '').split('\n'); const out = []; let i = 0
   while (i < lines.length) {
     const line = lines[i]
-    // table: header row + separator row of ---
     if (/^\s*\|.*\|\s*$/.test(line) && i + 1 < lines.length && /^\s*\|?[\s:|-]+\|?\s*$/.test(lines[i + 1]) && lines[i + 1].includes('-')) {
       const cells = (r) => r.trim().replace(/^\||\|$/g, '').split('|').map((c) => c.trim())
-      const head = cells(line)
-      let j = i + 2
-      const rows = []
+      const head = cells(line); let j = i + 2; const rows = []
       while (j < lines.length && /^\s*\|.*\|\s*$/.test(lines[j])) { rows.push(cells(lines[j])); j++ }
-      out.push('<table><thead><tr>' + head.map((h) => '<th>' + inline(h) + '</th>').join('') + '</tr></thead><tbody>' +
-        rows.map((r) => '<tr>' + r.map((c) => '<td>' + inline(c) + '</td>').join('') + '</tr>').join('') + '</tbody></table>')
+      out.push('<table><thead><tr>' + head.map((h) => '<th>' + inline(h) + '</th>').join('') + '</tr></thead><tbody>' + rows.map((r) => '<tr>' + r.map((c) => '<td>' + inline(c) + '</td>').join('') + '</tr>').join('') + '</tbody></table>')
       i = j; continue
     }
     const h = line.match(/^(#{1,3})\s+(.*)$/)
-    if (h) { out.push('<h' + (h[1].length + 2) + '>' + inline(h[2]) + '</h' + (h[1].length + 2) + '>'); i++; continue }
-    if (/^\s*[-*]\s+/.test(line)) {
-      const items = []
-      while (i < lines.length && /^\s*[-*]\s+/.test(lines[i])) { items.push('<li>' + inline(lines[i].replace(/^\s*[-*]\s+/, '')) + '</li>'); i++ }
-      out.push('<ul>' + items.join('') + '</ul>'); continue
-    }
+    if (h) { out.push('<h' + (h[1].length + 3) + '>' + inline(h[2]) + '</h' + (h[1].length + 3) + '>'); i++; continue }
+    if (/^\s*[-*]\s+/.test(line)) { const items = []; while (i < lines.length && /^\s*[-*]\s+/.test(lines[i])) { items.push('<li>' + inline(lines[i].replace(/^\s*[-*]\s+/, '')) + '</li>'); i++ } out.push('<ul>' + items.join('') + '</ul>'); continue }
     if (line.trim() === '') { i++; continue }
     out.push('<p>' + inline(line) + '</p>'); i++
   }
@@ -59,7 +50,6 @@ function loadMermaid() {
   })
   return _mermaidLoading
 }
-
 function MermaidBlock({ code, id }) {
   const ref = useRef(null)
   useEffect(() => {
@@ -67,89 +57,103 @@ function MermaidBlock({ code, id }) {
     loadMermaid().then((m) => {
       if (dead || !ref.current) return
       if (!m) { ref.current.innerHTML = '<pre>' + esc(code) + '</pre>'; return }
-      m.render('m_' + id, code).then(({ svg }) => { if (!dead && ref.current) ref.current.innerHTML = svg })
-        .catch(() => { if (ref.current) ref.current.innerHTML = '<pre>' + esc(code) + '</pre>' })
+      m.render('mm_' + id, code).then(({ svg }) => { if (!dead && ref.current) ref.current.innerHTML = svg }).catch(() => { if (ref.current) ref.current.innerHTML = '<pre>' + esc(code) + '</pre>' })
     })
     return () => { dead = true }
   }, [code, id])
   return <div ref={ref} style={{ overflowX: 'auto' }} />
 }
 
-function Artifact({ a, n }) {
-  let body
-  if (a.type === 'mermaid') body = <MermaidBlock code={a.content} id={a.id} />
-  else if (a.type === 'image') {
-    const src = /^(https?:|data:)/.test(a.content) ? a.content : `${SERVER}/file?path=${encodeURIComponent(a.content)}`
-    body = <img src={src} alt={a.title || 'image'} style={{ maxWidth: '100%', borderRadius: 8 }} />
-  } else body = <div dangerouslySetInnerHTML={{ __html: md2html(a.content) }} />
-  return (
-    <div style={{ background: 'rgba(255,255,255,0.04)', border: '1px solid rgba(255,255,255,0.08)', borderRadius: 12, padding: 12, marginBottom: 10 }}>
-      <div style={{ display: 'flex', gap: 8, alignItems: 'baseline', marginBottom: 6 }}>
-        <span style={{ fontSize: 11, fontWeight: 700, color: '#8b5cf6', minWidth: 20 }}>#{n}</span>
-        <span style={{ fontSize: 12, fontWeight: 600, color: '#cbd5e1', textTransform: 'capitalize' }}>{a.title || a.type}</span>
-        <span style={{ fontSize: 10, color: '#64748b', marginLeft: 'auto' }}>{a.type}</span>
-      </div>
-      <div style={{ fontSize: 13, color: '#e2e8f0', lineHeight: 1.5 }}>{body}</div>
-    </div>
-  )
+function ytId(u) { const m = String(u || '').match(/(?:youtu\.be\/|[?&]v=|embed\/|shorts\/)([A-Za-z0-9_-]{6,})/); if (m) return m[1]; return /^[A-Za-z0-9_-]{6,}$/.test(String(u || '').trim()) ? u.trim() : null }
+
+function CardBody({ c }) {
+  const t = c.type
+  if (t === 'image' || t === 'photo') return <img src={c.content} alt={c.title || ''} style={{ maxWidth: '100%', borderRadius: 8, display: 'block' }} />
+  if (t === 'video') {
+    const id = ytId(c.content)
+    if (id) return <div style={{ position: 'relative', paddingTop: '56%' }}><iframe title={c.title} src={`https://www.youtube.com/embed/${id}?autoplay=1&mute=1&rel=0`} allow="autoplay; encrypted-media; picture-in-picture" allowFullScreen style={{ position: 'absolute', inset: 0, width: '100%', height: '100%', border: 0, borderRadius: 8 }} /></div>
+    return <video src={c.content} autoPlay muted controls style={{ width: '100%', borderRadius: 8 }} />
+  }
+  if (t === 'web') return <div><iframe title={c.title} src={c.content} sandbox="allow-scripts allow-same-origin allow-popups" style={{ width: '100%', height: 320, border: 0, borderRadius: 8, background: '#fff' }} /><div style={{ fontSize: 11, color: '#64748b', marginTop: 4 }}>If blank, the site blocks embedding — <a href={c.content} target="_blank" rel="noreferrer" style={{ color: '#a78bfa' }}>open it</a>.</div></div>
+  if (t === 'news') {
+    let items = []
+    try { items = Array.isArray(c.content) ? c.content : JSON.parse(c.content) } catch { items = [] }
+    if (!items.length) return <div dangerouslySetInnerHTML={{ __html: md2html(String(c.content)) }} />
+    return <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>{items.slice(0, 8).map((a, i) => (
+      <a key={i} href={a.url} target="_blank" rel="noreferrer" style={{ display: 'flex', gap: 10, textDecoration: 'none', color: 'inherit', background: 'rgba(255,255,255,0.03)', border: '1px solid rgba(255,255,255,0.07)', borderRadius: 10, padding: 8 }}>
+        {a.image ? <img src={a.image} alt="" style={{ width: 84, height: 64, objectFit: 'cover', borderRadius: 6, flexShrink: 0 }} /> : null}
+        <span><span style={{ fontWeight: 600, fontSize: 13, color: '#e2e8f0', display: 'block' }}>{a.title}</span><span style={{ fontSize: 11, color: '#94a3b8' }}>{a.source || ''}</span>{a.snippet ? <span style={{ fontSize: 12, color: '#cbd5e1', display: 'block', marginTop: 3 }}>{String(a.snippet).slice(0, 140)}</span> : null}</span>
+      </a>
+    ))}</div>
+  }
+  if (t === 'mermaid') return <MermaidBlock code={c.content} id={c.id} />
+  return <div dangerouslySetInnerHTML={{ __html: md2html(c.content) }} />
 }
 
 export default function ArtifactPanel() {
-  const [items, setItems] = useState([])
-  const [open, setOpen] = useState(false)
-  const sinceRef = useRef(0)
-  const bodyRef = useRef(null)
+  const [cards, setCards] = useState([])
+  const [focusedId, setFocusedId] = useState(null)
+  const [hidden, setHidden] = useState(false)
 
   useEffect(() => {
     let stop = false
     const poll = async () => {
-      try {
-        const r = await fetch(`${SERVER}/artifacts/recent?since=${sinceRef.current}`)
-        const j = await r.json()
-        const fresh = (j && j.artifacts) || []
-        if (fresh.length) {
-          sinceRef.current = fresh[fresh.length - 1].ts
-          setItems((prev) => [...prev, ...fresh].slice(-30))
-          setOpen(true) // pop open when she surfaces something
-        }
-      } catch {}
-      if (!stop) setTimeout(poll, 1500)
+      try { const r = await api('/panel/state'); const j = await r.json(); if (j && j.ok) { setCards(j.cards || []); setFocusedId(j.focusedId || null) } } catch {}
+      if (!stop) setTimeout(poll, 1000)
     }
-    // start from "now" so we only show artifacts created from here on
-    fetch(`${SERVER}/artifacts/recent`).then((r) => r.json()).then((j) => { sinceRef.current = (j && j.now) || Date.now() }).catch(() => {}).finally(poll)
+    poll()
     return () => { stop = true }
   }, [])
 
-  useEffect(() => { if (bodyRef.current) bodyRef.current.scrollTop = bodyRef.current.scrollHeight }, [items])
+  const focus = (id) => { setFocusedId(id); api('/panel/focus', { id }).catch(() => {}) }
+  const close = (id) => { setCards((cs) => cs.filter((c) => c.id !== id)); api('/panel/close', { id }).catch(() => {}) }
+  const clearAll = () => { setCards([]); api('/panel/clear', {}).catch(() => {}) }
+  const cycle = (dir) => { if (!cards.length) return; const i = Math.max(0, cards.findIndex((c) => c.id === focusedId)); focus(cards[(i + dir + cards.length) % cards.length].id) }
 
-  if (!items.length) return null
-
-  if (!open) {
-    return (
-      <button onClick={() => setOpen(true)} style={{
-        position: 'fixed', right: 0, top: '38%', zIndex: 9999, background: '#8b5cf6', color: 'white',
-        border: 'none', borderRadius: '10px 0 0 10px', padding: '10px 8px', writingMode: 'vertical-rl',
-        cursor: 'pointer', fontWeight: 700, fontSize: 12, boxShadow: '0 4px 20px rgba(0,0,0,0.4)'
-      }}>Visuals ({items.length})</button>
-    )
+  if (!cards.length) return null
+  if (hidden) {
+    return <button onClick={() => setHidden(false)} style={{ position: 'fixed', right: 0, top: '40%', zIndex: 99999, background: '#8b5cf6', color: '#fff', border: 0, borderRadius: '10px 0 0 10px', padding: '10px 8px', writingMode: 'vertical-rl', cursor: 'pointer', fontWeight: 700, fontSize: 12 }}>Visuals ({cards.length})</button>
   }
 
+  const fIdx = Math.max(0, cards.findIndex((c) => c.id === focusedId))
   return (
-    <div style={{
-      position: 'fixed', right: 16, top: 16, bottom: 16, width: 420, maxWidth: '46vw', zIndex: 9999,
-      background: 'rgba(15,17,26,0.92)', backdropFilter: 'blur(10px)', border: '1px solid rgba(139,92,246,0.35)',
-      borderRadius: 16, boxShadow: '0 10px 40px rgba(0,0,0,0.5)', display: 'flex', flexDirection: 'column', color: '#e2e8f0'
-    }}>
-      <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '12px 14px', borderBottom: '1px solid rgba(255,255,255,0.08)' }}>
+    <div style={{ position: 'fixed', right: 14, top: 14, bottom: 14, width: 'min(46vw, 560px)', zIndex: 99999, display: 'flex', flexDirection: 'column', pointerEvents: 'none' }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '8px 12px', background: 'rgba(15,17,26,0.92)', border: '1px solid rgba(139,92,246,0.35)', borderRadius: 12, marginBottom: 8, color: '#e2e8f0', pointerEvents: 'auto', backdropFilter: 'blur(8px)' }}>
         <span style={{ width: 8, height: 8, borderRadius: 8, background: '#8b5cf6' }} />
-        <span style={{ fontWeight: 700, fontSize: 13 }}>AVA · Visuals</span>
-        <span style={{ fontSize: 11, color: '#64748b' }}>{items.length}</span>
-        <button onClick={() => setItems([])} title="Clear" style={{ marginLeft: 'auto', background: 'transparent', border: '1px solid rgba(255,255,255,0.15)', color: '#94a3b8', borderRadius: 8, padding: '2px 8px', cursor: 'pointer', fontSize: 11 }}>Clear</button>
-        <button onClick={() => setOpen(false)} title="Collapse" style={{ background: 'transparent', border: '1px solid rgba(255,255,255,0.15)', color: '#94a3b8', borderRadius: 8, padding: '2px 8px', cursor: 'pointer', fontSize: 11 }}>Hide</button>
+        <span style={{ fontWeight: 700, fontSize: 13 }}>AVA · Presenting</span>
+        <span style={{ fontSize: 11, color: '#64748b' }}>{fIdx + 1}/{cards.length}</span>
+        <span style={{ marginLeft: 'auto', display: 'flex', gap: 6 }}>
+          <button onClick={() => cycle(-1)} title="Previous" style={btn}>‹</button>
+          <button onClick={() => cycle(1)} title="Next" style={btn}>›</button>
+          <button onClick={clearAll} title="Clear all" style={btn}>Clear</button>
+          <button onClick={() => setHidden(true)} title="Hide" style={btn}>Hide</button>
+        </span>
       </div>
-      <div ref={bodyRef} style={{ overflowY: 'auto', padding: 14, flex: 1 }}>
-        {items.map((a, idx) => <Artifact key={a.id} a={a} n={idx + 1} />)}
+      <div style={{ position: 'relative', flex: 1 }}>
+        {cards.map((c, idx) => {
+          const isFront = c.id === focusedId
+          const depth = idx <= fIdx ? fIdx - idx : idx - fIdx
+          const style = {
+            position: 'absolute', top: 0, right: 0, width: '100%', maxHeight: '100%', overflowY: 'auto', pointerEvents: 'auto',
+            background: 'rgba(17,19,29,0.96)', border: `1px solid ${isFront ? 'rgba(139,92,246,0.6)' : 'rgba(255,255,255,0.08)'}`,
+            borderRadius: 14, boxShadow: isFront ? '0 14px 44px rgba(0,0,0,0.55)' : '0 6px 20px rgba(0,0,0,0.4)',
+            transform: isFront ? 'none' : `translate(${Math.min(depth, 5) * -16}px, ${Math.min(depth, 5) * 14 + 6}px) scale(0.955)`,
+            opacity: isFront ? 1 : 0.5, zIndex: isFront ? 100 : 40 - depth, transition: 'all 0.18s ease', cursor: isFront ? 'default' : 'pointer'
+          }
+          return (
+            <div key={c.id} style={style} onClick={isFront ? undefined : () => focus(c.id)}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '8px 12px', borderBottom: '1px solid rgba(255,255,255,0.07)', position: 'sticky', top: 0, background: 'rgba(17,19,29,0.98)', borderRadius: '14px 14px 0 0' }}>
+                <span style={{ fontSize: 11, fontWeight: 700, color: '#8b5cf6' }}>#{idx + 1}</span>
+                <span style={{ fontSize: 12.5, fontWeight: 600, color: '#e2e8f0', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{c.title || c.type}</span>
+                <span style={{ fontSize: 10, color: '#64748b' }}>{c.type}</span>
+                <button onClick={(e) => { e.stopPropagation(); close(c.id) }} title="Close" style={{ ...btn, marginLeft: 'auto', padding: '1px 7px' }}>✕</button>
+              </div>
+              <div style={{ padding: 12, fontSize: 13, color: '#e2e8f0', lineHeight: 1.5 }}><CardBody c={c} /></div>
+            </div>
+          )
+        })}
       </div>
     </div>
   )
 }
+const btn = { background: 'transparent', border: '1px solid rgba(255,255,255,0.15)', color: '#94a3b8', borderRadius: 8, padding: '2px 8px', cursor: 'pointer', fontSize: 12 }

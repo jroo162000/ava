@@ -1665,7 +1665,9 @@ router.post('/respond', async (req, res) => {
       try { _commitBlock = (await import('../services/commitments.js')).default.block(); } catch { /* optional */ }
       let _evoBlock = '';
       try { _evoBlock = (await import('../services/evolutionLog.js')).default.block(); } catch { /* optional */ }
-      const sysPrompt = `${personaSvc.buildPersonaBlockText()}${_gtBlock ? '\n\n' + _gtBlock : ''}${_commitBlock ? '\n\n' + _commitBlock : ''}${_evoBlock ? '\n\n' + _evoBlock : ''}${_memBlock ? '\n\n' + _memBlock : ''}${_envBlock ? '\n\n' + _envBlock : ''}${_proactiveBlock}${_financeBlock}\n\nThis reply is BOTH spoken aloud AND shown on screen. Keep it natural and conversational — short enough to say out loud (a sentence or two is usually enough). For the screen you may use LIGHT Markdown: a **bold** key term, or a short "- " bullet list when you name several things — but no big headings or tables, and never sound like a written report. Give a complete answer when the question calls for it.${budgetPrompt}${context ? '\n\nContext: ' + context : ''}`;
+      let _panelBlock = '';
+      try { _panelBlock = artifactBus.block(); } catch { /* optional */ }
+      const sysPrompt = `${personaSvc.buildPersonaBlockText()}${_gtBlock ? '\n\n' + _gtBlock : ''}${_commitBlock ? '\n\n' + _commitBlock : ''}${_evoBlock ? '\n\n' + _evoBlock : ''}${_panelBlock ? '\n\n' + _panelBlock : ''}${_memBlock ? '\n\n' + _memBlock : ''}${_envBlock ? '\n\n' + _envBlock : ''}${_proactiveBlock}${_financeBlock}\n\nThis reply is BOTH spoken aloud AND shown on screen. Keep it natural and conversational — short enough to say out loud (a sentence or two is usually enough). For the screen you may use LIGHT Markdown: a **bold** key term, or a short "- " bullet list when you name several things — but no big headings or tables, and never sound like a written report. Give a complete answer when the question calls for it.${budgetPrompt}${context ? '\n\nContext: ' + context : ''}`;
       // Capability awareness: list the real tools so AVA can answer "what can you
       // do?" accurately even on this no-execution conversational path. (Previously
       // this prompt omitted tools, so she'd say she had none.)
@@ -2903,6 +2905,24 @@ router.get('/artifacts/recent', (req, res) => {
 router.post('/artifacts/push', (req, res) => {
   try { res.json({ ok: true, artifact: artifactBus.push(req.body || {}) }); }
   catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+});
+
+// Multi-card visual panel (presenter). The UI polls /panel/state and mirrors it exactly; AVA drives
+// it (open a card, bring one to the front, close it) via the panel tool or these endpoints.
+router.get('/panel/state', (_req, res) => {
+  try { res.json({ ok: true, ...artifactBus.state() }); } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+});
+router.post('/panel/open', (req, res) => {
+  try { res.json({ ok: true, card: artifactBus.open(req.body || {}), ...artifactBus.state() }); } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+});
+router.post('/panel/focus', (req, res) => {
+  try { res.json({ ok: artifactBus.focus((req.body || {}).id), ...artifactBus.state() }); } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+});
+router.post('/panel/close', (req, res) => {
+  try { res.json({ ok: artifactBus.close((req.body || {}).id), ...artifactBus.state() }); } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+});
+router.post('/panel/clear', (_req, res) => {
+  try { artifactBus.clear(); res.json({ ok: true, ...artifactBus.state() }); } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
 });
 
 router.post('/memory/search', async (req, res) => {
