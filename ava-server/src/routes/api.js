@@ -1524,6 +1524,16 @@ router.post('/respond', async (req, res) => {
 
     // REMEMBER PATH: "remember that I prefer X / save my preference" — persist via
     // memory_system (the model often picked file_gen). Distinct from recall (which RETRIEVES).
+    // COMMITMENT: "remind me to X" / "hold me to X" -> track it for proactive follow-up.
+    {
+      const _cm = String(userText || '').match(/^\s*(?:ava[\s,!.]*)?(?:please\s+)?(?:remind me to|hold me to|i need to remember to|add (?:a )?(?:commitment|task)(?:\s+to)?|track (?:a )?commitment(?:\s+to)?)\s*[:,\-]?\s*(.+)$/i);
+      if (_cm && (_cm[1] || '').trim().length > 2 && !looksLikeRecall(userText)) {
+        try { (await import('../services/commitments.js')).default.add(_cm[1].trim(), { who: 'user' }); } catch { /* optional */ }
+        const _t = shapeSpokenReply("Got it — I'm tracking that, and I'll keep you honest on it.", req.body || {});
+        try { conversationLogger.logAssistantMessage(_t, { sessionId, responseType: 'commitment' }); } catch { /* optional */ }
+        return res.json({ ok: true, output_text: String(_t || '').slice(0, 20000), agent: { id: 'commit-' + Date.now(), status: 'success', steps: 1, result: _t, errors: [] } });
+      }
+    }
     if (/\b(remember that|save (my|this|that)|note that i|make a note that|keep in mind that|store (this|that))\b/.test(userText.toLowerCase()) && !looksLikeRecall(userText)) {
       logger.info('[respond] Remember path (memory_system save)', { text: userText.slice(0, 60) });
       let ok = false;
@@ -1638,10 +1648,12 @@ router.post('/respond', async (req, res) => {
           }
         }
       } catch { /* optional */ }
-      // GROUND TRUTH: settled facts/preferences/decisions she reads each session (so she doesn't re-ask).
+      // GROUND TRUTH + OPEN COMMITMENTS: settled context + accountability she carries each session.
       let _gtBlock = '';
       try { _gtBlock = (await import('../services/groundTruth.js')).default.block(); } catch { /* optional */ }
-      const sysPrompt = `${personaSvc.buildPersonaBlockText()}${_gtBlock ? '\n\n' + _gtBlock : ''}${_memBlock ? '\n\n' + _memBlock : ''}${_envBlock ? '\n\n' + _envBlock : ''}${_proactiveBlock}${_financeBlock}\n\nThis reply is BOTH spoken aloud AND shown on screen. Keep it natural and conversational — short enough to say out loud (a sentence or two is usually enough). For the screen you may use LIGHT Markdown: a **bold** key term, or a short "- " bullet list when you name several things — but no big headings or tables, and never sound like a written report. Give a complete answer when the question calls for it.${budgetPrompt}${context ? '\n\nContext: ' + context : ''}`;
+      let _commitBlock = '';
+      try { _commitBlock = (await import('../services/commitments.js')).default.block(); } catch { /* optional */ }
+      const sysPrompt = `${personaSvc.buildPersonaBlockText()}${_gtBlock ? '\n\n' + _gtBlock : ''}${_commitBlock ? '\n\n' + _commitBlock : ''}${_memBlock ? '\n\n' + _memBlock : ''}${_envBlock ? '\n\n' + _envBlock : ''}${_proactiveBlock}${_financeBlock}\n\nThis reply is BOTH spoken aloud AND shown on screen. Keep it natural and conversational — short enough to say out loud (a sentence or two is usually enough). For the screen you may use LIGHT Markdown: a **bold** key term, or a short "- " bullet list when you name several things — but no big headings or tables, and never sound like a written report. Give a complete answer when the question calls for it.${budgetPrompt}${context ? '\n\nContext: ' + context : ''}`;
       // Capability awareness: list the real tools so AVA can answer "what can you
       // do?" accurately even on this no-execution conversational path. (Previously
       // this prompt omitted tools, so she'd say she had none.)

@@ -11,6 +11,7 @@ import pythonWorker from './pythonWorker.js';
 import securityService from '../utils/security.js';
 import moltbookService from './moltbook.js';
 import avaSelf from './avaSelf.js';
+import commitments from './commitments.js';
 import { emitVoiceEvent } from './voiceBus.js';
 import fileGen from './fileGen.js';
 import memorySearch from './memorySearch.js';
@@ -198,6 +199,14 @@ class ToolsService {
           },
           required: ['action']
         },
+        requires_confirm: false,
+        risk_level: 'low'
+      },
+      {
+        name: 'commitment',
+        description: "Accountability tracker. action 'add' with text (something you or the user committed to; optional due) logs it; action 'list' returns open commitments; action 'done' with text or id marks one complete. Use it to hold the user (and yourself) to things.",
+        source: 'builtin',
+        schema: { type: 'object', properties: { action: { type: 'string', enum: ['add', 'list', 'done'] }, text: { type: 'string' }, due: { type: 'string' } }, required: ['action'] },
         requires_confirm: false,
         risk_level: 'low'
       },
@@ -612,6 +621,16 @@ class ToolsService {
           if (act === 'set_theme') return { ok: true, result: avaSelf.setTheme(args.theme || {}) };
           if (act === 'set_board') return { ok: true, result: avaSelf.setBoard(args.items || []) };
           return { ok: true, result: { theme: avaSelf.getTheme(), board: avaSelf.getBoard() } };
+        } catch (e) {
+          return { ok: false, error: e.message };
+        }
+
+      case 'commitment':
+        try {
+          const act = (args.action || 'list').toLowerCase();
+          if (act === 'add') { const c = commitments.add(args.text, { due: args.due }); return { ok: true, result: c ? { added: c.text, id: c.id } : { error: 'nothing to add' } }; }
+          if (act === 'done') { const c = commitments.complete(args.text || args.id); return { ok: true, result: c ? { completed: c.text } : { error: 'no matching open commitment' } }; }
+          return { ok: true, result: { open: commitments.list(true).map(c => ({ id: c.id, text: c.text, due: c.due })) } };
         } catch (e) {
           return { ok: false, error: e.message };
         }
