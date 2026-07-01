@@ -1529,9 +1529,13 @@ router.post('/respond', async (req, res) => {
       let ok = false;
       try {
         await toolsService.executeTool('memory_system', { action: 'save', operation: 'save', content: userText, text: userText, value: userText }, false, { source: 'voice', bypassIdempotency: true });
+        try {
+          const _note = userText.replace(/^\s*(?:ava[\s,!.]*)?(?:please\s+)?(?:remember|save|note|make a note|keep in mind|store)\b\s*(?:that|this|my)?\b[:,\-\s]*/i, '').trim();
+          (await import('../services/groundTruth.js')).default.fileThat(_note || userText);
+        } catch { /* ground-truth mirror optional */ }
         ok = true;
       } catch (e) { ok = false; }
-      let finalText = ok ? "Got it — I'll remember that." : "I tried to save that, but ran into an issue.";
+      let finalText = ok ? "Got it — I'll remember that, and I've filed it in our ground truth." : "I tried to save that, but ran into an issue.";
       finalText = shapeSpokenReply(finalText, req.body || {});
       try { conversationLogger.logAssistantMessage(finalText, { sessionId, responseType: 'remember' }); } catch {}
       return res.json({ ok: true, output_text: String(finalText || '').slice(0, 20000), agent: {
