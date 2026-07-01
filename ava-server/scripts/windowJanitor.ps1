@@ -1,11 +1,14 @@
-# windowJanitor.ps1 -- AVA proactive housekeeping.
-# Closes ONLY, and only when NOT the foreground window and (for consoles) at least 30s old:
-#   - File Explorer file windows           (class CabinetWClass)
-#   - classic Command Prompt consoles      (process cmd.exe, class ConsoleWindowClass)
-#   - Windows Terminal windows hosting cmd (process WindowsTerminal, title contains "Command Prompt"/"cmd")
-# Never touches the shell (desktop=Progman, taskbar=Shell_TrayWnd are never CabinetWClass), never
-# force-kills (gentle WM_CLOSE), and never closes a PowerShell/other Windows Terminal tab.
-# Emits one "CLOSED: <what>" line per window closed, for the Node service to log.
+# windowJanitor.ps1 -- AVA proactive housekeeping + monitor-fed console cleanup.
+# Closes ONLY (never the foreground window; consoles must be >=30s old; gentle WM_CLOSE, never a kill):
+#   - File Explorer file windows            (class CabinetWClass)
+#   - classic Command Prompt consoles       (process cmd.exe)
+#   - Windows Terminal windows hosting cmd  (process WindowsTerminal/OpenConsole, title has cmd/command prompt)
+#   - MONITOR-FED: leftover "AVA Server (5051)" console windows -- but ONLY when the live server on 5051
+#     is a HIDDEN standalone node (MainWindowHandle 0). In that case no visible "AVA Server (5051)" window
+#     can be the live one, so they're all provably dead restart leftovers and safe to close.
+# Deliberately NOT touched: the voice python console, and "AVA Client (5173)" windows -- because those run
+# inside Windows Terminal, which shares one PID across windows, so a live one can't be told from a dead one.
+# Never matches Progman/Shell_TrayWnd, so the desktop/taskbar (also explorer.exe) are never touched.
 $ErrorActionPreference = 'SilentlyContinue'
 
 $src = @"
@@ -42,6 +45,15 @@ try { Add-Type -TypeDefinition $src -Language CSharp } catch {}
 
 $fg = [long][AvaJan]::GetForegroundWindow()
 $WM_CLOSE = 0x0010
+
+# Monitor gate: is the live 5051 server a hidden standalone node? Only then are the leftover
+# "AVA Server (5051)" console windows all provably dead (the live one owns no window).
+$serverHiddenNode = $false
+try {
+  $op = (Get-NetTCPConnection -LocalPort 5051 -State Listen -ErrorAction SilentlyContinue).OwningProcess | Select-Object -First 1
+  if ($op) { $sp = Get-Process -Id $op -ErrorAction SilentlyContinue; if ($sp -and $sp.ProcessName -eq 'node' -and $sp.MainWindowHandle -eq [IntPtr]::Zero) { $serverHiddenNode = $true } }
+} catch {}
+
 $closed = @()
 foreach ($row in [AvaJan]::List()) {
   $parts = $row -split '\|', 4
@@ -51,10 +63,12 @@ foreach ($row in [AvaJan]::List()) {
   $proc = Get-Process -Id $wpid -ErrorAction SilentlyContinue
   if (-not $proc) { continue }
   $name = $proc.ProcessName
-  $isExplorer   = ($cls -eq 'CabinetWClass')
-  $isClassicCmd = ($name -eq 'cmd')
-  $isTermCmd    = (($name -eq 'WindowsTerminal' -or $name -eq 'OpenConsole') -and ($title -match '(?i)command prompt|cmd'))
-  if ($isExplorer -or $isClassicCmd -or $isTermCmd) {
+  $isConsoleHost = ($cls -eq 'CASCADIA_HOSTING_WINDOW_CLASS' -or $cls -eq 'ConsoleWindowClass' -or $name -eq 'cmd' -or $name -eq 'WindowsTerminal' -or $name -eq 'OpenConsole')
+  $isExplorer    = ($cls -eq 'CabinetWClass')
+  $isClassicCmd  = ($name -eq 'cmd')
+  $isTermCmd     = (($name -eq 'WindowsTerminal' -or $name -eq 'OpenConsole') -and ($title -match '(?i)command prompt|cmd'))
+  $isStaleServer = ($serverHiddenNode -and $isConsoleHost -and ($title -match 'AVA Server \(5051\)'))
+  if ($isExplorer -or $isClassicCmd -or $isTermCmd -or $isStaleServer) {
     $ageOk = $true
     if ($isClassicCmd -or $isTermCmd) { try { $ageOk = ((Get-Date) - $proc.StartTime).TotalSeconds -ge 30 } catch { $ageOk = $true } }
     if ($ageOk) {
