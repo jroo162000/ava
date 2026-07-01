@@ -14,7 +14,22 @@ const KB_PATH = path.join(__dirname, '..', '..', '..', 'ava-integration', 'memor
 const PROGRESS_PATH = path.join(__dirname, '..', '..', '..', 'ava-integration', 'memory', 'finance-kb-progress.json');
 const SOURCES_PATH = path.join(__dirname, 'finance-sources.json');
 const STATES_PATH = path.join(__dirname, 'finance-sources-states.json');
+const DEAD_PATH = path.join(__dirname, '..', '..', '..', 'ava-integration', 'memory', 'finance-kb-dead.json');
 const REFRESH_DAYS = parseInt(process.env.AVA_FINANCE_REFRESH_DAYS || '14', 10);
+const MAX_FAILS = parseInt(process.env.AVA_FINANCE_MAX_FAILS || '4', 10);   // give up on a URL after this many failed passes
+const ALT_MAX = parseInt(process.env.AVA_FINANCE_ALT_MAX || '4', 10);       // alternate URLs to try per subject
+
+// ---- dead-URL blacklist: addresses that returned nothing, so we never re-scrape them ----
+let _dead = null;
+function _deadUrls() {
+  if (_dead) return _dead;
+  try { _dead = new Set(JSON.parse(fs.readFileSync(DEAD_PATH, 'utf8'))); } catch { _dead = new Set(); }
+  return _dead;
+}
+function _markDead(u) {
+  if (!u) return; const s = _deadUrls();
+  if (!s.has(u)) { s.add(u); try { fs.mkdirSync(path.dirname(DEAD_PATH), { recursive: true }); fs.writeFileSync(DEAD_PATH, JSON.stringify([...s].slice(-1000))); } catch { /* ignore */ } }
+}
 
 // ---- embeddings: OpenAI (accurate) with a local hashed fallback ----
 const _D = 256;
@@ -98,7 +113,14 @@ async function _ensureVecs() {
   if (_migrated) return;
   let idx = _load();
   const before = idx.length;
-  idx = idx.filter(e => !_isBoilerplate(e.text));   // purge boilerplate already in the KB
+  // Purge boilerplate AND collapse duplicate chunks (same hash ingested across runs/rewrites).
+  const _seenH = new Set(); const _deduped = [];
+  for (const e of idx) {
+    if (_isBoilerplate(e.text)) continue;
+    const h = e.hash || _hash(e.text); e.hash = h;
+    if (_seenH.has(h)) continue; _seenH.add(h); _deduped.push(e);
+  }
+  idx = _deduped;
   _index = idx;
   const missing = idx.filter(e => !Array.isArray(e.vec) || !e.vec.length);
   if (missing.length) {
@@ -157,9 +179,10 @@ function _writeProgress(p) { try { fs.mkdirSync(path.dirname(PROGRESS_PATH), { r
 let _pop = { running: false, total: 0, done: 0, ok: 0, failed: 0, lastSource: '', startedAt: null, finishedAt: null, mode: '' };
 export function popStatus() {
   const prog = _readProgress();
-  const keys = Object.keys(prog);
+  const keys = Object.keys(prog).filter(k => !k.startsWith('__'));
   const succeeded = keys.filter(k => prog[k] && prog[k].ok).length;
-  return { ..._pop, kbChunks: _load().length, sourcesTracked: keys.length, sourcesSucceeded: succeeded };
+  const deadSources = keys.filter(k => prog[k] && prog[k].dead).length;
+  return { ..._pop, kbChunks: _load().length, sourcesTracked: keys.length, sourcesSucceeded: succeeded, deadSources, deadUrls: _deadUrls().size };
 }
 
 async function _scrapeText(url) {
@@ -198,35 +221,98 @@ async function _findContentUrl(query) {
     return (results[0] && (results[0].url || results[0].href)) || '';
   } catch { return ''; }
 }
-// Ingest a source's CONTENT. If the page is a PORTAL, crawl its relevant links into content pages.
-async function _ingestSource(w) {
-  let got = 0;
-  const r = await _scrapeRich(w.url);
-  if (r.text && r.text.length >= 200 && !r.isPortal) {
-    try { const o = await ingest({ text: r.text, source: w.source, url: w.url, topic: w.topic, jurisdiction: w.jurisdiction }); got += o.stored || 0; } catch { /* skip */ }
-  }
-  if (r.isPortal || r.text.length < 200) {
-    const rel = (r.links || []).filter(l => LINK_KEYWORDS.test((l.text || '') + ' ' + (l.url || ''))).slice(0, MAX_CRAWL);
-    for (const l of rel) {
-      const sub = await _scrapeText(l.url);
-      if (sub && sub.length >= 200) { try { const o = await ingest({ text: sub, source: `${w.source} — ${(l.text || 'page').slice(0, 60)}`, url: l.url, topic: w.topic, jurisdiction: w.jurisdiction }); got += o.stored || 0; } catch { /* skip */ } }
+// Search engines → a ranked list of candidate URLs (prefer .gov), deduped, blacklist filtered.
+async function _searchUrls(query, n = 6) {
+  try {
+    const r = await toolsService.executeTool('web_search', { query }, false, { source: 'finance', bypassIdempotency: true });
+    const inner = (r && (r.result || r)) || {};
+    const results = inner.results || (inner.result && inner.result.results) || [];
+    const seen = new Set(); const gov = []; const rest = [];
+    for (const res of results) {
+      const u = res.url || res.href;
+      if (!u || !/^https?:\/\//.test(u) || seen.has(u)) continue;
+      seen.add(u); (/\.gov(\b|\/|$)/.test(u) ? gov : rest).push(u);
     }
+    return [...gov, ...rest].slice(0, n);
+  } catch { return []; }
+}
+// Subject phrasings used to hunt for ALTERNATE sources when a source's own URL is dead.
+function _subjectQueries(w) {
+  if (w.kind === 'state' && w.state) return [
+    `${w.state} individual income tax rates filing requirements`,
+    `${w.state} department of revenue income tax official site`
+  ];
+  const base = String(w.source || '').replace(/\s+[—-].*$/, '').trim();
+  return [`${base} ${w.topic || 'tax'} IRS official`, `${w.topic || base} federal tax rules`];
+}
+async function _store(text, source, url, w) {
+  try { const o = await ingest({ text, source, url, topic: w.topic, jurisdiction: w.jurisdiction }); return o.stored || 0; } catch { return 0; }
+}
+// Portal page → crawl its relevant links into real content pages (dead links get blacklisted).
+async function _crawlPortal(r, w) {
+  let got = 0; const dead = _deadUrls();
+  const rel = (r.links || []).filter(l => LINK_KEYWORDS.test((l.text || '') + ' ' + (l.url || ''))).slice(0, MAX_CRAWL);
+  for (const l of rel) {
+    if (!l.url || dead.has(l.url)) continue;
+    const sub = await _scrapeText(l.url);
+    if (sub && sub.length >= 200) got += await _store(sub, `${w.source} — ${(l.text || 'page').slice(0, 60)}`, l.url, w);
+    else _markDead(l.url);
   }
   return got;
 }
+// Ingest a source's CONTENT. Prefers a previously-discovered working URL; on failure it searches
+// for ALTERNATE sources on the same subject and scrapes them until one succeeds. Returns rich state
+// so the populator can persist the working URL, an unchanged-refresh signal, and a content hash.
+async function _ingestSource(w, prev = {}) {
+  const dead = _deadUrls();
+  const primary = prev.workingUrl || w.url;
+  let got = 0, contentHash = prev.contentHash || null;
+
+  // 1) try the known-good / primary URL
+  if (primary && !dead.has(primary)) {
+    const r = await _scrapeRich(primary);
+    if (r.text && r.text.length >= 200 && !r.isPortal) {
+      const h = _hash(r.text.slice(0, 4000));
+      if (prev.ok && h === prev.contentHash) return { got: 0, unchanged: true, workingUrl: prev.workingUrl || null, contentHash: h, altTried: prev.altTried || false };
+      got += await _store(r.text, w.source, primary, w); contentHash = h;
+    } else if (r.isPortal || (r.text || '').length < 200) {
+      got += await _crawlPortal(r, w);
+    }
+    if (got > 0) return { got, workingUrl: prev.workingUrl || null, contentHash, altTried: prev.altTried || false };
+    _markDead(primary);
+  }
+
+  // 2) primary yielded nothing → find ALTERNATES via search engines, scrape until success
+  let workingUrl = null;
+  for (const q of _subjectQueries(w)) {
+    const cands = (await _searchUrls(q, ALT_MAX + 2)).filter(u => u !== primary && u !== w.url && !_deadUrls().has(u));
+    for (const u of cands.slice(0, ALT_MAX)) {
+      const rr = await _scrapeRich(u); let g = 0;
+      if (rr.text && rr.text.length >= 200 && !rr.isPortal) { g += await _store(rr.text, `${w.source} (alt)`, u, w); contentHash = _hash(rr.text.slice(0, 4000)); }
+      else if (rr.isPortal || (rr.text || '').length < 200) g += await _crawlPortal(rr, w);
+      if (g > 0) { got += g; workingUrl = u; break; }
+      _markDead(u);
+    }
+    if (got > 0) break;
+  }
+  return { got, workingUrl, contentHash, altTried: true };
+}
 // Topic-driven DEPTH: per jurisdiction, search each topic specifically and ingest the content page.
 async function _ingestTopics(jurisdiction, label) {
-  let got = 0;
+  let got = 0; const jw = { topic: '', jurisdiction };
   for (const t of TOPIC_QUERIES) {
-    const url = await _findContentUrl(`${label} ${t}`);
-    if (!url) continue;
-    const r = await _scrapeRich(url);
-    let txt = r.text;
-    if ((!txt || txt.length < 200 || r.isPortal) && r.links.length) {
-      const rel = r.links.filter(l => LINK_KEYWORDS.test((l.text || '') + ' ' + (l.url || ''))).slice(0, 2);
-      for (const l of rel) { const s = await _scrapeText(l.url); if (s && s.length >= 200) { txt = s; break; } }
+    // Scrape ALL relevant search results for the topic (not just the first .gov) so coverage is broad.
+    const urls = (await _searchUrls(`${label} ${t}`, 3)).filter(u => !_deadUrls().has(u));
+    for (const url of urls) {
+      const r = await _scrapeRich(url);
+      let txt = r.text;
+      if ((!txt || txt.length < 200 || r.isPortal) && r.links.length) {
+        const rel = r.links.filter(l => LINK_KEYWORDS.test((l.text || '') + ' ' + (l.url || ''))).slice(0, 2);
+        for (const l of rel) { const s = await _scrapeText(l.url); if (s && s.length >= 200) { txt = s; break; } }
+      }
+      if (txt && txt.length >= 200) { const n = await _store(txt, `${label}: ${t}`, url, { ...jw, topic: t.split(' ')[0] }); got += n; if (n > 0) break; }
+      else _markDead(url);
     }
-    if (txt && txt.length >= 200) { try { const o = await ingest({ text: txt, source: `${label}: ${t}`, url, topic: t.split(' ')[0], jurisdiction }); got += o.stored || 0; } catch { /* skip */ } }
   }
   return got;
 }
@@ -245,10 +331,12 @@ export function runPopulate(opts = {}) {
   const deep = mode === 'deep';
   const work = _workList(); const prog = _readProgress(); const now = Date.now();
   const due = work.filter(w => {
-    if (mode === 'all' || deep) return true;
+    if (mode === 'all' || deep) return !(prog[w.key] && prog[w.key].dead);   // even full re-runs skip abandoned subjects
     const p = prog[w.key];
-    if (!p || !p.ok) return true;
-    return (now - (Date.parse(p.lastOkAt) || 0)) > REFRESH_DAYS * 86400000;
+    if (!p) return true;                 // never tried
+    if (p.dead) return false;            // gave up (URL + alternates all dead) — stop retrying
+    if (!p.ok) return true;              // keep trying (with alternates) until it's marked dead
+    return (now - (Date.parse(p.lastOkAt) || 0)) > REFRESH_DAYS * 86400000;  // success → only refresh when stale
   });
   const jurs = deep ? [...new Set(work.map(w => w.jurisdiction))] : [];
   _pop = { running: true, total: due.length + jurs.length, done: 0, ok: 0, failed: 0, lastSource: '', startedAt: new Date().toISOString(), finishedAt: null, mode };
@@ -256,11 +344,23 @@ export function runPopulate(opts = {}) {
   (async () => {
     // 1) each source, content-first (crawls portal links into real content pages)
     for (const w of due) {
-      let got = 0;
-      try { got = await _ingestSource(w); } catch { /* skip */ }
-      const ok = got > 0;
       const prev = prog[w.key] || {};
-      prog[w.key] = { ok: ok || prev.ok || false, lastOkAt: ok ? new Date().toISOString() : (prev.lastOkAt || null), lastAttemptAt: new Date().toISOString(), fails: ok ? 0 : (prev.fails || 0) + 1, chunks: (prev.chunks || 0) + got };
+      let res = { got: 0 };
+      try { res = await _ingestSource(w, prev); } catch { /* skip */ }
+      const got = res.got || 0;
+      const ok = got > 0 || res.unchanged === true;      // an unchanged refresh still counts as a success
+      const fails = ok ? 0 : (prev.fails || 0) + 1;
+      const altTried = prev.altTried || res.altTried || false;
+      const dead = !ok && altTried && fails >= MAX_FAILS; // only abandon after alternates were tried
+      prog[w.key] = {
+        ok: ok || prev.ok || false,
+        lastOkAt: ok ? new Date().toISOString() : (prev.lastOkAt || null),
+        lastAttemptAt: new Date().toISOString(),
+        fails, chunks: (prev.chunks || 0) + got, dead,
+        workingUrl: res.workingUrl || prev.workingUrl || null,
+        contentHash: res.contentHash || prev.contentHash || null,
+        altTried
+      };
       _writeProgress(prog);
       _pop.done++; _pop.lastSource = w.source; ok ? _pop.ok++ : _pop.failed++;
     }
@@ -290,3 +390,4 @@ if ((process.env.AVA_FINANCE_AUTOPOPULATE || '1') !== '0') {
 }
 
 export default { ingest, search, stats, runPopulate, popStatus };
+// scrape-hardening: dead-URL blacklist + alternate discovery + source-level dedup (rev)
