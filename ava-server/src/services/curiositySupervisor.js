@@ -5,6 +5,7 @@
 import autonomyLib from './autonomyPolicy.js';
 import memoryService from './memory.js';
 import { jaccardSim } from './curiosityScoring.js';
+import evolutionLog from './evolutionLog.js';
 import logger from '../utils/logger.js';
 
 function normalizeFinding(f) {
@@ -118,6 +119,21 @@ export async function runCuriosity({
   }
 
   const rawFindings = (findings || []).slice(0, 3).map(f => normalizeFinding(f));
+
+  // Transparency (#208): make each governed curiosity run legible — what prompted it, what it
+  // kept, and why things were dropped — so it isn't an opaque background process.
+  try {
+    const dropReasons = {};
+    for (const fr of filtered) { const r = (fr && fr.reason) ? String(fr.reason).split(':')[0] : 'other'; dropReasons[r] = (dropReasons[r] || 0) + 1; }
+    const dropStr = Object.entries(dropReasons).map(([k, v]) => `${k}×${v}`).join(', ');
+    evolutionLog.record({
+      kind: 'curiosity',
+      title: (query || trigger || 'background research').slice(0, 120),
+      detail: `kept ${stored.length}, dropped ${filtered.length}${dropStr ? ' (' + dropStr + ')' : ''}`,
+      meta: { trigger, domain, storedCount: stored.length, filteredCount: filtered.length }
+    });
+  } catch { /* logging must never break the run */ }
+
   return { ran: true, outcome: decision.outcome, decision, storedCount: stored.length, filteredCount: filtered.length, stored, filtered, rawFindings, taskOutput };
 }
 

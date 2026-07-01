@@ -25,6 +25,7 @@ import digestScheduler from './services/digestScheduler.js';
 import moltbookScheduler from './services/moltbookScheduler.js';
 import selfImprove from './services/selfImprove.js';
 import workflowEngine from './services/workflowEngine.js';
+import windowJanitor from './services/windowJanitor.js';
 
 // Phase 7: Security audit at startup
 const isProd = process.env.NODE_ENV === 'production';
@@ -165,6 +166,14 @@ server.listen(PORT, HOST, () => {
     selfImprove.start();
   } catch (e) {
     logger.warn('Failed to start self-improvement loop', { error: e.message });
+  }
+
+  // Proactive housekeeping: close leftover, unused Command Prompt and File Explorer windows around
+  // the clock (skips the focused window + freshly-opened consoles). Scoped to just those two.
+  try {
+    windowJanitor.start();
+  } catch (e) {
+    logger.warn('Failed to start window janitor', { error: e.message });
   }
 
   // Long-horizon workflows: resume any multi-stage workflow that was mid-run when we last stopped,

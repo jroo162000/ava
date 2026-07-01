@@ -23,6 +23,7 @@ import llmService from '../services/llm.js';
 import avaSelf from '../services/avaSelf.js';
 import financeKnowledge from '../services/financeKnowledge.js';
 import toolsService from '../services/tools.js';
+import evolutionLog from '../services/evolutionLog.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -294,6 +295,15 @@ router.get('/self/board', (_req, res) => {
   try { res.json({ ok: true, ...avaSelf.getBoard() }); }
   catch (e) { res.status(500).json({ ok: false, error: e.message }); }
 });
+// Self-evolution changelog + curiosity transparency (#208/#209): what she's changed about her own
+// code and what she chose to look into. ?kind=self_mod|curiosity to filter, ?n= to limit.
+router.get('/self/evolution', (req, res) => {
+  try {
+    const kind = req.query.kind ? String(req.query.kind) : null;
+    const n = Math.min(200, Math.max(1, parseInt(req.query.n, 10) || 40));
+    res.json({ ok: true, entries: evolutionLog.recent(n, kind), block: evolutionLog.block() });
+  } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+});
 
 // Finance/bookkeeping/tax knowledge harness (RAG). Ingest an authoritative source (scraped via
 // web_scrape, or pass text directly) into the finance KB; search it; check coverage.
@@ -436,6 +446,17 @@ router.post('/self_mod', async (req, res) => {
           result.message = `I applied it, but it failed a syntax check (${v.error}) — so I reverted it instead of restarting into broken code.`;
           return res.json({ ok: true, ...result });
         }
+        // Self-evolution changelog (#209): record the applied change so she can reflect on how
+        // she's changing. Only reached after the applied file passed the syntax verify above.
+        try {
+          const fn = String(appliedFile || '').split(/[\\/]/).pop() || appliedFile;
+          evolutionLog.record({
+            kind: 'self_mod',
+            title: fn || 'self-modification',
+            detail: result.reason || result.summary || body.reason || 'applied an approved change to my own code',
+            meta: { id: result.modification_id || req.body?.modification_id || null, file: appliedFile, action: 'applied' }
+          });
+        } catch { /* logging must never break apply */ }
         result.restart = selfRestart.scheduleServerRestart({
           reason: `UI approved proposal ${result.modification_id || req.body?.modification_id || ''}`.trim()
         });
@@ -445,6 +466,10 @@ router.post('/self_mod', async (req, res) => {
       }
       // Undoing an applied change also needs the server to reload to take effect.
       if ((action === 'undo' || action === 'revert') && result.status === 'success') {
+        try {
+          const rf = String(result.file || result.file_path || '').split(/[\\/]/).pop();
+          evolutionLog.record({ kind: 'self_mod', title: `reverted ${rf || 'a change'}`, detail: result.reason || 'rolled back a change I had applied', meta: { id: result.modification_id || req.body?.modification_id || null, action: 'reverted' } });
+        } catch { /* best effort */ }
         result.restart = selfRestart.scheduleServerRestart({
           reason: `UI undo of ${result.modification_id || req.body?.modification_id || ''}`.trim()
         });

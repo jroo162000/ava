@@ -1653,7 +1653,9 @@ router.post('/respond', async (req, res) => {
       try { _gtBlock = (await import('../services/groundTruth.js')).default.block(); } catch { /* optional */ }
       let _commitBlock = '';
       try { _commitBlock = (await import('../services/commitments.js')).default.block(); } catch { /* optional */ }
-      const sysPrompt = `${personaSvc.buildPersonaBlockText()}${_gtBlock ? '\n\n' + _gtBlock : ''}${_commitBlock ? '\n\n' + _commitBlock : ''}${_memBlock ? '\n\n' + _memBlock : ''}${_envBlock ? '\n\n' + _envBlock : ''}${_proactiveBlock}${_financeBlock}\n\nThis reply is BOTH spoken aloud AND shown on screen. Keep it natural and conversational — short enough to say out loud (a sentence or two is usually enough). For the screen you may use LIGHT Markdown: a **bold** key term, or a short "- " bullet list when you name several things — but no big headings or tables, and never sound like a written report. Give a complete answer when the question calls for it.${budgetPrompt}${context ? '\n\nContext: ' + context : ''}`;
+      let _evoBlock = '';
+      try { _evoBlock = (await import('../services/evolutionLog.js')).default.block(); } catch { /* optional */ }
+      const sysPrompt = `${personaSvc.buildPersonaBlockText()}${_gtBlock ? '\n\n' + _gtBlock : ''}${_commitBlock ? '\n\n' + _commitBlock : ''}${_evoBlock ? '\n\n' + _evoBlock : ''}${_memBlock ? '\n\n' + _memBlock : ''}${_envBlock ? '\n\n' + _envBlock : ''}${_proactiveBlock}${_financeBlock}\n\nThis reply is BOTH spoken aloud AND shown on screen. Keep it natural and conversational — short enough to say out loud (a sentence or two is usually enough). For the screen you may use LIGHT Markdown: a **bold** key term, or a short "- " bullet list when you name several things — but no big headings or tables, and never sound like a written report. Give a complete answer when the question calls for it.${budgetPrompt}${context ? '\n\nContext: ' + context : ''}`;
       // Capability awareness: list the real tools so AVA can answer "what can you
       // do?" accurately even on this no-execution conversational path. (Previously
       // this prompt omitted tools, so she'd say she had none.)
