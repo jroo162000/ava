@@ -328,8 +328,8 @@ router.get('/finance/stats', (_req, res) => {
   catch (e) { res.status(500).json({ ok: false, error: e.message }); }
 });
 // Kick off background population of the whole federal + 50-state + DC corpus (non-blocking).
-router.post('/finance/populate', (_req, res) => {
-  try { res.json({ ok: true, ...financeKnowledge.runPopulate() }); }
+router.post('/finance/populate', (req, res) => {
+  try { res.json({ ok: true, ...financeKnowledge.runPopulate({ mode: (req.body && req.body.mode) || 'all' }) }); }
   catch (e) { res.status(500).json({ ok: false, error: e.message }); }
 });
 

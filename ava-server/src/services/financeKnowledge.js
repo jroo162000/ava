@@ -176,6 +176,61 @@ async function _findStateUrl(state) {
     return (results[0] && (results[0].url || results[0].href)) || '';
   } catch { return ''; }
 }
+const TOPIC_QUERIES = (process.env.AVA_FINANCE_TOPICS
+  || 'individual income tax brackets and rates|standard deduction and exemptions|filing requirements deadlines and extensions|sales and use tax rate|business and self-employment tax|tax credits and deductions').split('|');
+const LINK_KEYWORDS = /(income|tax|sales|use[- ]?tax|deduction|credit|filing|\bfile\b|rate|bracket|business|self[- ]?employ|withhold|estimate|exempt|return|payment|refund|individual)/i;
+const MAX_CRAWL = parseInt(process.env.AVA_FINANCE_MAX_CRAWL || '5', 10);
+
+async function _scrapeRich(url) {
+  try {
+    const r = await toolsService.executeTool('web_scrape', { url, links: true, max_chars: 8000 }, false, { source: 'finance', bypassIdempotency: true });
+    const inner = (r && (r.result || r)) || {};
+    const res = inner.result || inner;
+    return { text: res.text || res.content || res.article || '', isPortal: !!res.is_portal, links: Array.isArray(res.links) ? res.links : [] };
+  } catch { return { text: '', isPortal: false, links: [] }; }
+}
+async function _findContentUrl(query) {
+  try {
+    const r = await toolsService.executeTool('web_search', { query: query + ' official site' }, false, { source: 'finance', bypassIdempotency: true });
+    const inner = (r && (r.result || r)) || {};
+    const results = inner.results || (inner.result && inner.result.results) || [];
+    for (const res of results) { const u = res.url || res.href; if (u && /\.gov(\b|\/|$)/.test(u)) return u; }
+    return (results[0] && (results[0].url || results[0].href)) || '';
+  } catch { return ''; }
+}
+// Ingest a source's CONTENT. If the page is a PORTAL, crawl its relevant links into content pages.
+async function _ingestSource(w) {
+  let got = 0;
+  const r = await _scrapeRich(w.url);
+  if (r.text && r.text.length >= 200 && !r.isPortal) {
+    try { const o = await ingest({ text: r.text, source: w.source, url: w.url, topic: w.topic, jurisdiction: w.jurisdiction }); got += o.stored || 0; } catch { /* skip */ }
+  }
+  if (r.isPortal || r.text.length < 200) {
+    const rel = (r.links || []).filter(l => LINK_KEYWORDS.test((l.text || '') + ' ' + (l.url || ''))).slice(0, MAX_CRAWL);
+    for (const l of rel) {
+      const sub = await _scrapeText(l.url);
+      if (sub && sub.length >= 200) { try { const o = await ingest({ text: sub, source: `${w.source} — ${(l.text || 'page').slice(0, 60)}`, url: l.url, topic: w.topic, jurisdiction: w.jurisdiction }); got += o.stored || 0; } catch { /* skip */ } }
+    }
+  }
+  return got;
+}
+// Topic-driven DEPTH: per jurisdiction, search each topic specifically and ingest the content page.
+async function _ingestTopics(jurisdiction, label) {
+  let got = 0;
+  for (const t of TOPIC_QUERIES) {
+    const url = await _findContentUrl(`${label} ${t}`);
+    if (!url) continue;
+    const r = await _scrapeRich(url);
+    let txt = r.text;
+    if ((!txt || txt.length < 200 || r.isPortal) && r.links.length) {
+      const rel = r.links.filter(l => LINK_KEYWORDS.test((l.text || '') + ' ' + (l.url || ''))).slice(0, 2);
+      for (const l of rel) { const s = await _scrapeText(l.url); if (s && s.length >= 200) { txt = s; break; } }
+    }
+    if (txt && txt.length >= 200) { try { const o = await ingest({ text: txt, source: `${label}: ${t}`, url, topic: t.split(' ')[0], jurisdiction }); got += o.stored || 0; } catch { /* skip */ } }
+  }
+  return got;
+}
+
 function _workList() {
   let federal = [], states = [];
   try { federal = (JSON.parse(fs.readFileSync(SOURCES_PATH, 'utf8')).sources || []).map(s => ({ key: 'fed:' + s.url, kind: 'federal', url: s.url, source: s.source, topic: s.topic, jurisdiction: 'US-federal' })); } catch { /* ignore */ }
@@ -187,32 +242,41 @@ function _workList() {
 export function runPopulate(opts = {}) {
   if (_pop.running) return { already: true, ..._pop };
   const mode = opts.mode || 'all';
+  const deep = mode === 'deep';
   const work = _workList(); const prog = _readProgress(); const now = Date.now();
   const due = work.filter(w => {
-    if (mode === 'all') return true;
+    if (mode === 'all' || deep) return true;
     const p = prog[w.key];
     if (!p || !p.ok) return true;
     return (now - (Date.parse(p.lastOkAt) || 0)) > REFRESH_DAYS * 86400000;
   });
-  _pop = { running: true, total: due.length, done: 0, ok: 0, failed: 0, lastSource: '', startedAt: new Date().toISOString(), finishedAt: null, mode };
-  if (!due.length) { _pop.running = false; _pop.finishedAt = new Date().toISOString(); return { started: false, nothingDue: true, mode }; }
+  const jurs = deep ? [...new Set(work.map(w => w.jurisdiction))] : [];
+  _pop = { running: true, total: due.length + jurs.length, done: 0, ok: 0, failed: 0, lastSource: '', startedAt: new Date().toISOString(), finishedAt: null, mode };
+  if (!due.length && !jurs.length) { _pop.running = false; _pop.finishedAt = new Date().toISOString(); return { started: false, nothingDue: true, mode }; }
   (async () => {
+    // 1) each source, content-first (crawls portal links into real content pages)
     for (const w of due) {
-      let ok = false, txt = await _scrapeText(w.url), usedUrl = w.url;
-      if (!(txt && txt.length >= 200) && w.kind === 'state') {
-        const alt = await _findStateUrl(w.state);
-        if (alt) { const t2 = await _scrapeText(alt); if (t2 && t2.length >= 200) { txt = t2; usedUrl = alt; } }
-      }
-      if (txt && txt.length >= 200) { try { await ingest({ text: txt, source: w.source, url: usedUrl, topic: w.topic, jurisdiction: w.jurisdiction }); ok = true; } catch { /* skip */ } }
+      let got = 0;
+      try { got = await _ingestSource(w); } catch { /* skip */ }
+      const ok = got > 0;
       const prev = prog[w.key] || {};
-      prog[w.key] = { ok: ok || prev.ok || false, lastOkAt: ok ? new Date().toISOString() : (prev.lastOkAt || null), lastAttemptAt: new Date().toISOString(), fails: ok ? 0 : (prev.fails || 0) + 1 };
+      prog[w.key] = { ok: ok || prev.ok || false, lastOkAt: ok ? new Date().toISOString() : (prev.lastOkAt || null), lastAttemptAt: new Date().toISOString(), fails: ok ? 0 : (prev.fails || 0) + 1, chunks: (prev.chunks || 0) + got };
       _writeProgress(prog);
       _pop.done++; _pop.lastSource = w.source; ok ? _pop.ok++ : _pop.failed++;
+    }
+    // 2) DEEP fill: topic-specific searches per jurisdiction for real depth
+    for (const jur of jurs) {
+      const label = jur === 'US-federal' ? 'US federal' : jur.replace(/^US-/, '');
+      let got = 0; try { got = await _ingestTopics(jur, label); } catch { /* skip */ }
+      const tkey = 'topics:' + jur; const prev = prog[tkey] || {};
+      prog[tkey] = { ok: got > 0 || prev.ok || false, lastOkAt: got > 0 ? new Date().toISOString() : (prev.lastOkAt || null), lastAttemptAt: new Date().toISOString(), chunks: (prev.chunks || 0) + got };
+      _writeProgress(prog);
+      _pop.done++; _pop.lastSource = label + ' (topics)'; got > 0 ? _pop.ok++ : _pop.failed++;
     }
     _pop.running = false; _pop.finishedAt = new Date().toISOString();
     logger.info('[finance-kb] populate complete', { mode, ok: _pop.ok, failed: _pop.failed, total: _pop.total });
   })().catch(e => { _pop.running = false; logger.warn('[finance-kb] populate crashed', { error: e.message }); });
-  return { started: true, total: due.length, mode };
+  return { started: true, total: due.length + jurs.length, mode };
 }
 
 // Auto-refresh scheduler: frequently fills the misses + keeps the corpus current. Opt-out with
