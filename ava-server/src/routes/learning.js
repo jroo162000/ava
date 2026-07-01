@@ -24,6 +24,7 @@ import avaSelf from '../services/avaSelf.js';
 import financeKnowledge from '../services/financeKnowledge.js';
 import toolsService from '../services/tools.js';
 import evolutionLog from '../services/evolutionLog.js';
+import moltbookWatchlist from '../services/moltbookWatchlist.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -582,6 +583,21 @@ router.post('/moltbook/verify', async (req, res) => {
     if (!code || answer === undefined || answer === '') return res.status(400).json({ ok: false, error: 'code and answer required' });
     const out = await submitMoltbookVerification(code, answer);
     res.json({ ok: out.ok, ...out });
+  } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+});
+
+// Focused Moltbook watchlist (#200): topics/handles/submolts AVA prioritizes engaging with.
+// GET lists it; POST {action:'add'|'remove', term, kind} edits it.
+router.get('/moltbook/watchlist', (_req, res) => {
+  try { res.json({ ok: true, watchlist: moltbookWatchlist.list() }); }
+  catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+});
+router.post('/moltbook/watchlist', (req, res) => {
+  try {
+    const { action = 'add', term, kind } = req.body || {};
+    if (!term) return res.status(400).json({ ok: false, error: 'term required' });
+    if (action === 'remove') return res.json({ ok: true, removed: moltbookWatchlist.remove(term), watchlist: moltbookWatchlist.list() });
+    return res.json({ ok: true, added: moltbookWatchlist.add(term, kind), watchlist: moltbookWatchlist.list() });
   } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
 });
 

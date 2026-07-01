@@ -9,6 +9,7 @@ import llmService from '../services/llm.js';
 import toolsService from '../services/tools.js';
 import pythonWorker from '../services/pythonWorker.js';
 import conversationLogger from '../services/conversationLogger.js';
+import turnGuard from '../services/turnGuard.js';
 import artifactMemory from '../services/artifactMemory.js';
 import personaSvc from '../services/persona.js';
 import environmentContext from '../services/environmentContext.js';
@@ -1107,6 +1108,10 @@ router.post('/respond', async (req, res) => {
     }
 
     try { conversationLogger.logUserMessage(userText, { sessionId, endpoint: '/respond', freshSession }); } catch {}
+    // Clean task-switch (#205): claim this turn. If a newer turn for this session begins while the
+    // slow (agent / conversational) paths below are still working, they'll see they're superseded
+    // at their emit point and drop the stale reply instead of speaking over the newer one.
+    const _turn = turnGuard.begin(sessionId);
 
     // Repair STT mishears of "Moltbook" before any intent routing / agent reasoning (original
     // text is already logged above).
@@ -1738,6 +1743,9 @@ router.post('/respond', async (req, res) => {
 
         try { conversationLogger.logAssistantMessage(_convDisplay, { sessionId, responseType: 'conversational' }); } catch {}
 
+        if (!turnGuard.isCurrent(sessionId, _turn)) {
+          return res.json({ ok: true, superseded: true, output_text: '', display_text: '', agent: { id: 'superseded-' + Date.now(), status: 'superseded', steps: 0, result: '', errors: [] } });
+        }
         return res.json({ ok: true, output_text: String(_convSpoken || '').slice(0, 20000), display_text: _convDisplay.slice(0, 20000), agent: {
           id: 'conv-' + Date.now(),
           status: 'success',
@@ -1835,6 +1843,9 @@ Don't read raw tool names, JSON, or status codes, but you MAY describe your heal
 
     try { conversationLogger.logAssistantMessage(_agentDisplay, { sessionId, responseType: 'agent' }); } catch {}
 
+    if (!turnGuard.isCurrent(sessionId, _turn)) {
+      return res.json({ ok: true, superseded: true, output_text: '', display_text: '', agent: { id: 'superseded-' + Date.now(), status: 'superseded', steps: 0, result: '', errors: [] } });
+    }
     res.json({ ok: true, output_text: String(_agentSpoken || '').slice(0, 20000), display_text: _agentDisplay.slice(0, 20000), agent: {
       id: state.id,
       status: state.status,

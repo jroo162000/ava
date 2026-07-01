@@ -9,6 +9,7 @@ import memoryService, { MemoryType, MemorySource } from './memory.js';
 import digestQueue from './digestQueue.js';
 import personaSvc from './persona.js';
 import interests from './moltbookInterests.js';
+import watchlist from './moltbookWatchlist.js';
 import selfReflections from './selfReflections.js';
 import logger from '../utils/logger.js';
 import fs from 'fs';
@@ -1252,7 +1253,15 @@ async function engageWithFeed(state) {
     return pid && author !== 'AVA-Voice' && !state.engagedPosts.includes(pid);
   });
   if (!candidates.length) return { engaged: 0, state };
-  const target = candidates[0];
+  // Watchlist focus (#200): prioritize feed items matching watched topics/handles/submolts, but
+  // still engage with something even when nothing matches (stable sort keeps original order on ties).
+  const target = candidates
+    .map((p, i) => {
+      const author = (p.author && (p.author.name || p.author.username)) || p.author || '';
+      const submolt = p.submolt || p.subMolt || p.community || '';
+      return { p, i, s: watchlist.score(`${p.title || ''} ${p.content || p.body || ''} ${author} ${submolt}`) };
+    })
+    .sort((a, b) => (b.s - a.s) || (a.i - b.i))[0].p;
   const pid = target.id || target.postId || target._id;
   const comment = await generateFeedComment(target);
   if (!comment) return { engaged: 0, state };
@@ -1353,10 +1362,10 @@ async function _runActivityInternal() {
   // Engage with OTHERS' posts — comment on something fresh in the feed (frequently).
   try {
     if (moltbookService.isRateLimited) throw new Error('rate_limited_cooldown');
-    const ENGAGE_EVERY = Math.max(1, parseInt(process.env.AVA_MOLTBOOK_ENGAGE_MIN || '6', 10)) * 60 * 1000;
+    const ENGAGE_EVERY = Math.max(1, parseInt(process.env.AVA_MOLTBOOK_ENGAGE_MIN || '5', 10)) * 60 * 1000;
     const todayStr = new Date().toDateString();
     if (state.lastEngageDate !== todayStr) { state.engagesToday = 0; state.lastEngageDate = todayStr; }
-    const engageCap = parseInt(process.env.AVA_MOLTBOOK_ENGAGE_MAX_DAILY || '30', 10);
+    const engageCap = parseInt(process.env.AVA_MOLTBOOK_ENGAGE_MAX_DAILY || '48', 10);
     if ((!state.lastEngageAt || now - state.lastEngageAt > ENGAGE_EVERY) && (state.engagesToday || 0) < engageCap) {
       const res = await engageWithFeed(state);
       if (res.state) state = res.state;
@@ -1413,7 +1422,7 @@ async function _runActivityInternal() {
     writeState(state);
     try {
       if (moltbookService.isRateLimited) throw new Error('rate_limited_cooldown');
-      const SELF_POST_MIN = Math.max(30, parseInt(process.env.AVA_MOLTBOOK_SELFPOST_MIN || '60', 10)) * 60 * 1000;
+      const SELF_POST_MIN = Math.max(30, parseInt(process.env.AVA_MOLTBOOK_SELFPOST_MIN || '45', 10)) * 60 * 1000;
       const selfPostDue = !state.lastSelfPostAt || now - state.lastSelfPostAt > SELF_POST_MIN;
       if (selfPostDue) {
         const sp = await generateSelfPost();
