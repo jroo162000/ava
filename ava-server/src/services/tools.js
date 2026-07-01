@@ -213,9 +213,9 @@ class ToolsService {
       },
       {
         name: 'panel',
-        description: "Your VISUAL PRESENTER panel. Open cards to SHOW things while you talk or work, then bring the relevant one to the front and close it when done. action 'open' with type (news|image|video|web|mermaid|markdown|table|note) + title + content opens a card and returns its id (news content = JSON array of {title,source,url,image,snippet}; video content = a YouTube url/id or direct video url; image/web content = a url; mermaid/table/markdown content = the source text). action 'focus' with id brings a card to the front. action 'close' with id removes it. action 'clear' removes all. action 'list' returns what's currently on screen.",
+        description: "Your VISUAL PRESENTER panel. Open cards to SHOW things while you talk or work, then highlight the referenced one, arrange them, and close when done. YOU choose how many, which, the layout, and where. action 'open' with type (news|image|video|web|mermaid|markdown|table|note) + title + content opens a card and returns its id (news content = JSON array of {title,source,url,image,snippet}; video content = a YouTube url/id or direct video url; image/web content = a url; mermaid/table/markdown content = the source text). action 'focus' with id highlights/brings-forward a card. action 'layout' with mode 'spread' (all visible) or 'stack' (fanned). action 'move' with id + x + y (0..1) repositions a card. action 'close' with id removes it. action 'clear' removes all. action 'list' returns what's on screen.",
         source: 'builtin',
-        schema: { type: 'object', properties: { action: { type: 'string', enum: ['open', 'focus', 'close', 'clear', 'list'] }, type: { type: 'string' }, title: { type: 'string' }, content: {}, id: { type: 'string' } }, required: ['action'] },
+        schema: { type: 'object', properties: { action: { type: 'string', enum: ['open', 'focus', 'layout', 'move', 'close', 'clear', 'list'] }, type: { type: 'string' }, title: { type: 'string' }, content: {}, id: { type: 'string' }, mode: { type: 'string' }, x: { type: 'number' }, y: { type: 'number' } }, required: ['action'] },
         requires_confirm: false,
         risk_level: 'low'
       },
@@ -649,6 +649,8 @@ class ToolsService {
           const act = (args.action || 'list').toLowerCase();
           if (act === 'open') { const c = artifactBus.open({ type: args.type, title: args.title, content: args.content }); return { ok: true, result: { opened: c.id, type: c.type, title: c.title } }; }
           if (act === 'focus') { return { ok: true, result: { focused: artifactBus.focus(args.id) ? args.id : null } }; }
+          if (act === 'layout') { return { ok: true, result: { layout: artifactBus.setLayout(args.mode) } }; }
+          if (act === 'move') { return { ok: true, result: { moved: artifactBus.move(args.id, args.x, args.y) } }; }
           if (act === 'close') { return { ok: true, result: { closed: artifactBus.close(args.id) } }; }
           if (act === 'clear') { artifactBus.clear(); return { ok: true, result: { cleared: true } }; }
           const st = artifactBus.state();

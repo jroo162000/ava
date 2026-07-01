@@ -13,6 +13,7 @@ import turnGuard from '../services/turnGuard.js';
 import artifactMemory from '../services/artifactMemory.js';
 import artifactBus from '../services/artifactBus.js';
 import visualizer from '../services/visualizer.js';
+import presenter from '../services/presenter.js';
 import personaSvc from '../services/persona.js';
 import environmentContext from '../services/environmentContext.js';
 import actionHistory from '../services/actionHistory.js';
@@ -1753,8 +1754,8 @@ router.post('/respond', async (req, res) => {
         if (!turnGuard.isCurrent(sessionId, _turn)) {
           return res.json({ ok: true, superseded: true, output_text: '', display_text: '', agent: { id: 'superseded-' + Date.now(), status: 'superseded', steps: 0, result: '', errors: [] } });
         }
-        // Fire-and-forget: pop a visual reference onto the panel if it would help (never blocks the reply).
-        try { visualizer.maybeVisualize(userText, _convDisplay, { force: _wantsVisual, sessionId }).catch(() => {}); } catch { /* optional */ }
+        // Fire-and-forget: the director presents real visuals (news/photos/video/diagrams) if they help. Never blocks the reply.
+        try { presenter.present(userText, _convDisplay, { force: _wantsVisual, sessionId }).catch(() => {}); } catch { /* optional */ }
         return res.json({ ok: true, output_text: String(_convSpoken || '').slice(0, 20000), display_text: _convDisplay.slice(0, 20000), agent: {
           id: 'conv-' + Date.now(),
           status: 'success',
@@ -1855,7 +1856,7 @@ Don't read raw tool names, JSON, or status codes, but you MAY describe your heal
     if (!turnGuard.isCurrent(sessionId, _turn)) {
       return res.json({ ok: true, superseded: true, output_text: '', display_text: '', agent: { id: 'superseded-' + Date.now(), status: 'superseded', steps: 0, result: '', errors: [] } });
     }
-    try { visualizer.maybeVisualize(userText, _agentDisplay, { force: _wantsVisual, sessionId }).catch(() => {}); } catch { /* optional */ }
+    try { presenter.present(userText, _agentDisplay, { force: _wantsVisual, sessionId }).catch(() => {}); } catch { /* optional */ }
     res.json({ ok: true, output_text: String(_agentSpoken || '').slice(0, 20000), display_text: _agentDisplay.slice(0, 20000), agent: {
       id: state.id,
       status: state.status,
@@ -2923,6 +2924,12 @@ router.post('/panel/close', (req, res) => {
 });
 router.post('/panel/clear', (_req, res) => {
   try { artifactBus.clear(); res.json({ ok: true, ...artifactBus.state() }); } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+});
+router.post('/panel/layout', (req, res) => {
+  try { res.json({ ok: true, layout: artifactBus.setLayout((req.body || {}).mode), ...artifactBus.state() }); } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+});
+router.post('/panel/move', (req, res) => {
+  try { const b = req.body || {}; res.json({ ok: artifactBus.move(b.id, b.x, b.y), ...artifactBus.state() }); } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
 });
 
 router.post('/memory/search', async (req, res) => {
