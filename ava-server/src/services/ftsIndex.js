@@ -167,5 +167,41 @@ function query(q, limit = 8) {
   }
 }
 
-export { available, query, ensureFresh };
-export default { available, query, ensureFresh };
+// Autocomplete-like prefix search: returns completions for a given prefix string by scanning the
+// FTS index for labels and content that start with the prefix, enabling fast suggest-as-you-type
+// for tool names, known entities, and recent terms without a full scan.
+function _searchByPrefix(prefix, limit = 6) {
+  if (!_ok && !_init()) return null;
+  const p = String(prefix || '').trim().toLowerCase();
+  if (!p || p.length < 2) return [];
+  const safeP = p.replace(/'/g, "''");
+  try {
+    const sql = `SELECT DISTINCT content, source, label, ymd, tm, who FROM docs WHERE LOWER(content) LIKE '${safeP}%' OR LOWER(label) LIKE '${safeP}%' LIMIT ?`;
+    const rows = db.prepare(sql).all(limit * 3);
+    const seen = new Set();
+    const out = [];
+    for (const r of rows) {
+      const text = String(r.content || '').slice(0, 240);
+      const key = `${r.source}:${r.label}:${text.slice(0, 60)}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push({
+        source: r.source,
+        label: r.label || '',
+        date: r.ymd || '',
+        time: r.tm || '',
+        who: r.who || '',
+        text,
+        score: r.source === 'memory' ? 10 : 5,
+      });
+      if (out.length >= limit) break;
+    }
+    return out;
+  } catch (e) {
+    try { logger.warn('[fts] prefix search failed', { error: e.message }); } catch { /* ignore */ }
+    return null;
+  }
+}
+
+export { available, query, ensureFresh, _searchByPrefix };
+export default { available, query, ensureFresh, _searchByPrefix };
