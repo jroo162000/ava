@@ -10,6 +10,7 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import logger from '../utils/logger.js';
+import { emitVoiceEvent } from './voiceBus.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DATA_DIR = path.join(__dirname, '..', '..', 'data');
@@ -41,6 +42,8 @@ export function setTheme(partial) {
   }
   writeJson(THEME, next);
   logger.info('[self] theme updated (no approval needed)', { changed });
+  // Tier 2 #15: push her new look to the UI live (replaces the client's 30s theme poll).
+  try { emitVoiceEvent('self.theme', { theme: next, changed }, 'server'); } catch { /* ui push is best-effort */ }
   return { theme: next, changed };
 }
 

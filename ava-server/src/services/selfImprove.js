@@ -757,6 +757,8 @@ async function runScan({ reason = 'scheduled', max = 1, avoid = [], diag: trigge
     });
     if (res.status === 'proposed') {
       logger.info('[selfImprove] queued a proposal', { id: res.modification_id, file: path.basename(plan.file), reviewRecommendation: proposalReview.recommendation });
+      // Tier 2 #15: push the updated pending queue to the UI (no client polling).
+      try { (await import('./uiPush.js')).default.pushSelfModPending(); } catch { /* ui push is best-effort */ }
       // Spoken heads-up — composed in HER OWN voice (no fixed "Heads up" opener). The voice
       // runner polls /voice/announcements and says this aloud.
       announceQueue.pushAnnouncement(await composeProposalAnnouncement({
@@ -865,6 +867,8 @@ async function reproposeForFile({ file, intent = '', rejectionReason = '', fromI
   const res = (pf && (pf.result || pf)) || {};
   if (res.status === 'proposed') {
     logger.info('[selfImprove] queued a RE-proposal', { id: res.modification_id, file: path.basename(target), from: fromId });
+    // Tier 2 #15: push the updated pending queue to the UI (no client polling).
+    try { (await import('./uiPush.js')).default.pushSelfModPending(); } catch { /* ui push is best-effort */ }
     try {
       announceQueue.pushAnnouncement(await composeProposalAnnouncement({
         file: target, reason: reasonText, recommendation: proposalReview.recommendation,

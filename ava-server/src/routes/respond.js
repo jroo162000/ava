@@ -22,6 +22,7 @@ import memoryReviewer from '../services/memoryReviewer.js';
 import selfImprove from '../services/selfImprove.js';
 import { shapeSpokenReply, normalizeSpokenReplyBudget, normalizeMoltbookMentions, isStepStatusMessage } from '../services/speech.js';
 import { isSelfSnapshotRequest, isManualProposalRequest, createSelfSnapshot, handleSelfModVoice } from '../services/selfModVoice.js';
+import { emitVoiceEvent } from '../services/voiceBus.js';  // Tier 2 #15: assistant.delta to the UI
 import { markDuplicateTurn, buildSelfStatus } from './api.js';
 
 function isSelfDescriptionRequest(text = '') {
@@ -1202,6 +1203,11 @@ router.post('/respond/stream', async (req, res) => {
       // ruled out (or stripped), stream normally.
       if (buf.trim().length < SENTINEL.length + 2) return;
       stripSentinel();
+      // Tier 2 #15 / #11 UI leg: mirror the (sentinel-cleaned) text to the UI as it generates,
+      // so the reply types into the web client live. assistant.final still closes the bubble.
+      if (buf) { try { emitVoiceEvent('assistant.delta', { text: buf }, 'stream'); } catch { /* ui push is best-effort */ } }
+    } else if (piece) {
+      try { emitVoiceEvent('assistant.delta', { text: String(piece) }, 'stream'); } catch { /* ui push is best-effort */ }
     }
     flushSentences(false);
   };

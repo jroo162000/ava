@@ -1,4 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react'
+import { subscribe } from '../liveBus.js'
 
 // ArtifactPanel — AVA's visual PRESENTER. Mirrors backend panel state (/panel/state): however many
 // cards she opened, in the layout SHE chose (spread = all visible; stack = fanned), placed where she
@@ -84,13 +85,21 @@ export default function ArtifactPanel() {
   const [drag, setDrag] = useState(null) // {id, x, y} live override during a drag
   const stageRef = useRef(null)
 
+  // Tier 2 #15: artifactBus already emits a `panel` event on every change — subscribe to the
+  // shared /voice/ws fan-out (liveBus) instead of hammering /panel/state every second. One
+  // snapshot fetch on mount and on socket (re)open keeps reconnects honest.
   useEffect(() => {
     let stop = false
-    const poll = async () => {
-      try { const r = await api('/panel/state'); const j = await r.json(); if (j && j.ok) { setCards(j.cards || []); setFocusedId(j.focusedId || null); if (j.layout) setLayout(j.layout) } } catch {}
-      if (!stop) setTimeout(poll, 1000)
+    const applyState = (j) => { if (stop || !j) return; setCards(j.cards || []); setFocusedId(j.focusedId || null); if (j.layout) setLayout(j.layout) }
+    const fetchState = async () => {
+      try { const r = await api('/panel/state'); const j = await r.json(); if (j && j.ok) applyState(j) } catch {}
     }
-    poll(); return () => { stop = true }
+    fetchState()
+    const un = subscribe((ev) => {
+      if (ev.type === 'panel') applyState(ev.data || {})
+      else if (ev.type === 'ws.open') fetchState()
+    })
+    return () => { stop = true; un() }
   }, [])
 
   const focus = (id) => { setFocusedId(id); api('/panel/focus', { id }).catch(() => {}) }

@@ -26,6 +26,7 @@ import toolsService from '../services/tools.js';
 import evolutionLog from '../services/evolutionLog.js';
 import moltbookWatchlist from '../services/moltbookWatchlist.js';
 import selfModSandbox from '../services/selfModSandbox.js';  // Tier 2 #13: worktree + test gate
+import uiPush from '../services/uiPush.js';  // Tier 2 #15: push queue changes to the UI (no polling)
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -447,6 +448,11 @@ router.post('/self_mod', async (req, res) => {
     }
 
     const response = await pythonWorker.selfMod(body);
+    // Tier 2 #15: any action that can change the pending queue pushes the fresh list to the
+    // UI over the WebSocket (fire-and-forget; replaces the client's 6s poll).
+    if (['propose_fix', 'approve', 'reject', 'rollback', 'undo', 'revert'].includes(action)) {
+      setTimeout(() => { uiPush.pushSelfModPending(); }, 250);
+    }
     if (response.ok) {
       const result = response.result || {};
       if (['propose_fix','approve','rollback','undo','revert'].includes(action)) {

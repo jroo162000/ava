@@ -25,6 +25,7 @@ import curatedMemory from './curatedMemory.js';
 import skillStore from './skillStore.js';
 import trainingGuidance from './trainingGuidance.js';
 import modelConfig from '../utils/modelConfig.js';
+import { emitVoiceEvent } from './voiceBus.js';  // Tier 2 #15: explicit working-state events for the UI
 
 // Informational tools whose raw result should be SYNTHESIZED into a real answer (her own knowledge
 // + the findings) rather than returned verbatim -- otherwise a lookup shortens/replaces her answer.
@@ -1158,8 +1159,14 @@ function shouldContinue(state) {
  */
 async function runAgentLoop(goal, options = {}) {
   const state = createAgentState(goal, options);
-  
+
   logger.info('[agent] Starting loop', { id: state.id, goal: goal.slice(0, 100), stepLimit: state.step_limit });
+
+  // Tier 2 #15: tell the UI explicitly when real work starts/ends, so it never has to
+  // GUESS with idle timeouts (the client's old 15s "working" hack is gone). NOTE: this
+  // main entry has its own inlined loop — runAgentLoopFromState below is only the
+  // resume-after-waiting_user path, which carries the same events.
+  try { emitVoiceEvent('agent.state', { state: 'working.start', id: state.id, goal: String(goal || '').slice(0, 140) }, 'agent'); } catch { /* ui push is best-effort */ }
 
   try {
     while (shouldContinue(state)) {
@@ -1255,6 +1262,7 @@ async function runAgentLoop(goal, options = {}) {
     }
   } catch { /* never block the result */ }
 
+  try { emitVoiceEvent('agent.state', { state: 'working.end', id: state.id, status: state.status }, 'agent'); } catch { /* ui push is best-effort */ }
   return state;
 }
 
@@ -1279,6 +1287,9 @@ async function resumeAgentLoop(state, userResponse) {
  * Continue agent loop from existing state
  */
 async function runAgentLoopFromState(state) {
+  // Tier 2 #15: tell the UI explicitly when real work starts/ends, so it never has to
+  // GUESS with idle timeouts (the client's old 15s "working" hack is gone).
+  try { emitVoiceEvent('agent.state', { state: 'working.start', id: state.id, goal: String(state.goal || '').slice(0, 140) }, 'agent'); } catch { /* ui push is best-effort */ }
   try {
     while (shouldContinue(state)) {
       state.step_count++;
@@ -1344,6 +1355,7 @@ async function runAgentLoopFromState(state) {
     state.final_result = `Agent loop error: ${e.message}`;
   }
 
+  try { emitVoiceEvent('agent.state', { state: 'working.end', id: state.id, status: state.status }, 'agent'); } catch { /* ui push is best-effort */ }
   return state;
 }
 

@@ -9,6 +9,7 @@ import digestQueue from './digestQueue.js';
 import interests from './moltbookInterests.js';
 import watchlist from './moltbookWatchlist.js';
 import logger from '../utils/logger.js';
+import { emitVoiceEvent } from './voiceBus.js';
 import fs from 'fs';
 import path from 'path';
 // Content composition (post/comment text building, LLM prompt assembly, persona/interest-driven
@@ -448,17 +449,26 @@ function shouldKeepAfterVerificationResponse(res) {
   return false;
 }
 
+// Tier 2 #15: every change to the pending-verifications queue is pushed to the UI over the
+// voiceBus WebSocket (replaces the client's 10s poll). Best-effort — the client also
+// refreshes its snapshot whenever the socket (re)opens.
+function _emitVerifications() {
+  try { emitVoiceEvent('moltbook.verifications', { pending: _pendingVerifications.slice() }, 'server'); } catch { /* ui push is best-effort */ }
+}
+
 function removePendingVerification(code) {
   const i = _pendingVerifications.findIndex(v => v.verification_code === code);
-  if (i >= 0) _pendingVerifications.splice(i, 1);
+  if (i >= 0) { _pendingVerifications.splice(i, 1); _emitVerifications(); }
 }
 
 async function prunePendingVerifications({ refresh = false } = {}) {
   const now = Date.now();
+  let changed = false;
   for (let i = _pendingVerifications.length - 1; i >= 0; i--) {
     const v = _pendingVerifications[i];
     if ((now - v.queued_at) >= VERIFICATION_TTL_MS) {
       _pendingVerifications.splice(i, 1);
+      changed = true;
       continue;
     }
     if (!refresh || !v.post_id) continue;
@@ -468,11 +478,13 @@ async function prunePendingVerifications({ refresh = false } = {}) {
       const stillNeedsChallenge = !!(post?.verification && (post.verification.verification_code || post.verification.challenge_text));
       if (verificationSucceeded(post) || (post && !stillNeedsChallenge && status && status !== 'pending')) {
         _pendingVerifications.splice(i, 1);
+        changed = true;
       }
     } catch {
       // Keep the local card if the status check itself failed; the submit path will reconcile it.
     }
   }
+  if (changed) _emitVerifications();
 }
 
 export async function getPendingVerifications() {
@@ -528,6 +540,7 @@ async function postToMoltbook(submolt, title, content) {
           verification_code: _v.verification_code || '', expires_at: _v.expires_at || '', queued_at: Date.now(),
         });
         while (_pendingVerifications.length > 20) _pendingVerifications.shift();
+        _emitVerifications();  // Tier 2 #15: card appears in the UI immediately, no poll
         logger.info('[moltbook-scheduler] Post needs verification — queued for user', { post: result.post.id });
       }
     } else {
@@ -588,6 +601,94 @@ Has anyone encountered something similar? Any tips or solutions would be appreci
   }
 
   return result;
+}
+
+/**
+ * Align cadences after a digestion cycle to prevent starvation (pt-003).
+ * Reads real last-run timestamps from the scheduler state, compares against sibling
+ * job cadences (proposals, learning loops), and shifts any job that is overdue
+ * or about to collide within a 10-minute window. Uses local state only — no
+ * external module dependencies.
+ */
+async function _alignCadences() {
+  const state = readState();
+  const now = Date.now();
+  const CADENCE_WINDOW_MS = 10 * 60 * 1000; // 10 minutes
+  const MIN_CADENCE_MS = 5 * 60 * 1000;     // at least 5 minutes between jobs
+
+  // Known job slots: learn, post, search
+  const jobs = [
+    { key: 'lastLearnAt', name: 'learning' },
+    { key: 'lastPostAt', name: 'posting' },
+    { key: 'lastSearchAt', name: 'search' },
+  ];
+
+  // Collect timestamps; if any is 0 (never run), treat as overdue
+  const timestamps = jobs.map(j => ({
+    name: j.name,
+    lastRun: state[j.key] || 0,
+    key: j.key,
+  }));
+
+  // Sort by last-run ascending (oldest first)
+  timestamps.sort((a, b) => a.lastRun - b.lastRun);
+
+  let adjusted = false;
+
+  for (let i = 1; i < timestamps.length; i++) {
+    const prev = timestamps[i - 1];
+    const curr = timestamps[i];
+
+    // If current job hasn't run yet, it's automatically overdue; shift next prev? skip
+    if (curr.lastRun === 0) continue;
+
+    const gap = curr.lastRun - prev.lastRun;
+
+    // If the gap is negative (prev is actually later), fix by moving prev forward
+    if (gap < 0) {
+      // This shouldn't happen after sort, but guard against clock skew
+      timestamps[i - 1].lastRun = curr.lastRun - CADENCE_WINDOW_MS;
+      adjusted = true;
+      continue;
+    }
+
+    // If gap is too small (collision -> starvation), shift the later job forward
+    if (gap < CADENCE_WINDOW_MS) {
+      const shift = CADENCE_WINDOW_MS - gap + MIN_CADENCE_MS;
+      const newTime = curr.lastRun + shift;
+
+      // Don't push into the future more than 2 cycles
+      if (newTime - now < 2 * CADENCE_WINDOW_MS) {
+        state[curr.key] = newTime;
+        logger.info('[moltbook-scheduler] Cadence adjustment: shifted', {
+          job: curr.name,
+          from: new Date(curr.lastRun).toISOString(),
+          to: new Date(newTime).toISOString(),
+        });
+        curr.lastRun = newTime;
+        adjusted = true;
+      }
+    }
+  }
+
+  // Also check the earliest job: if it's too far in the past (>2x window), reset to now
+  if (timestamps.length > 0) {
+    const earliest = timestamps[0];
+    if (earliest.lastRun > 0 && (now - earliest.lastRun) > 2 * CADENCE_WINDOW_MS) {
+      state[earliest.key] = now - CADENCE_WINDOW_MS; // nudge forward
+      logger.info('[moltbook-scheduler] Cadence reset: overdue job', {
+        job: earliest.name,
+        oldLastRun: new Date(earliest.lastRun).toISOString(),
+        newLastRun: new Date(state[earliest.key]).toISOString(),
+      });
+      adjusted = true;
+    }
+  }
+
+  if (adjusted) {
+    writeState(state);
+  }
+  return adjusted;
 }
 
 /**

@@ -417,6 +417,8 @@ async function handleSelfModVoice(userText) {
     return `Done — I applied ${ok.length} change${ok.length > 1 ? 's' : ''} (${ok.join(', ')}), backed up the original, and verified ${ok.length > 1 ? 'they parse' : 'it parses'} cleanly.${revTail}${tail}${restartText}`;
   }
   const ok = results.filter(x => x.r.status === 'success').map(x => x.id);
+  // Tier 2 #15: push the updated pending queue to the UI (no client polling).
+  try { (await import('./uiPush.js')).default.pushSelfModPending(); } catch { /* ui push is best-effort */ }
   return `Okay — rejected ${ok.length} change${ok.length > 1 ? 's' : ''} (${ok.join(', ')}). Nothing was applied.`;
 }
 
@@ -462,6 +464,9 @@ async function approveThroughSandbox(ids, fileById) {
       try { selfRestart.scheduleServerRestart({ reason: `voice approved proposal ${id} (sandbox-validated)` }); } catch { /* best effort */ }
     }, 12000);
   }
+  // Tier 2 #15: whatever happened above (applied / blocked / reverted), the pending queue may
+  // have changed — push the fresh list to the UI (no client polling).
+  try { (await import('./uiPush.js')).default.pushSelfModPending(); } catch { /* ui push is best-effort */ }
 }
 
 export {
