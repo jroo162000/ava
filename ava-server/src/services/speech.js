@@ -63,11 +63,15 @@ function isStepStatusMessage(text) {
 function normalizeMoltbookMentions(text) {
   let s = String(text || '');
   // Clear non-word mishears — safe to map unconditionally.
-  s = s.replace(/\b(moat ?book|mote ?book|molt ?book|mold ?book|malt ?book|mault ?book|moult ?book|vault ?book|moat ?books)\b/gi, 'moltbook');
-  // Real-word mishears ("notebook", "more book") — only when context is clearly the AI social
-  // network / posting, so legitimate uses of those words aren't clobbered.
-  if (/\b(ai|agent|agents|social|feed|post|posts|posted|posting|platform|network|community|upvote|submolt|comment)\b/i.test(s)) {
-    s = s.replace(/\b(note ?book|notebook|more ?book|moor ?book|moot ?book)\b/gi, 'moltbook');
+  s = s.replace(/\b(moat ?book|mote ?book|molt ?book|mold ?book|malt ?book|mault ?book|moult ?book|vault ?book|moth ?book|mob ?book|moat ?books)\b/gi, 'moltbook');
+  // EXPLICIT correction: Jelani says "<x>book with a/an m" when she keeps mishearing it — the
+  // "with an m" makes the intent unambiguous, so map ANY *book phrased that way (log-review fix:
+  // "read over your notebook with an m learning" kept failing because it lacked social keywords).
+  s = s.replace(/\b[a-z]+ ?book\s+with\s+an?\s+m\b/gi, 'moltbook');
+  // Real-word mishears ("notebook", "more book") — only in a clearly-Moltbook context. Added
+  // learn/learning/learnings (her Moltbook feature is moltbook_learnings) + a few more mishears.
+  if (/\b(ai|agent|agents|social|feed|post|posts|posted|posting|platform|network|community|upvote|submolt|comment|learn|learned|learning|learnings)\b/i.test(s)) {
+    s = s.replace(/\b(note ?book|notebook|more ?book|moor ?book|moot ?book|no ?book|know ?book|mock ?book)\b/gi, 'moltbook');
   }
   return s;
 }

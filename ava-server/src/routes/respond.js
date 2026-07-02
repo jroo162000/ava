@@ -87,6 +87,28 @@ function looksLikeToolRequest(text = '') {
   );
 }
 
+// True when the turn is a general WORLD-KNOWLEDGE / explanation question (explain photosynthesis,
+// how does an engine work, what is X, who was Y) with NO dependence on the user's own machine,
+// data, or self. Log-review fix (2026-07-02): "explain step by step how photosynthesis works"
+// was routed to the AGENT LOOP (voice defaults run_tools=true for non-chit-chat), where the
+// decision model occasionally hallucinated a refusal ("conflicts with system instructions").
+// Such questions belong on the conversational path, where she just answers (and can still emit
+// NEED_TOOLS if it turns out real data/tools ARE needed). Deliberately conservative: anything a
+// tool/recall/self-description handler already catches is excluded by the callers' ordering, and
+// "my/your <machine-noun>" is excluded here so live-data questions still reach the tools.
+function looksLikeKnowledgeQuestion(text = '') {
+  const t = String(text || '').toLowerCase().trim();
+  if (!t) return false;
+  const educational = /\b(explain|how (do|does|did|can|would|is|are)|what (is|are|was|were|causes?|happens?|does)|what'?s the (difference|meaning|point|history)|why (is|are|does|do|did|would)|define|describe (the|how|why|what)|tell me about|give me (an? )?(overview|summary|rundown) (of|on)|who (was|is|were|are)|when (did|was|were)|where (is|are|was)|difference between|meaning of)\b/;
+  if (!educational.test(t)) return false;
+  // Exclude anything tied to the user's OWN machine / data / self (those need tools or the
+  // self-intro path). looksLikeToolRequest/isSelfDescriptionRequest run before this at the
+  // call site, but guard here too so the routing intent is self-contained.
+  if (/\b(my|your)\b[\s\S]{0,24}\b(calendar|email|inbox|file|files|folder|screen|camera|memory|memories|ram|cpu|disk|drive|clipboard|window|windows|download|system|volume|network|wi-?fi|conversation|code|setting|process)\b/.test(t)) return false;
+  if (/\bwhat can you do\b|\b(your|you have) (capabilit|tool|feature|function)/.test(t)) return false;
+  return true;
+}
+
 // Detect "let me see / describe what's in front of the camera" so we can run the
 // camera's see+describe directly (deterministic) instead of leaving it to the agent,
 // which has been asking to confirm or picking the wrong action.
@@ -879,8 +901,14 @@ async function respondHandler(req, res) {
     // non-answers for simple factual questions. Direct LLM call gives natural replies.
     // EXCEPTION: if the question implies a tool/data action ("what's on my calendar?"),
     // fall through to the tool path so she actually fetches instead of just describing.
-    if (run_tools === false && !looksLikeToolRequest(userText) && !looksLikeRecall(userText)) {
-      logger.info('[respond] Conversational path (no tools)', { text: userText.slice(0, 60) });
+    // Log-review fix (2026-07-02): a general WORLD-KNOWLEDGE question ("explain photosynthesis")
+    // also takes this path EVEN WHEN run_tools is allowed — voice defaults run_tools=true for
+    // anything non-chit-chat, which shoved knowledge questions into the agent loop where the
+    // decision model sometimes falsely refused. It's still gated by !looksLikeToolRequest, so a
+    // live-data question never lands here, and the path can still emit NEED_TOOLS to escalate.
+    const _knowledgeQ = looksLikeKnowledgeQuestion(userText);
+    if ((run_tools === false || _knowledgeQ) && !looksLikeToolRequest(userText) && !looksLikeRecall(userText)) {
+      logger.info('[respond] Conversational path (no tools)', { text: userText.slice(0, 60), knowledge: _knowledgeQ });
       const { context, persona, style } = req.body || {};
       const spokenReplyBudget = normalizeSpokenReplyBudget(req.body || {});
       const budgetPrompt = spokenReplyBudget.voiceMode === 'spoken'
