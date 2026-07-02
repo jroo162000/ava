@@ -1,0 +1,775 @@
+{
+  "fed:https://www.irs.gov/publications/p17": {
+    "ok": true,
+    "lastOkAt": "2026-07-01T00:05:03.474Z",
+    "lastAttemptAt": "2026-07-01T01:34:36.538Z",
+    "fails": 2,
+    "chunks": 1
+  },
+  "fed:https://www.irs.gov/publications/p334": {
+    "ok": true,
+    "lastOkAt": "2026-07-01T00:05:10.961Z",
+    "lastAttemptAt": "2026-07-01T01:34:36.543Z",
+    "fails": 2,
+    "chunks": 1
+  },
+  "fed:https://www.irs.gov/publications/p583": {
+    "ok": true,
+    "lastOkAt": "2026-07-01T00:05:15.670Z",
+    "lastAttemptAt": "2026-07-01T01:34:36.546Z",
+    "fails": 2,
+    "chunks": 1
+  },
+  "fed:https://www.irs.gov/forms-pubs/about-publication-535": {
+    "ok": true,
+    "lastOkAt": "2026-06-30T23:32:09.442Z",
+    "lastAttemptAt": "2026-07-01T01:34:36.549Z",
+    "fails": 3,
+    "chunks": 0
+  },
+  "fed:https://www.irs.gov/publications/p946": {
+    "ok": true,
+    "lastOkAt": "2026-07-01T00:05:28.846Z",
+    "lastAttemptAt": "2026-07-01T01:34:36.552Z",
+    "fails": 2,
+    "chunks": 1
+  },
+  "fed:https://www.irs.gov/publications/p463": {
+    "ok": true,
+    "lastOkAt": "2026-06-30T23:32:23.477Z",
+    "lastAttemptAt": "2026-07-01T01:34:36.555Z",
+    "fails": 3,
+    "chunks": 0
+  },
+  "fed:https://www.irs.gov/publications/p538": {
+    "ok": true,
+    "lastOkAt": "2026-07-01T00:05:38.158Z",
+    "lastAttemptAt": "2026-07-01T01:34:36.560Z",
+    "fails": 2,
+    "chunks": 1
+  },
+  "fed:https://www.irs.gov/publications/p542": {
+    "ok": true,
+    "lastOkAt": "2026-07-01T00:05:40.064Z",
+    "lastAttemptAt": "2026-07-01T01:34:36.562Z",
+    "fails": 2,
+    "chunks": 1
+  },
+  "fed:https://www.irs.gov/instructions/i1040sc": {
+    "ok": true,
+    "lastOkAt": "2026-06-30T23:33:05.721Z",
+    "lastAttemptAt": "2026-07-01T01:34:36.564Z",
+    "fails": 3,
+    "chunks": 0
+  },
+  "fed:https://www.irs.gov/businesses/small-businesses-self-employed/self-employed-individuals-tax-center": {
+    "ok": true,
+    "lastOkAt": "2026-07-01T00:06:13.585Z",
+    "lastAttemptAt": "2026-07-01T01:34:36.567Z",
+    "fails": 2,
+    "chunks": 1
+  },
+  "fed:https://www.irs.gov/businesses/small-businesses-self-employed/estimated-taxes": {
+    "ok": true,
+    "lastOkAt": "2026-07-01T00:06:13.960Z",
+    "lastAttemptAt": "2026-07-01T01:34:36.570Z",
+    "fails": 2,
+    "chunks": 1
+  },
+  "fed:https://www.investor.gov/introduction-investing/investing-basics/how-stock-markets-work/how-read-financial-statement": {
+    "ok": true,
+    "lastOkAt": "2026-07-01T07:27:45.926Z",
+    "lastAttemptAt": "2026-07-01T07:27:45.926Z",
+    "fails": 0,
+    "chunks": 6,
+    "dead": false,
+    "workingUrl": "https://www.investor.gov/",
+    "contentHash": null,
+    "altTried": true
+  },
+  "st:Alabama": {
+    "ok": true,
+    "lastOkAt": "2026-07-01T00:06:42.301Z",
+    "lastAttemptAt": "2026-07-01T01:34:36.577Z",
+    "fails": 2,
+    "chunks": 3
+  },
+  "st:Alaska": {
+    "ok": true,
+    "lastOkAt": "2026-06-30T23:33:15.713Z",
+    "lastAttemptAt": "2026-07-01T01:34:36.580Z",
+    "fails": 3,
+    "chunks": 0
+  },
+  "st:Arizona": {
+    "ok": true,
+    "lastOkAt": "2026-07-01T00:07:22.112Z",
+    "lastAttemptAt": "2026-07-01T01:34:36.583Z",
+    "fails": 2,
+    "chunks": 6
+  },
+  "st:Arkansas": {
+    "ok": true,
+    "lastOkAt": "2026-07-01T00:07:35.288Z",
+    "lastAttemptAt": "2026-07-01T01:34:36.585Z",
+    "fails": 2,
+    "chunks": 3
+  },
+  "st:California": {
+    "ok": true,
+    "lastOkAt": "2026-07-01T00:07:35.673Z",
+    "lastAttemptAt": "2026-07-01T01:34:36.587Z",
+    "fails": 2,
+    "chunks": 1
+  },
+  "st:Colorado": {
+    "ok": true,
+    "lastOkAt": "2026-07-01T00:07:47.557Z",
+    "lastAttemptAt": "2026-07-01T01:34:36.591Z",
+    "fails": 2,
+    "chunks": 2
+  },
+  "st:Connecticut": {
+    "ok": true,
+    "lastOkAt": "2026-07-01T00:07:59.261Z",
+    "lastAttemptAt": "2026-07-01T01:34:36.594Z",
+    "fails": 2,
+    "chunks": 7
+  },
+  "st:Delaware": {
+    "ok": true,
+    "lastOkAt": "2026-07-01T00:07:59.873Z",
+    "lastAttemptAt": "2026-07-01T01:34:36.597Z",
+    "fails": 2,
+    "chunks": 1
+  },
+  "st:Florida": {
+    "ok": true,
+    "lastOkAt": "2026-07-01T00:08:44.854Z",
+    "lastAttemptAt": "2026-07-01T01:34:36.599Z",
+    "fails": 2,
+    "chunks": 2
+  },
+  "st:Georgia": {
+    "ok": true,
+    "lastOkAt": "2026-07-01T00:08:47.764Z",
+    "lastAttemptAt": "2026-07-01T01:34:36.602Z",
+    "fails": 2,
+    "chunks": 5
+  },
+  "st:Hawaii": {
+    "ok": true,
+    "lastOkAt": "2026-06-30T23:33:46.701Z",
+    "lastAttemptAt": "2026-07-01T01:34:36.605Z",
+    "fails": 3,
+    "chunks": 0
+  },
+  "st:Idaho": {
+    "ok": true,
+    "lastOkAt": "2026-06-30T23:33:58.940Z",
+    "lastAttemptAt": "2026-07-01T01:34:36.608Z",
+    "fails": 3,
+    "chunks": 0
+  },
+  "st:Illinois": {
+    "ok": true,
+    "lastOkAt": "2026-07-01T00:09:42.127Z",
+    "lastAttemptAt": "2026-07-01T01:34:36.611Z",
+    "fails": 2,
+    "chunks": 3
+  },
+  "st:Indiana": {
+    "ok": true,
+    "lastOkAt": "2026-07-01T00:09:48.410Z",
+    "lastAttemptAt": "2026-07-01T01:34:36.613Z",
+    "fails": 2,
+    "chunks": 16
+  },
+  "st:Iowa": {
+    "ok": true,
+    "lastOkAt": "2026-07-01T00:10:08.884Z",
+    "lastAttemptAt": "2026-07-01T01:34:36.615Z",
+    "fails": 2,
+    "chunks": 7
+  },
+  "st:Kansas": {
+    "ok": true,
+    "lastOkAt": "2026-07-01T00:10:11.899Z",
+    "lastAttemptAt": "2026-07-01T01:34:36.617Z",
+    "fails": 2,
+    "chunks": 10
+  },
+  "st:Kentucky": {
+    "ok": true,
+    "lastOkAt": "2026-07-01T00:10:14.076Z",
+    "lastAttemptAt": "2026-07-01T01:34:36.619Z",
+    "fails": 2,
+    "chunks": 1
+  },
+  "st:Louisiana": {
+    "ok": true,
+    "lastOkAt": "2026-06-30T23:34:19.926Z",
+    "lastAttemptAt": "2026-07-01T01:34:36.623Z",
+    "fails": 3,
+    "chunks": 0
+  },
+  "st:Maine": {
+    "ok": true,
+    "lastOkAt": "2026-07-01T00:10:26.634Z",
+    "lastAttemptAt": "2026-07-01T01:34:36.628Z",
+    "fails": 2,
+    "chunks": 3
+  },
+  "st:Maryland": {
+    "ok": true,
+    "lastOkAt": "2026-07-01T00:10:27.643Z",
+    "lastAttemptAt": "2026-07-01T01:34:36.631Z",
+    "fails": 2,
+    "chunks": 1
+  },
+  "st:Massachusetts": {
+    "ok": true,
+    "lastOkAt": "2026-07-01T07:28:04.492Z",
+    "lastAttemptAt": "2026-07-01T07:28:04.492Z",
+    "fails": 0,
+    "chunks": 1,
+    "dead": false,
+    "workingUrl": "https://www.taxcompare.org/state/massachusetts/brackets",
+    "contentHash": "1mtk82g",
+    "altTried": true
+  },
+  "st:Michigan": {
+    "ok": true,
+    "lastOkAt": "2026-07-01T00:10:49.770Z",
+    "lastAttemptAt": "2026-07-01T01:34:36.651Z",
+    "fails": 2,
+    "chunks": 3
+  },
+  "st:Minnesota": {
+    "ok": true,
+    "lastOkAt": "2026-07-01T00:10:50.351Z",
+    "lastAttemptAt": "2026-07-01T01:34:36.654Z",
+    "fails": 2,
+    "chunks": 1
+  },
+  "st:Mississippi": {
+    "ok": true,
+    "lastOkAt": "2026-07-01T07:28:30.918Z",
+    "lastAttemptAt": "2026-07-01T07:28:30.918Z",
+    "fails": 0,
+    "chunks": 1,
+    "dead": false,
+    "workingUrl": "https://bridgelegal.org/mississippi-income-tax-rates-brackets-filing/",
+    "contentHash": "1alq26i",
+    "altTried": true
+  },
+  "st:Missouri": {
+    "ok": true,
+    "lastOkAt": "2026-07-01T00:11:36.437Z",
+    "lastAttemptAt": "2026-07-01T01:34:36.662Z",
+    "fails": 2,
+    "chunks": 1
+  },
+  "st:Montana": {
+    "ok": true,
+    "lastOkAt": "2026-07-01T00:11:51.417Z",
+    "lastAttemptAt": "2026-07-01T01:34:36.665Z",
+    "fails": 2,
+    "chunks": 6
+  },
+  "st:Nebraska": {
+    "ok": true,
+    "lastOkAt": "2026-07-01T00:12:01.160Z",
+    "lastAttemptAt": "2026-07-01T01:34:36.668Z",
+    "fails": 2,
+    "chunks": 2
+  },
+  "st:Nevada": {
+    "ok": true,
+    "lastOkAt": "2026-07-01T00:12:19.831Z",
+    "lastAttemptAt": "2026-07-01T01:34:36.671Z",
+    "fails": 2,
+    "chunks": 12
+  },
+  "st:New Hampshire": {
+    "ok": true,
+    "lastOkAt": "2026-07-01T07:28:56.639Z",
+    "lastAttemptAt": "2026-07-01T07:28:56.639Z",
+    "fails": 0,
+    "chunks": 1,
+    "dead": false,
+    "workingUrl": "https://www.taxformcalculator.com/new-hampshire/tax-tables.html",
+    "contentHash": "3k68kw",
+    "altTried": true
+  },
+  "st:New Jersey": {
+    "ok": true,
+    "lastOkAt": "2026-07-01T00:12:45.535Z",
+    "lastAttemptAt": "2026-07-01T01:34:36.679Z",
+    "fails": 2,
+    "chunks": 2
+  },
+  "st:New Mexico": {
+    "ok": true,
+    "lastOkAt": "2026-07-01T00:13:23.365Z",
+    "lastAttemptAt": "2026-07-01T01:34:36.682Z",
+    "fails": 2,
+    "chunks": 1
+  },
+  "st:New York": {
+    "ok": true,
+    "lastOkAt": "2026-07-01T00:13:23.977Z",
+    "lastAttemptAt": "2026-07-01T01:34:36.685Z",
+    "fails": 2,
+    "chunks": 1
+  },
+  "st:North Carolina": {
+    "ok": true,
+    "lastOkAt": "2026-07-01T00:13:42.092Z",
+    "lastAttemptAt": "2026-07-01T01:34:36.687Z",
+    "fails": 2,
+    "chunks": 8
+  },
+  "st:North Dakota": {
+    "ok": true,
+    "lastOkAt": "2026-06-30T23:35:49.872Z",
+    "lastAttemptAt": "2026-07-01T01:34:36.699Z",
+    "fails": 3,
+    "chunks": 0
+  },
+  "st:Ohio": {
+    "ok": true,
+    "lastOkAt": "2026-07-01T00:14:28.664Z",
+    "lastAttemptAt": "2026-07-01T01:34:36.702Z",
+    "fails": 2,
+    "chunks": 1
+  },
+  "st:Oklahoma": {
+    "ok": true,
+    "lastOkAt": "2026-07-01T00:15:00.802Z",
+    "lastAttemptAt": "2026-07-01T01:34:36.705Z",
+    "fails": 2,
+    "chunks": 3
+  },
+  "st:Oregon": {
+    "ok": true,
+    "lastOkAt": "2026-07-01T00:15:41.427Z",
+    "lastAttemptAt": "2026-07-01T01:34:36.710Z",
+    "fails": 2,
+    "chunks": 1
+  },
+  "st:Pennsylvania": {
+    "ok": true,
+    "lastOkAt": "2026-06-30T23:36:18.178Z",
+    "lastAttemptAt": "2026-07-01T01:34:36.713Z",
+    "fails": 3,
+    "chunks": 0
+  },
+  "st:Rhode Island": {
+    "ok": true,
+    "lastOkAt": "2026-07-01T00:16:44.662Z",
+    "lastAttemptAt": "2026-07-01T01:34:36.716Z",
+    "fails": 2,
+    "chunks": 7
+  },
+  "st:South Carolina": {
+    "ok": true,
+    "lastOkAt": "2026-07-01T00:16:46.014Z",
+    "lastAttemptAt": "2026-07-01T01:34:36.719Z",
+    "fails": 2,
+    "chunks": 1
+  },
+  "st:South Dakota": {
+    "ok": true,
+    "lastOkAt": "2026-07-01T00:16:53.210Z",
+    "lastAttemptAt": "2026-07-01T01:34:36.723Z",
+    "fails": 2,
+    "chunks": 21
+  },
+  "st:Tennessee": {
+    "ok": true,
+    "lastOkAt": "2026-06-30T23:36:29.567Z",
+    "lastAttemptAt": "2026-07-01T01:34:36.727Z",
+    "fails": 3,
+    "chunks": 0
+  },
+  "st:Texas": {
+    "ok": true,
+    "lastOkAt": "2026-07-01T00:17:03.742Z",
+    "lastAttemptAt": "2026-07-01T01:34:36.730Z",
+    "fails": 2,
+    "chunks": 5
+  },
+  "st:Utah": {
+    "ok": true,
+    "lastOkAt": "2026-07-01T00:17:04.882Z",
+    "lastAttemptAt": "2026-07-01T01:34:36.733Z",
+    "fails": 2,
+    "chunks": 1
+  },
+  "st:Vermont": {
+    "ok": true,
+    "lastOkAt": "2026-07-01T00:17:11.339Z",
+    "lastAttemptAt": "2026-07-01T01:34:36.737Z",
+    "fails": 2,
+    "chunks": 2
+  },
+  "st:Virginia": {
+    "ok": true,
+    "lastOkAt": "2026-06-30T23:36:42.285Z",
+    "lastAttemptAt": "2026-07-01T01:34:36.744Z",
+    "fails": 3,
+    "chunks": 0
+  },
+  "st:Washington": {
+    "ok": true,
+    "lastOkAt": "2026-07-01T00:32:59.155Z",
+    "lastAttemptAt": "2026-07-01T01:34:36.769Z",
+    "fails": 1,
+    "chunks": 2
+  },
+  "st:West Virginia": {
+    "ok": true,
+    "lastOkAt": "2026-07-01T00:33:13.350Z",
+    "lastAttemptAt": "2026-07-01T01:34:36.774Z",
+    "fails": 1,
+    "chunks": 3
+  },
+  "st:Wisconsin": {
+    "ok": true,
+    "lastOkAt": "2026-07-01T07:29:54.835Z",
+    "lastAttemptAt": "2026-07-01T07:29:54.835Z",
+    "fails": 0,
+    "chunks": 1,
+    "dead": false,
+    "workingUrl": "https://www.revenue.wi.gov/pages/faqs/pcs-indreq.aspx",
+    "contentHash": null,
+    "altTried": true
+  },
+  "st:Wyoming": {
+    "ok": true,
+    "lastOkAt": "2026-07-01T00:34:34.023Z",
+    "lastAttemptAt": "2026-07-01T01:34:36.784Z",
+    "fails": 1,
+    "chunks": 1
+  },
+  "st:District of Columbia": {
+    "ok": true,
+    "lastOkAt": "2026-07-01T00:34:37.893Z",
+    "lastAttemptAt": "2026-07-01T01:34:36.787Z",
+    "fails": 1,
+    "chunks": 3
+  },
+  "topics:US-federal": {
+    "ok": true,
+    "lastOkAt": "2026-07-01T00:34:43.557Z",
+    "lastAttemptAt": "2026-07-01T01:34:36.799Z",
+    "chunks": 2
+  },
+  "topics:US-Alabama": {
+    "ok": false,
+    "lastOkAt": null,
+    "lastAttemptAt": "2026-07-01T01:34:36.811Z",
+    "chunks": 0
+  },
+  "topics:US-Alaska": {
+    "ok": true,
+    "lastOkAt": "2026-07-01T00:34:52.020Z",
+    "lastAttemptAt": "2026-07-01T01:34:36.820Z",
+    "chunks": 3
+  },
+  "topics:US-Arizona": {
+    "ok": false,
+    "lastOkAt": null,
+    "lastAttemptAt": "2026-07-01T01:34:36.830Z",
+    "chunks": 0
+  },
+  "topics:US-Arkansas": {
+    "ok": false,
+    "lastOkAt": null,
+    "lastAttemptAt": "2026-07-01T01:34:36.839Z",
+    "chunks": 0
+  },
+  "topics:US-California": {
+    "ok": true,
+    "lastOkAt": "2026-07-01T00:35:02.774Z",
+    "lastAttemptAt": "2026-07-01T01:34:36.853Z",
+    "chunks": 1
+  },
+  "topics:US-Colorado": {
+    "ok": false,
+    "lastOkAt": null,
+    "lastAttemptAt": "2026-07-01T01:34:36.861Z",
+    "chunks": 0
+  },
+  "topics:US-Connecticut": {
+    "ok": false,
+    "lastOkAt": null,
+    "lastAttemptAt": "2026-07-01T01:34:36.870Z",
+    "chunks": 0
+  },
+  "topics:US-Delaware": {
+    "ok": false,
+    "lastOkAt": null,
+    "lastAttemptAt": "2026-07-01T01:34:36.879Z",
+    "chunks": 0
+  },
+  "topics:US-Florida": {
+    "ok": false,
+    "lastOkAt": null,
+    "lastAttemptAt": "2026-07-01T01:34:36.890Z",
+    "chunks": 0
+  },
+  "topics:US-Georgia": {
+    "ok": false,
+    "lastOkAt": null,
+    "lastAttemptAt": "2026-07-01T01:34:36.902Z",
+    "chunks": 0
+  },
+  "topics:US-Hawaii": {
+    "ok": false,
+    "lastOkAt": null,
+    "lastAttemptAt": "2026-07-01T01:34:36.910Z",
+    "chunks": 0
+  },
+  "topics:US-Idaho": {
+    "ok": false,
+    "lastOkAt": null,
+    "lastAttemptAt": "2026-07-01T01:34:36.921Z",
+    "chunks": 0
+  },
+  "topics:US-Illinois": {
+    "ok": false,
+    "lastOkAt": null,
+    "lastAttemptAt": "2026-07-01T01:34:36.935Z",
+    "chunks": 0
+  },
+  "topics:US-Indiana": {
+    "ok": false,
+    "lastOkAt": null,
+    "lastAttemptAt": "2026-07-01T01:34:36.945Z",
+    "chunks": 0
+  },
+  "topics:US-Iowa": {
+    "ok": false,
+    "lastOkAt": null,
+    "lastAttemptAt": "2026-07-01T01:34:36.956Z",
+    "chunks": 0
+  },
+  "topics:US-Kansas": {
+    "ok": false,
+    "lastOkAt": null,
+    "lastAttemptAt": "2026-07-01T01:34:36.966Z",
+    "chunks": 0
+  },
+  "topics:US-Kentucky": {
+    "ok": false,
+    "lastOkAt": null,
+    "lastAttemptAt": "2026-07-01T01:34:36.982Z",
+    "chunks": 0
+  },
+  "topics:US-Louisiana": {
+    "ok": false,
+    "lastOkAt": null,
+    "lastAttemptAt": "2026-07-01T01:34:36.992Z",
+    "chunks": 0
+  },
+  "topics:US-Maine": {
+    "ok": false,
+    "lastOkAt": null,
+    "lastAttemptAt": "2026-07-01T01:34:37.000Z",
+    "chunks": 0
+  },
+  "topics:US-Maryland": {
+    "ok": false,
+    "lastOkAt": null,
+    "lastAttemptAt": "2026-07-01T01:34:37.013Z",
+    "chunks": 0
+  },
+  "topics:US-Massachusetts": {
+    "ok": false,
+    "lastOkAt": null,
+    "lastAttemptAt": "2026-07-01T01:34:37.025Z",
+    "chunks": 0
+  },
+  "topics:US-Michigan": {
+    "ok": false,
+    "lastOkAt": null,
+    "lastAttemptAt": "2026-07-01T01:34:37.047Z",
+    "chunks": 0
+  },
+  "topics:US-Minnesota": {
+    "ok": false,
+    "lastOkAt": null,
+    "lastAttemptAt": "2026-07-01T01:34:37.062Z",
+    "chunks": 0
+  },
+  "topics:US-Mississippi": {
+    "ok": false,
+    "lastOkAt": null,
+    "lastAttemptAt": "2026-07-01T01:34:37.086Z",
+    "chunks": 0
+  },
+  "topics:US-Missouri": {
+    "ok": false,
+    "lastOkAt": null,
+    "lastAttemptAt": "2026-07-01T01:34:37.099Z",
+    "chunks": 0
+  },
+  "topics:US-Montana": {
+    "ok": false,
+    "lastOkAt": null,
+    "lastAttemptAt": "2026-07-01T01:34:37.120Z",
+    "chunks": 0
+  },
+  "topics:US-Nebraska": {
+    "ok": false,
+    "lastOkAt": null,
+    "lastAttemptAt": "2026-07-01T01:34:37.132Z",
+    "chunks": 0
+  },
+  "topics:US-Nevada": {
+    "ok": false,
+    "lastOkAt": null,
+    "lastAttemptAt": "2026-07-01T01:34:37.146Z",
+    "chunks": 0
+  },
+  "topics:US-New Hampshire": {
+    "ok": false,
+    "lastOkAt": null,
+    "lastAttemptAt": "2026-07-01T01:34:37.160Z",
+    "chunks": 0
+  },
+  "topics:US-New Jersey": {
+    "ok": false,
+    "lastOkAt": null,
+    "lastAttemptAt": "2026-07-01T01:34:37.175Z",
+    "chunks": 0
+  },
+  "topics:US-New Mexico": {
+    "ok": false,
+    "lastOkAt": null,
+    "lastAttemptAt": "2026-07-01T01:34:37.192Z",
+    "chunks": 0
+  },
+  "topics:US-New York": {
+    "ok": false,
+    "lastOkAt": null,
+    "lastAttemptAt": "2026-07-01T01:34:37.204Z",
+    "chunks": 0
+  },
+  "topics:US-North Carolina": {
+    "ok": false,
+    "lastOkAt": null,
+    "lastAttemptAt": "2026-07-01T01:34:37.216Z",
+    "chunks": 0
+  },
+  "topics:US-North Dakota": {
+    "ok": false,
+    "lastOkAt": null,
+    "lastAttemptAt": "2026-07-01T01:34:37.235Z",
+    "chunks": 0
+  },
+  "topics:US-Ohio": {
+    "ok": false,
+    "lastOkAt": null,
+    "lastAttemptAt": "2026-07-01T01:34:37.260Z",
+    "chunks": 0
+  },
+  "topics:US-Oklahoma": {
+    "ok": false,
+    "lastOkAt": null,
+    "lastAttemptAt": "2026-07-01T01:34:37.272Z",
+    "chunks": 0
+  },
+  "topics:US-Oregon": {
+    "ok": false,
+    "lastOkAt": null,
+    "lastAttemptAt": "2026-07-01T01:34:37.284Z",
+    "chunks": 0
+  },
+  "topics:US-Pennsylvania": {
+    "ok": false,
+    "lastOkAt": null,
+    "lastAttemptAt": "2026-07-01T01:34:37.292Z",
+    "chunks": 0
+  },
+  "topics:US-Rhode Island": {
+    "ok": false,
+    "lastOkAt": null,
+    "lastAttemptAt": "2026-07-01T01:34:37.301Z",
+    "chunks": 0
+  },
+  "topics:US-South Carolina": {
+    "ok": false,
+    "lastOkAt": null,
+    "lastAttemptAt": "2026-07-01T01:34:37.313Z",
+    "chunks": 0
+  },
+  "topics:US-South Dakota": {
+    "ok": false,
+    "lastOkAt": null,
+    "lastAttemptAt": "2026-07-01T01:34:37.322Z",
+    "chunks": 0
+  },
+  "topics:US-Tennessee": {
+    "ok": false,
+    "lastOkAt": null,
+    "lastAttemptAt": "2026-07-01T01:34:37.331Z",
+    "chunks": 0
+  },
+  "topics:US-Texas": {
+    "ok": false,
+    "lastOkAt": null,
+    "lastAttemptAt": "2026-07-01T01:34:37.350Z",
+    "chunks": 0
+  },
+  "topics:US-Utah": {
+    "ok": false,
+    "lastOkAt": null,
+    "lastAttemptAt": "2026-07-01T01:34:37.361Z",
+    "chunks": 0
+  },
+  "topics:US-Vermont": {
+    "ok": false,
+    "lastOkAt": null,
+    "lastAttemptAt": "2026-07-01T01:34:37.370Z",
+    "chunks": 0
+  },
+  "topics:US-Virginia": {
+    "ok": false,
+    "lastOkAt": null,
+    "lastAttemptAt": "2026-07-01T01:34:37.381Z",
+    "chunks": 0
+  },
+  "topics:US-Washington": {
+    "ok": false,
+    "lastOkAt": null,
+    "lastAttemptAt": "2026-07-01T01:34:37.391Z",
+    "chunks": 0
+  },
+  "topics:US-West Virginia": {
+    "ok": false,
+    "lastOkAt": null,
+    "lastAttemptAt": "2026-07-01T01:34:37.400Z",
+    "chunks": 0
+  },
+  "topics:US-Wisconsin": {
+    "ok": false,
+    "lastOkAt": null,
+    "lastAttemptAt": "2026-07-01T01:34:37.410Z",
+    "chunks": 0
+  },
+  "topics:US-Wyoming": {
+    "ok": false,
+    "lastOkAt": null,
+    "lastAttemptAt": "2026-07-01T01:34:37.420Z",
+    "chunks": 0
+  },
+  "topics:US-District of Columbia": {
+    "ok": false,
+    "lastOkAt": null,
+    "lastAttemptAt": "2026-07-01T01:34:37.429Z",
+    "chunks": 0
+  }
+}
