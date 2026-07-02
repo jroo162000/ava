@@ -102,17 +102,7 @@ export function search(query, limit = 8) {
   }
 
   results.sort((a, b) => (b.score - a.score) || String(b.date).localeCompare(String(a.date)));
-  // Deduplicate by normalized text — keep first (highest-scored) occurrence
-  const seen = new Set();
-  const deduped = [];
-  for (const r of results) {
-    const key = r.text.toLowerCase().replace(/\s+/g, ' ').trim();
-    if (!seen.has(key)) {
-      seen.add(key);
-      deduped.push(r);
-    }
-  }
-  const top = deduped.slice(0, limit);
+  const top = results.slice(0, limit);
   const summary = top.length
     ? top.map((r) => (r.source === 'conversation' ? `[${r.date} ${r.time || ''} ${r.who}] ${r.text}` : `[${r.label}] ${r.text}`)).join('\n')
     : `No matches for "${query}".`;

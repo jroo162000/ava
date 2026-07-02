@@ -40,9 +40,15 @@ def load_token():
         except:
             pass
     
-    # Default (insecure - for local dev only)
-    print("[WARNING] No BRIDGE_TOKEN set. Using default token (insecure!)")
-    return "local-dev-token"
+    # Tier 0 security: no known default token, ever. A guessable default on a
+    # service whose /run executes shell commands is remote code execution.
+    # Generate a random token for this process and print it once; anything that
+    # legitimately needs the bridge should set AVA_BRIDGE_TOKEN in the env.
+    import secrets as _secrets
+    token = _secrets.token_hex(32)
+    print("[SECURITY] No AVA_BRIDGE_TOKEN configured. Generated a random one for this run.")
+    print("[SECURITY] Set AVA_BRIDGE_TOKEN in the environment (or ~/.cmpuse/secrets.json) to use the bridge.")
+    return token
 
 BRIDGE_TOKEN = load_token()
 HOST = os.environ.get("BRIDGE_HOST", "127.0.0.1")
@@ -498,6 +504,6 @@ def list_tools(authorization: Optional[str] = Header(None), x_ava_token: Optiona
 if __name__ == "__main__":
     import uvicorn
     print(f"\n[BRIDGE] AVA Bridge starting on http://{HOST}:{PORT}")
-    print(f"   Token configured: {'[OK]' if BRIDGE_TOKEN != 'local-dev-token' else '[WARNING] Using default (insecure)'}")
+    print(f"   Token configured: {'[OK - from env/secrets]' if (os.environ.get('AVA_BRIDGE_TOKEN') or os.environ.get('BRIDGE_TOKEN')) else '[EPHEMERAL - random for this run; set AVA_BRIDGE_TOKEN to use the bridge]'}")
     print(f"   Endpoints: /health, /open, /run, /speak, /type, /keypress, /screenshot, /clipboard, /tool\n")
     uvicorn.run(app, host=HOST, port=PORT, log_level="info")

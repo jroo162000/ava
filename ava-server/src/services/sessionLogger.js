@@ -190,23 +190,6 @@ class SessionLogger {
     }
   }
 
-  logAuditReceipt(actor, action, receiptData = {}) {
-    const receipt = {
-      timestamp: new Date().toISOString(),
-      actor,
-      action,
-      data: receiptData,
-      runId: this.runId
-    };
-    const line = JSON.stringify(receipt) + '\n';
-    const auditFile = path.join(LOGS_DIR, 'audit_receipts.jsonl');
-    try {
-      fs.appendFileSync(auditFile, line, 'utf8');
-    } catch (err) {
-      logger.error('Failed to write audit receipt', { actor, action, error: err.message });
-    }
-  }
-
   // Load a specific session by ID
   loadSession(sessionId) {
     const logFile = path.join(LOGS_DIR, `${sessionId}.json`);

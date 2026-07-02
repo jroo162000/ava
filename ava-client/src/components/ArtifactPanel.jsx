@@ -6,7 +6,9 @@ import React, { useEffect, useRef, useState } from 'react'
 // video, web pages, mermaid, markdown, tables. She drives it (open/focus/layout/move/close) via the
 // panel tool; the user can also click to highlight, drag a card, or cycle/close.
 
-const SERVER = (import.meta.env.VITE_AVA_SERVER_URL || 'http://127.0.0.1:5051')
+// Default to the same-origin /api proxy (Tier 0 security: the Vite proxy injects the
+// API token server-side). VITE_AVA_SERVER_URL still overrides for direct connections.
+const SERVER = (import.meta.env.VITE_AVA_SERVER_URL || '/api')
 const api = (p, body) => fetch(`${SERVER}${p}`, body ? { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) } : undefined)
 
 function esc(s) { return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;') }

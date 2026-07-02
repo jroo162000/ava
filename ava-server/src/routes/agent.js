@@ -201,46 +201,6 @@ router.post('/agent/replay', async (req, res) => {
   }
 });
 
-/**
- * Execute a single step (for debugging/manual control)
- * POST /agent/step
- * Body: { goal: string, state?: object }
- */
-router.post('/agent/step', async (req, res) => {
-  try {
-    const { goal, state: existingState } = req.body;
-    
-    if (!goal && !existingState) {
-      return res.status(400).json({ ok: false, error: 'Goal or existing state required' });
-    }
-
-    // Create or use existing state
-    const state = existingState 
-      ? { ...existingState, status: agentLoop.AgentStatus.RUNNING }
-      : agentLoop.createAgentState(goal, { stepLimit: 1 });
-    
-    state.step_count++;
-
-    // Execute single step
-    const { observe, decide, act, record } = await import('../services/agentLoop.js').then(m => ({
-      observe: m.default.observe || (async (s) => ({})),
-      decide: m.default.decide || (async (s, o) => ({ decision: 'stop', result: 'Manual step', success: true })),
-      act: m.default.act || (async (s, d) => ({ action: d, result: { status: 'ok' } })),
-      record: m.default.record || (async () => {})
-    }));
-
-    // This is a simplified single-step execution for debugging
-    // The full loop is in runAgentLoop
-    
-    res.json({
-      ok: true,
-      message: 'Use POST /agent/run for full execution',
-      hint: 'Single-step mode is for debugging only'
-    });
-  } catch (error) {
-    res.status(500).json({ ok: false, error: error.message });
-  }
-});
 
 /**
  * LEAD AGENT — decompose a goal into subtasks, spawn subagents (each its own loop) in parallel,

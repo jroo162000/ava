@@ -183,7 +183,23 @@ ${getMoltbookContext()}
 Remember: You are a powerful assistant with real tools. When asked to take action, DO IT.`.trim();
 }
 
-const SYSTEM_PROMPT = buildSystemPrompt();
+// Tier 0 fix: was `const SYSTEM_PROMPT = buildSystemPrompt()` -- computed once at module
+// load and frozen forever, so Moltbook learnings/registration baked into the prompt never
+// refreshed without a full restart. Now rebuilt with a short TTL cache.
+let _systemPromptCache = { text: '', at: 0 };
+const SYSTEM_PROMPT_TTL_MS = 60000;
+function getSystemPrompt() {
+  const now = Date.now();
+  if (!_systemPromptCache.text || (now - _systemPromptCache.at) > SYSTEM_PROMPT_TTL_MS) {
+    try {
+      _systemPromptCache = { text: buildSystemPrompt(), at: now };
+    } catch (e) {
+      logger.warn('[llm] buildSystemPrompt failed; reusing last known prompt', { error: e.message });
+      _systemPromptCache.at = now; // don't retry every call on persistent failure
+    }
+  }
+  return _systemPromptCache.text;
+}
 
 class LLMService {
   constructor() {
@@ -237,7 +253,7 @@ class LLMService {
     const apiKey = this.getApiKey('openai');
     if (!apiKey) throw new Error('OpenAI API key not configured');
 
-    const systemMessage = system || SYSTEM_PROMPT;
+    const systemMessage = system || getSystemPrompt();
     const fullMessages = [
       { role: 'system', content: systemMessage },
       ...messages
@@ -284,7 +300,7 @@ class LLMService {
     // gemini-2.0-flash (which 404s: "model no longer available"). Overridable via AVA_SM_GEMINI.
     const mdl = model || process.env.AVA_SM_GEMINI || 'gemini-pro-latest';
 
-    const systemMessage = system || SYSTEM_PROMPT;
+    const systemMessage = system || getSystemPrompt();
 
     // Convert messages to Gemini format (system goes in systemInstruction, not contents)
     const contents = messages.filter(m => m.role !== 'system').map(msg => ({
@@ -328,7 +344,7 @@ class LLMService {
     const apiKey = this.getApiKey('claude');
     if (!apiKey) throw new Error('Claude API key not configured');
 
-    const systemMessage = system || SYSTEM_PROMPT;
+    const systemMessage = system || getSystemPrompt();
     // Claude's messages array must contain only user/assistant turns (system goes separately).
     const convo = (messages || [])
       .filter(m => m.role !== 'system')
@@ -369,7 +385,7 @@ class LLMService {
     const apiKey = this.getApiKey('groq');
     if (!apiKey) throw new Error('Groq API key not configured');
 
-    const systemMessage = system || SYSTEM_PROMPT;
+    const systemMessage = system || getSystemPrompt();
     const fullMessages = [
       { role: 'system', content: systemMessage },
       ...messages
@@ -406,7 +422,7 @@ class LLMService {
   // OpenAI-compatible chat completion (OpenAI, DeepSeek, and xAI/Grok all use this wire format).
   async _openaiCompat({ baseURL, apiKey, model, system, messages, maxTokens = 1500 }) {
     if (!apiKey) throw new Error('no api key');
-    const full = [{ role: 'system', content: system || SYSTEM_PROMPT }, ...messages.filter(m => m.role !== 'system')];
+    const full = [{ role: 'system', content: system || getSystemPrompt() }, ...messages.filter(m => m.role !== 'system')];
     const isNewerOpenAI = /^(gpt-5|o[0-9])/.test(model);
     const payload = { model, messages: full };
     if (isNewerOpenAI) payload.max_completion_tokens = Math.max(maxTokens, parseInt(process.env.AVA_SM_OPENAI_MIN_COMPLETION || '1600', 10));
@@ -575,7 +591,7 @@ class LLMService {
       } catch { personaBlock = ''; }
 
       // Add memory context if available
-      let systemPrompt = personaBlock ? `${personaBlock}\n\n${SYSTEM_PROMPT}` : SYSTEM_PROMPT;
+      let systemPrompt = personaBlock ? `${personaBlock}\n\n${getSystemPrompt()}` : getSystemPrompt();
 
       if (options.includeMemory) {
         const persona = memoryService.generatePersona();
@@ -587,7 +603,14 @@ class LLMService {
           const isRecallQuery = /what.*file.*asking|what.*been.*asking|remember.*conversation|past.*conversation|file.*requested|what.*file.*want/i.test(userMessage);
 
           if (isRecallQuery) {
-            const conversationLogPath = path.join(process.cwd(), 'logs', 'conversations', 'conversation-2025-09-24.jsonl');
+            // Tier 0 fix: was hardcoded to conversation-2025-09-24.jsonl (a debugging
+            // leftover), which silently dead-ended this feature for every other day.
+            const logsDir = path.join(process.cwd(), 'logs', 'conversations');
+            const dayFile = (d) => path.join(logsDir, `conversation-${d.toISOString().slice(0, 10)}.jsonl`);
+            let conversationLogPath = dayFile(new Date());
+            if (!fs.existsSync(conversationLogPath)) {
+              conversationLogPath = dayFile(new Date(Date.now() - 24 * 3600 * 1000));
+            }
 
             if (fs.existsSync(conversationLogPath)) {
               const logContent = fs.readFileSync(conversationLogPath, 'utf8');

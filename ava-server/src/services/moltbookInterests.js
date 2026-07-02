@@ -81,7 +81,6 @@ export function note(topic, delta = 1) {
 // Persistently stores a rejection lesson as a reusable governance rule.
 // Deduplicates by SHA-256 hash of the lesson text. Bounded to REJECTION_MAX entries.
 // Integrates with the interest system by appending a curated interest entry.
-// Also exports the full rejection store as structured lessons for selfImprove consumption.
 export function retainRejectedLesson(rejection) {
   if (!rejection || !rejection.lesson || !rejection.source) return false;
   const lesson = String(rejection.lesson).trim().slice(0, 500);
@@ -120,16 +119,4 @@ export function retainRejectedLesson(rejection) {
   return true;
 }
 
-// Returns the full list of stored rejection lessons, each as {source, lesson, context, timestamp}.
-// Used by selfImprove to populate prior_mistake_lessons automatically.
-export function listRejectedLessons() {
-  try {
-    if (fs.existsSync(REJECTION_DB)) {
-      const stored = JSON.parse(fs.readFileSync(REJECTION_DB, 'utf8'));
-      if (Array.isArray(stored)) return stored.map(e => ({ source: e.source, lesson: e.lesson, context: e.context, timestamp: e.timestamp }));
-    }
-  } catch { /* ignore */ }
-  return [];
-}
-
-export default { list, top, note, retainRejectedLesson, listRejectedLessons };
+export default { list, top, note, retainRejectedLesson };

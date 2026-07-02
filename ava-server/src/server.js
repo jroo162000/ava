@@ -11,6 +11,7 @@ import { WebSocketServer } from 'ws';
 import config from './utils/config.js';
 import logger from './utils/logger.js';
 import security from './utils/security.js';
+import { ensureApiToken, requireAuth, presentedToken, timingSafeEqualStr } from './utils/security.js';
 import apiRoutes from './routes/api.js';
 import monitoringRoutes from './routes/monitoring.js';
 import learningRoutes from './routes/learning.js';
@@ -39,10 +40,27 @@ if (!securityAudit.ok) {
 
 const app = express();
 
+// Tier 0 security: every route (except /health) requires AVA_API_TOKEN.
+// Generated + persisted to ava-integration/.env automatically if absent.
+const API_TOKEN = ensureApiToken();
+
+// Tier 0 security: CORS locked to local origins only (UI dev server, Electron).
+const LOCAL_ORIGIN = /^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$/i;
+const corsOptions = {
+  origin(origin, cb) {
+    // No Origin header = same-origin/non-browser client (voice runner, curl) — allow.
+    if (!origin || LOCAL_ORIGIN.test(origin)) return cb(null, true);
+    logger.warn('[security] Blocked cross-origin request', { origin });
+    return cb(null, false);
+  },
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-AVA-Token']
+};
+
 // Middleware
-app.use(cors());
+app.use(cors(corsOptions));
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true }));
+app.use(requireAuth(API_TOKEN));       // Tier 0: token auth on everything but /health
 app.use(security.securityMiddleware);  // Phase 7: Security middleware
 
 // Request logging (minimal)
@@ -83,9 +101,18 @@ const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
 
 wss.on('connection', (ws, req) => {
+  // Tier 0 security: WebSocket clients must present the API token too
+  // (Authorization header, X-AVA-Token, or ?token= query param).
+  const wsToken = presentedToken(req);
+  if (!wsToken || !timingSafeEqualStr(wsToken, API_TOKEN)) {
+    logger.warn('[security] Rejected unauthenticated WebSocket', { url: req.url });
+    try { ws.close(4401, 'Unauthorized'); } catch { /* ignore */ }
+    return;
+  }
+
   const clientId = `ws-${Date.now().toString(36)}`;
   logger.info('WebSocket connected', { clientId });
-  
+
   // Register for voice events if requested
   const url = new URL(req.url, `http://${req.headers.host}`);
   if (url.pathname === '/voice/ws') {

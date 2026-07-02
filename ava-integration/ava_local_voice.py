@@ -86,6 +86,36 @@ def _apply_pron_lexicon(text: str) -> str:
         s = re.sub(r"\b" + re.escape(word) + r"\b", say, s, flags=re.IGNORECASE)
     return s
 DEFAULT_SERVER_URL = "http://127.0.0.1:5051/respond"
+
+# ---- Tier 0 security: every AVA-server request carries AVA_API_TOKEN ----
+_API_TOKEN_CACHE: str | None = None
+
+def _api_token() -> str:
+    """AVA_API_TOKEN from the environment, else parsed from .env beside this script."""
+    global _API_TOKEN_CACHE
+    if _API_TOKEN_CACHE is not None:
+        return _API_TOKEN_CACHE
+    token = (os.environ.get("AVA_API_TOKEN") or "").strip()
+    if not token:
+        try:
+            env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+            with open(env_path, "r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    line = line.strip()
+                    if line.startswith("AVA_API_TOKEN="):
+                        token = line.split("=", 1)[1].strip().strip('"').strip("'")
+                        break
+        except Exception:
+            token = ""
+    _API_TOKEN_CACHE = token
+    return token
+
+def _auth_headers(extra: dict | None = None) -> dict:
+    h = dict(extra or {})
+    tok = _api_token()
+    if tok:
+        h["Authorization"] = f"Bearer {tok}"
+    return h
 TARGET_ASR_RATE = 16000
 SAMPLE_WIDTH = 2
 CHANNELS = 1
@@ -280,7 +310,7 @@ def _server_respond(text: str, config: dict) -> str:
     req = urllib.request.Request(
         url=url,
         data=body,
-        headers={"Content-Type": "application/json"},
+        headers=_auth_headers({"Content-Type": "application/json"}),
         method="POST",
     )
     try:
@@ -1398,7 +1428,7 @@ class LocalVoiceRunner:
         interval = float(os.getenv("AVA_ANNOUNCE_POLL_SEC", "8") or "8")
         while self.running:
             try:
-                req = urllib.request.Request(url=url, method="GET")
+                req = urllib.request.Request(url=url, headers=_auth_headers(), method="GET")
                 with urllib.request.urlopen(req, timeout=8) as resp:
                     data = json.loads(resp.read().decode("utf-8", errors="ignore"))
                 for item in (data.get("items") or []):

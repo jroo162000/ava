@@ -204,7 +204,9 @@ const config = new Config();
 export default {
   // Server
   PORT: config.getNumber('PORT', 5051),
-  HOST: config.get('HOST', '0.0.0.0'),
+  // Tier 0 security: bind to loopback by default. Set HOST=0.0.0.0 explicitly (plus a strong
+  // AVA_API_TOKEN) if LAN exposure is ever actually needed.
+  HOST: config.get('HOST', '127.0.0.1'),
   
   // OpenAI
   OPENAI_API_KEY: config.get('OPENAI_API_KEY', ''),
