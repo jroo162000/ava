@@ -98,4 +98,54 @@ export function formatTurns(turns, maxChars = 8000) {
   return text;
 }
 
-export default { readRecentTurns, availableDates, windowForQuery, formatTurns };
+export function getConversationSince(timestamp) {
+  const msThreshold = new Date(timestamp).getTime();
+  if (isNaN(msThreshold)) return [];
+  const all = readRecentTurns(60);
+  const result = [];
+  for (const t of all) {
+    const tMs = Date.parse(`${t.date}T${t.time}:00`);
+    if (!isNaN(tMs) && tMs >= msThreshold) result.push(t);
+  }
+  return result;
+}
+
+export function pruneBefore(timestamp) {
+  const msThreshold = new Date(timestamp).getTime();
+  if (isNaN(msThreshold)) return 0;
+  const dir = logsDir();
+  const files = dayFiles();
+  let removedCount = 0;
+  for (const f of files) {
+    const fullPath = path.join(dir, f);
+    let lines = [];
+    try { lines = fs.readFileSync(fullPath, 'utf8').split('\n'); } catch { continue; }
+    const kept = lines.filter((ln) => {
+      if (!ln.trim()) return true;
+      let e;
+      try { e = JSON.parse(ln); } catch { return true; }
+      const ms = Date.parse(e.timestamp);
+      return isNaN(ms) || ms >= msThreshold;
+    });
+    if (kept.length < lines.length) {
+      const counts = { before: lines.length, after: kept.length };
+      try {
+        const allKept = kept.join('\n');
+        if (allKept.trim()) {
+          // Write back the kept lines; if file would be empty remove it
+          if (kept.filter((l) => l.trim()).length === 0) {
+            fs.unlinkSync(fullPath);
+          } else {
+            fs.writeFileSync(fullPath, allKept, 'utf8');
+          }
+        } else {
+          fs.unlinkSync(fullPath);
+        }
+        removedCount += counts.before - counts.after;
+      } catch { /* permission or lock error, skip */ }
+    }
+  }
+  return removedCount;
+}
+
+export default { readRecentTurns, availableDates, windowForQuery, formatTurns, getConversationSince, pruneBefore };

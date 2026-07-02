@@ -22,13 +22,28 @@ const FIRST_PERSON = /\b(i|i'm|i'd|i've|my|myself|me)\b/i;
 const SELF_META = /\b(memory|remember|forget|forgetting|prune|retention|schema|design|architecture|pipeline|curiosity supervisor|transparency|consent|limitation|constraint|wish|should|struggle|chewing on|examine|examined|trade-?off|my code|my own|how i (work|think|store|decide|remember)|the way i)\b/i;
 const WANT = /\b(i wish|i'd (want|like|prefer|rather)|i should|i need to|i want to|i'm still (working|figuring)|i didn't (examine|realize|look)|closer to .* than i'd like|half the time i|i keep (circling|coming back))\b/i;
 
+// Regexes for actionable-reflection gating: detect references to concrete next steps, files, or changes.
+const ACTIONABLE_PLAN = /\b(implement|build|add|create|fix|change|refactor|update|modify|write|convert|replace|remove) .{3,}/i;
+const ACTIONABLE_FILE = /\b[a-zA-Z0-9_\-./]+\.(js|py|ts|json|yaml|yml|md|html|css|sh|env|txt|config)\b/i;
+const ACTIONABLE_STEP = /\b(1st step|next step|first action|commit message|pull request|branch|todo|checklist|the plan|my plan)\b/i;
+const PERFORMATIVE_DOUBT = /\b(i don't know|i'm not sure|maybe|perhaps|wondering if|i question|it's vague|circle back|it's unclear|unclear about|just thinking)\b/i;
+
 function splitSentences(text) {
   return String(text || '').replace(/\s+/g, ' ').split(/(?<=[.!?])\s+/).map(s => s.trim()).filter(Boolean);
 }
 function isReflective(s) {
   if (s.length < 40 || s.length > 600) return false;
   if (!FIRST_PERSON.test(s)) return false;
-  return WANT.test(s) || SELF_META.test(s);
+  if (PERFORMATIVE_DOUBT.test(s)) return false;
+  return (WANT.test(s) || SELF_META.test(s));
+}
+
+function isActionableReflection(s) {
+  // A reflection is actionable only if it references concrete plans, files, or steps — not vague circular doubt.
+  return Boolean(s &&
+    !PERFORMATIVE_DOUBT.test(s) &&
+    (ACTIONABLE_PLAN.test(s) || ACTIONABLE_FILE.test(s) || ACTIONABLE_STEP.test(s))
+  );
 }
 function norm(s) { return String(s).toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim().slice(0, 90); }
 
@@ -59,7 +74,7 @@ export function captureFrom(text, source = 'unknown') {
       const key = norm(s);
       if (!key || seen.has(key)) continue;
       seen.add(key);
-      const rec = { key, text: s, source, actionable: WANT.test(s), at };
+      const rec = { key, text: s, source, actionable: isActionableReflection(s), at };
       store.push(rec);
       try { fs.mkdirSync(DATA_DIR, { recursive: true }); fs.appendFileSync(STORE, JSON.stringify(rec) + '\n'); } catch { /* ignore */ }
       added++;

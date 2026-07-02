@@ -137,7 +137,9 @@ export function verifyClaims({ targetFile, currentContent, newContent }) {
       checked++;
       let src = moduleSrcCache.get(modPath);
       if (src === undefined) {
-        try { src = fs.readFileSync(modPath, 'utf8'); } catch { src = null; }
+        // Comments don't count as API existence — a module that merely *talks about* a member
+        // in a comment doesn't have it (found the hard way: 'query' in a curatedMemory comment).
+        try { src = stripComments(fs.readFileSync(modPath, 'utf8')); } catch { src = null; }
         moduleSrcCache.set(modPath, src);
       }
       if (src && !new RegExp(`\\b${member}\\b`).test(src)) {

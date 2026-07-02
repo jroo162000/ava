@@ -898,8 +898,18 @@ toolsService.executeTool = async function (name, args, dryRun = false, options =
 function _safeToolArgs(args) {
   try {
     if (args == null) return {};
-    const s = JSON.stringify(args);
-    return s.length > 240 ? (s.slice(0, 240) + '…') : args;
+    // Credential redaction (#21 review): web_automation gained a `login` action whose args
+    // carry a plaintext password — tool.start events are broadcast to the UI and stored in
+    // logs, so sensitive keys are masked HERE, at the single emit point.
+    let masked = args;
+    if (typeof args === 'object' && !Array.isArray(args)) {
+      masked = {};
+      for (const [k, v] of Object.entries(args)) {
+        masked[k] = /pass|secret|token|api_?key|credential|auth/i.test(k) ? '•••' : v;
+      }
+    }
+    const s = JSON.stringify(masked);
+    return s.length > 240 ? (s.slice(0, 240) + '…') : masked;
   } catch { return {}; }
 }
 function _summarizeToolResult(r) {

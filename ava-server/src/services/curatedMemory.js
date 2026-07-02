@@ -139,4 +139,80 @@ export function appendFact(target, line) {
 
 export function reload() { _cache = null; return buildMemoryBlock(true); }
 
-export default { buildMemoryBlock, appendFact, reload, paths: { userPath, memoryPath } };
+// ── Engagement signal storage ──────────────────────────────────────────
+// Stores observable user-engagement signals (interruptions, corrections, refinements)
+// as timestamped facts. Used by curiositySupervisor, conversationLogger, persona.
+
+const SIGNAL_RETENTION_MS = 24 * 60 * 60 * 1000; // 24 hours
+
+/**
+ * Record an observable engagement signal for a topic.
+ * @param {string} topic - Normalized topic identifier (lowercase, no punctuation)
+ * @param {'interruption'|'repeated_question'|'correction'|'refinement'} signalType
+ * @param {object} [meta={}] - Optional context (e.g. { conversationId, utterance })
+ * @returns {{ ok: boolean, error?: string }}
+ */
+export function storeEngagementSignal(topic, signalType, meta = {}) {
+  const validSignals = ['interruption', 'repeated_question', 'correction', 'refinement'];
+  if (!topic || typeof topic !== 'string') return { ok: false, error: 'invalid_topic' };
+  if (!validSignals.includes(signalType)) return { ok: false, error: 'invalid_signal_type' };
+  const cleanTopic = topic.replace(/[^a-z0-9_]/gi, '_').toLowerCase().replace(/_+/g, '_').replace(/^_|_$/g, '');
+  if (!cleanTopic) return { ok: false, error: 'empty_topic_after_clean' };
+  const ts = Date.now();
+  const line = `[engagement] topic=${cleanTopic} type=${signalType} ts=${ts} meta=${JSON.stringify(meta)}`;
+  const result = appendFact('user', line);
+  if (!result.ok && !result.deduped) return { ok: false, error: result.error };
+  return { ok: true };
+}
+
+/**
+ * Get a normalized engagement score (0–1) for a topic, based on a decaying-weighted
+ * sum over signals recorded in the last 24 hours.
+ * @param {string} topic
+ * @returns {number} score 0–1 (0 = no engagement, 1 = maximum)
+ */
+export function getTopicEngagement(topic) {
+  if (!topic || typeof topic !== 'string') return 0;
+  const cleanTopic = topic.replace(/[^a-z0-9_]/gi, '_').toLowerCase().replace(/_+/g, '_').replace(/^_|_$/g, '');
+  if (!cleanTopic) return 0;
+  const facts = queryFacts('user', `[engagement] topic=${cleanTopic}`);
+  if (!facts || facts.length === 0) return 0;
+  const now = Date.now();
+  const cutoff = now - SIGNAL_RETENTION_MS;
+  const WEIGHTS = { interruption: 0.8, repeated_question: 0.6, correction: 1.0, refinement: 0.7 };
+  // Decay: score contribution halves every 6 hours (half-life = 21600000 ms)
+  // decayFactor = 0.5 ^ ((now - ts) / halfLife)
+  const halfLife = 6 * 60 * 60 * 1000;
+  let totalWeighted = 0;
+  let totalMax = 0;
+  for (const f of facts) {
+    // f is the raw line text; extract ts and type via regex
+    const tsMatch = f.match(/ts=(\d+)/);
+    if (!tsMatch) continue;
+    const observedTs = parseInt(tsMatch[1], 10);
+    if (observedTs < cutoff) continue;
+    const typeMatch = f.match(/type=(\S+)/);
+    if (!typeMatch) continue;
+    const observedType = typeMatch[1];
+    const weight = WEIGHTS[observedType] || 0.5;
+    const ageMs = now - observedTs;
+    const decay = Math.pow(0.5, ageMs / halfLife);
+    totalWeighted += weight * decay;
+    totalMax += weight; // max possible if all happened just now
+  }
+  if (totalMax === 0) return 0;
+  return Math.min(1, totalWeighted / totalMax);
+}
+
+// Helper to query facts from user memory by prefix match
+function queryFacts(target, prefix) {
+  ensureSeed();
+  const p = target === 'user' ? userPath() : memoryPath();
+  if (!fs.existsSync(p)) return [];
+  try {
+    const text = fs.readFileSync(p, 'utf8');
+    return text.split('\n').filter(line => line.includes(prefix)).map(l => l.trim());
+  } catch { return []; }
+}
+
+export default { buildMemoryBlock, appendFact, reload, storeEngagementSignal, getTopicEngagement, paths: { userPath, memoryPath } };
