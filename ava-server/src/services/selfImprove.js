@@ -20,6 +20,7 @@ import pythonWorker from './pythonWorker.js';
 import announceQueue from './announceQueue.js';
 import personaSvc from './persona.js';
 import { verifyFileSyntax } from '../utils/verifyFileSyntax.js';
+import proposalVerifier from './proposalVerifier.js';
 
 // Syntax-check candidate full-file CONTENT before proposing it. Writes a throwaway file NEXT TO the
 // target (so node --check / py_compile inherit the project's ESM / package context, which an
@@ -433,6 +434,30 @@ async function runProposalReviewer({ reviewer, model, call, file, reason, find, 
 async function reviewProposal({ file, reason, find, replace, diff }) {
   const env = process.env;
   const reviews = [];
+
+  // Tier 3 #21: deterministic API-claims verification runs FIRST — a grep beats an LLM at
+  // catching invented APIs (her dominant rejection cause across dozens of proposals: fake
+  // pythonWorker commands, methods no service exports, CommonJS-in-ESM, dead import paths).
+  // A confident violation denies immediately with the exact claim named, which flows through
+  // recordReviewerFeedback -> her lesson loop at both call sites, and burns zero LLM calls.
+  try {
+    let current = '';
+    try { current = fs.readFileSync(file, 'utf8'); } catch { /* brand-new file */ }
+    const proposed = [replace || '', diff || ''].filter(Boolean).join('\n');
+    if (proposed.trim()) {
+      const claims = proposalVerifier.verifyClaims({ targetFile: file, currentContent: current, newContent: proposed });
+      if (!claims.ok) {
+        const detail = proposalVerifier.describeViolations(claims);
+        logger.info('[selfImprove] api-verifier denied a proposal pre-review', { file: path.basename(file), detail: detail.slice(0, 200) });
+        return {
+          recommendation: 'deny',
+          reason: `api-verifier: ${detail}`.slice(0, 1000),
+          reviewers: [{ reviewer: 'api-verifier', recommendation: 'deny', reason: detail.slice(0, 600) }],
+        };
+      }
+    }
+  } catch (e) { logger.warn('[selfImprove] api-verifier errored; falling through to LLM reviewers', { error: e.message }); }
+
   // Build AVA's full code context ONCE (component map of every source file + the COMPLETE target
   // file) and give the same context to every reviewer, so they judge against the real codebase.
   const ctx = buildCodebaseContext(file);

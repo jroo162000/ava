@@ -42,6 +42,7 @@ import { promisify } from 'util';
 import { pathToFileURL } from 'url';
 import logger from '../utils/logger.js';
 import { verifyFileSyntax } from '../utils/verifyFileSyntax.js';
+import proposalVerifier from './proposalVerifier.js';
 
 const execFileP = promisify(execFile);
 
@@ -162,6 +163,21 @@ export async function validateProposal(modId) {
   if (!rel || rel.startsWith('..')) {
     return { ok: true, skipped: 'target resolves outside its repo', warning: true };
   }
+
+  // Gate 0 (#21): deterministic API-claims verification — a grep beats an LLM at catching
+  // invented APIs (her dominant rejection cause: fake worker commands, methods no service
+  // exports, CommonJS-in-ESM, unresolvable imports). Runs BEFORE the worktree is even built,
+  // so this class of proposal dies in milliseconds with an exact, teachable reason.
+  try {
+    const livePath = path.join(repoRoot, rel);
+    let current = '';
+    try { current = fs.readFileSync(livePath, 'utf8'); } catch { /* brand-new file */ }
+    const claims = proposalVerifier.verifyClaims({ targetFile: livePath, currentContent: current, newContent: prop.newContent });
+    if (!claims.ok) {
+      logger.info('[selfmod-sandbox] blocked by api-claims gate', { modId, violations: claims.violations.slice(0, 3) });
+      return { ok: false, blocked: 'api-claims', violations: claims.violations.slice(0, 5), ms: Date.now() - t0 };
+    }
+  } catch (e) { logger.warn('[selfmod-sandbox] api-claims gate errored; continuing (fail-open)', { error: e.message }); }
 
   const sandboxDir = path.join(os.tmpdir(), `ava-selfmod-${String(modId).replace(/[^a-zA-Z0-9_-]/g, '')}-${Date.now()}`);
   const junctions = [];
@@ -322,6 +338,10 @@ export function describeGate(gate) {
     return 'sandbox passed: syntax OK (no test suite for this target)';
   }
   if (gate.blocked === 'syntax') return `sandbox blocked it: the file does not parse (${gate.error})`;
+  if (gate.blocked === 'api-claims') {
+    const v = (gate.violations || [])[0] || {};
+    return `sandbox blocked it: the change references APIs that don't exist (${v.detail || 'see violations'})`;
+  }
   if (gate.blocked === 'imports') return `sandbox blocked it: the module fails to load (${gate.error})`;
   if (gate.blocked === 'suite-load') {
     const s = (gate.suites || [])[0] || {};

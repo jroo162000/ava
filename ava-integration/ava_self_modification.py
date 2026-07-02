@@ -893,6 +893,7 @@ PROTECTED_BASENAMES = {
     "selfModSandbox.js",         # Tier 2 #13: the worktree+test sandbox gate itself
     "selfModVoice.js",           # voice approval wiring (calls the sandbox gate)
     "verifyFileSyntax.js",       # post-apply syntax verifier the gate relies on
+    "proposalVerifier.js",       # Tier 3 #21: the API-claims verifier gate
 }
 
 
