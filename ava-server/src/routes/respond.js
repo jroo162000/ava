@@ -1160,11 +1160,20 @@ router.post('/respond/stream', async (req, res) => {
 
   const SENTINEL = 'NEED_TOOLS';
   let buf = '';
-  let sentinelChecked = false;
   let sentencesSent = 0;
 
+  // NEED_TOOLS is a reserved control token (the conversational path emits it to escalate to the
+  // agent/recall path) and must NEVER be spoken. It leaked because the old code only stripped it
+  // when it led the buffer and only checked ONCE: in practice the model appends it to the END of
+  // a multi-sentence conversational reply ("…Let me search. NEED_TOOLS"), the escalated grounding
+  // stream then continues the SAME buffer ("I found…") → "NEED_TOOLSI found…" is spoken. So we
+  // scrub EVERY occurrence, wherever it sits, on every delta and again per sentence — position-
+  // and count-independent. It only matches the exact reserved form (all-caps, underscore), so
+  // natural phrases like "I need tools" are untouched.
+  const scrub = (s) => String(s || '').split(SENTINEL).join('');
+
   const emitSentence = (part) => {
-    const raw = String(part || '').trim();
+    const raw = scrub(part).replace(/\s+/g, ' ').trim();
     if (!raw) return;
     let spoken = '';
     try { spoken = shapeSpokenReply(raw, req.body || {}); } catch { spoken = raw; }
@@ -1174,23 +1183,10 @@ router.post('/respond/stream', async (req, res) => {
     }
   };
 
-  // Strip a leading NEED_TOOLS sentinel. NO \b after it: when the conversational reply is
-  // exactly "NEED_TOOLS" and the escalated turn's grounding stream appends straight after it,
-  // the buffer reads "NEED_TOOLSYour clipboard..." — a word-boundary regex fails there and the
-  // sentinel leaks into speech (caught in live verification).
-  const stripSentinel = () => {
-    if (new RegExp('^\\s*' + SENTINEL).test(buf)) {
-      buf = buf.replace(new RegExp('^\\s*' + SENTINEL + '[.!:,\\s]*'), '');
-    }
-    sentinelChecked = true;
-  };
-
   // Pull complete sentences off the front of the buffer. A sentence ends at .!?… (+ closing
   // quote/paren) followed by whitespace, or at a newline; require >=12 chars so fragments like
   // "Dr." or list numbers don't fire alone. force=true flushes whatever remains.
   const flushSentences = (force = false) => {
-    if (force && !sentinelChecked) stripSentinel();  // short buffers may never hit the check threshold
-    if (!sentinelChecked) return;
     for (;;) {
       const m = buf.match(/^([\s\S]{12,}?[.!?…][)"'’”]*)\s+([\s\S]*)$/);
       if (m) { emitSentence(m[1]); buf = m[2]; continue; }
@@ -1203,18 +1199,11 @@ router.post('/respond/stream', async (req, res) => {
 
   req._streamDelta = (piece) => {
     buf += String(piece || '');
-    if (!sentinelChecked) {
-      // Hold emission until we can rule out the escalation sentinel (it arrives as the whole
-      // reply: "NEED_TOOLS", sometimes with grounding-stream text appended right after). Once
-      // ruled out (or stripped), stream normally.
-      if (buf.trim().length < SENTINEL.length + 2) return;
-      stripSentinel();
-      // Tier 2 #15 / #11 UI leg: mirror the (sentinel-cleaned) text to the UI as it generates,
-      // so the reply types into the web client live. assistant.final still closes the bubble.
-      if (buf) { try { emitVoiceEvent('assistant.delta', { text: buf }, 'stream'); } catch { /* ui push is best-effort */ } }
-    } else if (piece) {
-      try { emitVoiceEvent('assistant.delta', { text: String(piece) }, 'stream'); } catch { /* ui push is best-effort */ }
-    }
+    buf = scrub(buf);   // remove the sentinel wherever it lands, before anything can be flushed
+    // Tier 2 #15 / #11 UI leg: mirror the scrubbed delta so the reply types into the web client
+    // live. assistant.final still closes the bubble.
+    const cleanPiece = scrub(piece);
+    if (cleanPiece) { try { emitVoiceEvent('assistant.delta', { text: cleanPiece }, 'stream'); } catch { /* ui push is best-effort */ } }
     flushSentences(false);
   };
 
