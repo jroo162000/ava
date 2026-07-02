@@ -1,0 +1,22 @@
+{
+  "generatedAt": "2026-07-02T07:40:23.257Z",
+  "note": "known pre-existing failures; the selfmod sandbox gate only blocks NEW failures",
+  "totalTests": 92,
+  "failed": [
+    "Chat API Tests POST /respond should not route spoken self-description prompts to the Done fallback",
+    "Idempotency Cache Tests Tool Execution Idempotency (API) should block repeated tool execution within TTL",
+    "Idempotency Cache Tests Edge Cases should handle empty args",
+    "Idempotency Cache Tests Edge Cases should be case-insensitive for string args",
+    "Idempotency Cache Tests Edge Cases should ignore volatile fields in args",
+    "AVA Server API Tests GET /health should return healthy status",
+    "File Generation Tool Tests POST /tools/file_gen/execute should describe file_gen capabilities",
+    "CuriositySupervisor blocks below relevance threshold",
+    "CuriositySupervisor blocks on budgets exceeded",
+    "CuriositySupervisor filters memory writes with no citation when required",
+    "CuriositySupervisor never interrupts (curiosity)",
+    "AutonomyPolicy loads and validates policy",
+    "AutonomyPolicy responsibility trigger can ask_permission at high urgency",
+    "AutonomyPolicy curiosity never interrupts and requires relevance threshold",
+    "AutonomyPolicy high risk always forces ask_permission"
+  ]
+}
