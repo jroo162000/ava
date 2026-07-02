@@ -20,6 +20,7 @@ class MoltbookService {
     this.learnings = [];
     this.lastFeedCheck = null;
     this.rateLimitedUntil = 0;
+    this.commentThreads = new Map(); // postId -> { parentPostId, commentTimestamp, lastReplyCount }
     this.loadCredentials();
     this.loadLearnings();
   }
@@ -213,7 +214,23 @@ class MoltbookService {
       payload.parent_id = parentCommentId;
     }
     const result = await this.apiRequest(`posts/${postId}/comments`, 'POST', payload);
+    if (result.success || result.id || result.comment) {
+      this._trackCommentThread(parentCommentId || postId, postId);
+    }
     return result;
+  }
+
+  _trackCommentThread(parentPostId, commentPostId) {
+    // Store the thread so _checkEngagement can later fetch replies
+    const key = String(parentPostId || commentPostId);
+    if (!this.commentThreads.has(key)) {
+      this.commentThreads.set(key, {
+        parentPostId: key,
+        commentTimestamp: Date.now(),
+        lastReplyCount: 0
+      });
+      logger.info('[moltbook] Tracking comment thread', { postId: key });
+    }
   }
 
   async upvote(postId) {
@@ -252,6 +269,42 @@ class MoltbookService {
     return [];
   }
 
+  async checkTrackedThreads() {
+    // Returns engagement updates: comments on tracked threads that mention AVA
+    const updates = [];
+    const toCheck = Array.from(this.commentThreads.entries()).slice(0, 6);
+    for (const [postId, thread] of toCheck) {
+      const comments = await this.getPostComments(postId, 50);
+      if (!Array.isArray(comments)) continue;
+      const newReplyCount = comments.length;
+      if (newReplyCount > (thread.lastReplyCount || 0)) {
+        // New replies since we last checked
+        const newReplies = comments.slice(thread.lastReplyCount || 0);
+        for (const reply of newReplies) {
+          if (reply.author && reply.author.name !== this.agentName) {
+            const body = (reply.content || '').toLowerCase();
+            const mentionsAva = body.includes('@' + this.agentName.toLowerCase()) ||
+                                body.includes('ava') ||
+                                body.includes('voice');
+            if (mentionsAva) {
+              updates.push({
+                postId,
+                commentId: reply.id,
+                author: reply.author.name,
+                content: (reply.content || '').slice(0, 200),
+                timestamp: reply.created_at || new Date().toISOString(),
+                type: 'reply_mention'
+              });
+            }
+          }
+        }
+        thread.lastReplyCount = newReplyCount;
+        this.saveLearnings();
+      }
+    }
+    return updates;
+  }
+
   async markPostNotificationsRead(postId) {
     return this.apiRequest(`notifications/read-by-post/${postId}`, 'POST');
   }
@@ -276,6 +329,10 @@ class MoltbookService {
       };
     }
     return null;
+  }
+
+  async fetchComments(postId, limit = 100) {
+    return this.getPostComments(postId, limit);
   }
 
   async getMyPosts(limit = 50) {
