@@ -8,21 +8,15 @@ import os from 'os';
 import curatedMemory from './curatedMemory.js';
 import skillStore from './skillStore.js';
 import ftsIndex from './ftsIndex.js';
+import avaPaths from '../utils/paths.js';
 
 const STOP = new Set(['the', 'a', 'an', 'and', 'or', 'but', 'what', 'did', 'we', 'about', 'you',
   'your', 'our', 'do', 'does', 'have', 'has', 'is', 'are', 'to', 'of', 'on', 'in', 'for', 'me',
   'my', 'i', 'it', 'that', 'this', 'with', 'was', 'were', 'they', 'them', 'how', 'when', 'where',
   'why', 'who', 'can', 'could', 'would', 'should', 'please', 'tell', 'know', 'say', 'said', 'get']);
 
-function logsDir() {
-  const cands = [
-    path.join(process.cwd(), 'logs', 'conversations'),
-    path.join(os.homedir(), 'ava', 'ava-server', 'logs', 'conversations'),
-    path.join(os.homedir(), 'ava-server', 'logs', 'conversations'),
-  ];
-  for (const c of cands) { try { if (fs.existsSync(c)) return c; } catch { /* ignore */ } }
-  return cands[0];
-}
+// Tier 1 #8: the conversation-logs location lives in ONE place now (utils/paths.js).
+function logsDir() { return avaPaths.conversationLogsDir(); }
 
 function terms(q) {
   return Array.from(new Set((String(q || '').toLowerCase().match(/[a-z0-9]+/g) || [])))
@@ -102,7 +96,17 @@ export function search(query, limit = 8) {
   }
 
   results.sort((a, b) => (b.score - a.score) || String(b.date).localeCompare(String(a.date)));
-  const top = results.slice(0, limit);
+  // Deduplicate by normalized text — keep first (highest-scored) occurrence
+  const seen = new Set();
+  const deduped = [];
+  for (const r of results) {
+    const key = r.text.toLowerCase().replace(/\s+/g, ' ').trim();
+    if (!seen.has(key)) {
+      seen.add(key);
+      deduped.push(r);
+    }
+  }
+  const top = deduped.slice(0, limit);
   const summary = top.length
     ? top.map((r) => (r.source === 'conversation' ? `[${r.date} ${r.time || ''} ${r.who}] ${r.text}` : `[${r.label}] ${r.text}`)).join('\n')
     : `No matches for "${query}".`;

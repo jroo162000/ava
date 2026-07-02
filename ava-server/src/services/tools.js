@@ -15,7 +15,7 @@ import commitments from './commitments.js';
 import artifactBus from './artifactBus.js';
 import { emitVoiceEvent } from './voiceBus.js';
 import fileGen from './fileGen.js';
-import memorySearch from './memorySearch.js';
+import memoryHub from './memoryHub.js';
 import sandbox from './sandbox.js';
 
 /**
@@ -491,9 +491,10 @@ class ToolsService {
         };
 
       case 'memory_search':
-        // Full-text search over curated memory (USER.md/MEMORY.md) + conversation logs.
+        // Tier 1 #5: unified retrieval via memoryHub — curated memory (USER.md/MEMORY.md),
+        // skills, conversation logs (FTS5-first) AND the durable typed store, in one search.
         try {
-          const out = memorySearch.search(args.query || args.q || '', args.limit || 8);
+          const out = await memoryHub.search(args.query || args.q || '', args.limit || 8);
           return { ok: true, result: out };
         } catch (e) {
           return { ok: false, result: { status: 'error', message: e.message } };

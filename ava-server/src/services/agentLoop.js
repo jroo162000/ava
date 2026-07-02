@@ -14,7 +14,7 @@ import config from '../utils/config.js';
 import toolsService from './tools.js';
 import subagentRoles from './subagentRoles.js';
 import autonomyLib from './autonomyPolicy.js';
-import memoryService, { MemoryType, MemorySource } from './memory.js';
+import memoryService, { MemoryType, MemorySource } from './memoryHub.js';  // Tier 1 #5: one memory interface
 import curiosity from './curiositySupervisor.js';
 import digestQueue from './digestQueue.js';
 import { jaccardSim } from './curiosityScoring.js';
@@ -24,6 +24,7 @@ import persona from './persona.js';
 import curatedMemory from './curatedMemory.js';
 import skillStore from './skillStore.js';
 import trainingGuidance from './trainingGuidance.js';
+import modelConfig from '../utils/modelConfig.js';
 
 // Informational tools whose raw result should be SYNTHESIZED into a real answer (her own knowledge
 // + the findings) rather than returned verbatim -- otherwise a lookup shortens/replaces her answer.
@@ -322,8 +323,8 @@ async function observe(state) {
  * Build the prompt for the LLM decision
  * Phase 5: Uses formatted memory from observations
  */
-function buildDecisionPrompt(state, observations) {
-  const toolDescriptions = state.toolset.map(t => {
+function buildDecisionPrompt(state, observations, native = false) {
+  const toolDescriptions = native ? '' : state.toolset.map(t => {
     // Surface each tool's valid actions so the model uses real action names instead
     // of guessing (e.g. calendar_ops "get_today", not an invented "check_today").
     let actionsHint = '';
@@ -374,7 +375,7 @@ function buildDecisionPrompt(state, observations) {
   try { _skills = skillStore.buildSkillsIndex(); } catch { /* optional */ }
   let _guide = '';
   try { _guide = trainingGuidance.buildGuidanceBlock(); } catch { /* optional */ }
-  return `${persona.buildPersonaPreamble()}${_mem ? '\n\n' + _mem : ''}${_skills ? '\n\n' + _skills : ''}${_guide ? '\n\n' + _guide : ''}
+  const head = `${persona.buildPersonaPreamble()}${_mem ? '\n\n' + _mem : ''}${_skills ? '\n\n' + _skills : ''}${_guide ? '\n\n' + _guide : ''}
 
 You are AVA, executing a task step by step. The personality above shapes only the words you SPEAK to the user — it never changes which tool you pick, and never lets you fake or over-claim a result.
 
@@ -391,7 +392,38 @@ ${historyContext}
 ${errorContext}
 ${userResponseContext}
 ${pendingContext}
-${memoryContext ? '\n' + memoryContext : ''}
+${memoryContext ? '\n' + memoryContext : ''}`;
+
+  // NATIVE FUNCTION-CALLING prompt (Tier 1 #4): tools + their full schemas are passed to the
+  // provider natively, so the prompt carries only the behavioral rules — no tool list, no
+  // "respond with one JSON object" contract, no JSON-repair needed.
+  if (native) {
+    return `${head}
+
+HOW TO ACT — you act by CALLING TOOLS (native function calls):
+- Call ONE tool at a time. EXCEPTION: you may call SEVERAL tools in a single turn ONLY when they are independent, read-only lookups (nothing that writes/sends/opens/deletes) — they will run in parallel.
+- When the request is unclear, garbled, or you need information only the user has, call the ask_user tool with ONE specific question. A wrong or random action (especially opening Explorer/Downloads) is far worse than asking. NEVER open a folder/file/app the user did not explicitly name in THIS goal.
+${state.canDelegate ? `- For long / multi-part / multi-step workflows (e.g. research-then-build, several independent parts), call the delegate tool to split the goal into INDEPENDENT subtasks run by parallel subagents, then you synthesize their results. Available subagent roles (each gets only its own scoped tools):
+${subagentRoles.rolesForPrompt()}
+Pick the role that best fits each subtask ("general" if it spans many categories); to invent a NEW role, include a "define" object (description, prompt, tools) — it is saved for reuse.
+` : ''}- When the GOAL is COMPLETE — or it is a question you can answer from the CURRENT STATE, the last result, and context — reply with PLAIN TEXT and NO tool call: that text is your final answer to the user and ends the task. Never describe a tool call in prose; actually call the tool.
+
+CRITICAL RULES:
+1. If a tool failed, try an alternative approach — do not repeat the same tool call with the same args. Once a tool has returned the information you need, answer with plain text.
+2. After ${state.step_limit} steps you must stop.
+3. Tools marked [REQUIRES confirmed:true] MUST have {"confirmed": true} in args. If the last result was "needs_confirm" and the user confirmed, retry with confirmed:true.
+4. The open_item tool uses "target" (not "path") for its argument. When a tool's schema has an "action"/"operation" enum, put the chosen action INSIDE args — never append it to the tool name.
+5. **USE MEMORY** for preferences, constraints, and facts only. Memory is NOT proof that the current request is already done — you must actually call the tool to fulfill THIS request before claiming it is done.
+6. **NEVER claim success for an action you did not actually perform this turn.** To create/update/delete/send anything, you MUST call the relevant tool and see a successful result in THIS run before answering that you did it.
+7. **SCOPE — do ONLY what the GOAL explicitly asks; then stop.** Do NOT add unrequested follow-up actions. If asked to "take a screenshot", do NOT also open it. As soon as the explicit request is satisfied by ONE successful tool result, give your final answer.
+8. **RECALL — if the GOAL asks what was previously discussed/decided/said, call memory_search with the key topic as the query (do NOT ask the user to narrow it down first). Only after a search returns nothing relevant should you ask for more detail.**
+9. **QUESTIONS / DIAGNOSE / STATUS — if the GOAL is a question, asks you to explain/diagnose/report, or is a vague follow-up about a previous step, answer from the CURRENT STATE and last result with plain text — or, for a genuine diagnosis, call the RELEVANT diagnostic tool (e.g. self_awareness). Do NOT substitute an unrelated action.**
+10. **FORMS & APPLICATIONS (web).** To fill out ANY web form/application/portal: (a) call profile_ops get_all FIRST to autofill the user's saved info; (b) browser_automation navigate to the page, then get_fields to see the REAL fields and buttons; (c) for any required field you do NOT already have, FIND it via comm_ops search (Gmail) and fs_find / fs_read BEFORE asking the user, and save new facts with profile_ops set; (d) fill with browser_automation fill_form, upload_file for attachments, then click_text to submit. For multi-step forms, fill the page, click Next, get_fields again, continue. If the page shows a CAPTCHA / login challenge you cannot complete legitimately, do NOT bypass it — stop and tell the user you need them to finish that step. You DO have the ability to fill and submit web forms — never say you "can't apply". If asked to "apply for jobs" without a specific link, ask_user for the URL or site (ONE question).
+
+What is your next action?`;
+  }
+
+  return `${head}
 
 AVAILABLE TOOLS:
 ${toolDescriptions}
@@ -440,6 +472,98 @@ What is your next action?`;
 }
 
 /**
+ * Build the native function-calling toolset (Tier 1 #4): the real tools with their FULL schemas
+ * (so the model sees exact arg names + action enums instead of a prose hint), plus two control
+ * tools — ask_user, and delegate for the lead agent. "Stop" is simply a plain-text reply.
+ */
+function buildNativeTools(state) {
+  const tools = (state.toolset || []).map(t => ({
+    type: 'function',
+    function: {
+      name: t.name,
+      description: `${t.description || ''}${t.requires_confirm ? ' [REQUIRES confirmed:true in args]' : ''}${t.risk_level === 'high' ? ' [HIGH RISK]' : ''}`,
+      parameters: (t.schema && t.schema.type) ? t.schema : { type: 'object', properties: {} }
+    }
+  }));
+  tools.push({
+    type: 'function',
+    function: {
+      name: 'ask_user',
+      description: 'Ask the user ONE specific clarifying question and wait for their answer. Use when the request is unclear/ambiguous or you need information only the user has. Ends your turn.',
+      parameters: { type: 'object', properties: { question: { type: 'string', description: 'The single specific question to ask' } }, required: ['question'] }
+    }
+  });
+  if (state.canDelegate) {
+    tools.push({
+      type: 'function',
+      function: {
+        name: 'delegate',
+        description: 'LEAD ONLY: split a long multi-part goal into INDEPENDENT subtasks, each run by a parallel subagent with a scoped role toolset; you synthesize the results afterwards. Prefer this for sizable multi-step workflows.',
+        parameters: {
+          type: 'object',
+          properties: {
+            subtasks: {
+              type: 'array',
+              items: {
+                type: 'object',
+                properties: {
+                  role: { type: 'string', description: 'Existing role name, or a NEW role name (then include define)' },
+                  goal: { type: 'string', description: 'One focused instruction for this subagent' },
+                  define: {
+                    type: 'object',
+                    description: 'Only when inventing a NEW role',
+                    properties: {
+                      description: { type: 'string' },
+                      prompt: { type: 'string', description: 'Specialized instructions for the role' },
+                      tools: { type: 'array', items: { type: 'string' } }
+                    }
+                  }
+                },
+                required: ['goal']
+              }
+            },
+            reasoning: { type: 'string' }
+          },
+          required: ['subtasks']
+        }
+      }
+    });
+  }
+  return tools;
+}
+
+/**
+ * Map a native tool-calling response onto the loop's decision shape.
+ * Returns null when the response is unusable (caller falls back to the legacy JSON path).
+ */
+function mapNativeDecision(state, resp) {
+  const calls = (resp && resp.toolCalls) || [];
+  const text = String((resp && resp.text) || '').trim();
+
+  if (calls.length) {
+    const askUser = calls.find(c => c.name === 'ask_user');
+    if (askUser) {
+      return { decision: DecisionType.ASK_USER, question: String(askUser.args.question || 'Could you clarify what you need?'), reasoning: 'model requested clarification' };
+    }
+    const delegate = calls.find(c => c.name === 'delegate');
+    if (delegate && state.canDelegate && Array.isArray(delegate.args.subtasks) && delegate.args.subtasks.length) {
+      return { decision: DecisionType.DELEGATE, subtasks: delegate.args.subtasks, reasoning: String(delegate.args.reasoning || '') };
+    }
+    const real = calls.filter(c => c.name !== 'ask_user' && c.name !== 'delegate');
+    if (real.length > 1) {
+      return { decision: DecisionType.PARALLEL, tool_calls: real.map(c => ({ tool: c.name, args: c.args || {} })), reasoning: 'parallel read-only fan-out' };
+    }
+    if (real.length === 1) {
+      return { decision: DecisionType.TOOL_CALL, tool: real[0].name, args: real[0].args || {}, reasoning: '' };
+    }
+  }
+
+  // Plain text with no tool calls = the final answer (STOP).
+  if (text) return { decision: DecisionType.STOP, result: text, success: true };
+  return null;
+}
+
+/**
  * DECIDE: Call LLM to determine next action
  */
 async function decide(state, observations) {
@@ -470,6 +594,34 @@ async function decide(state, observations) {
     }
   }
 
+  // PRIMARY PATH (Tier 1 #4): native function calling — tools with full schemas go to the
+  // provider natively; no JSON contract, no repair pipeline. Disable with AVA_NATIVE_TOOLS=0.
+  if (process.env.AVA_NATIVE_TOOLS !== '0') {
+    try {
+      const nativeResp = await llmService.chatWithTools([
+        { role: 'system', content: 'You are AVA, a task execution agent. Act by calling tools; reply with plain text only when the task is complete or you can answer directly.' },
+        { role: 'user', content: buildDecisionPrompt(state, observations, true) }
+      ], {
+        tools: buildNativeTools(state),
+        temperature: 0.3,
+        max_tokens: parseInt(process.env.AVA_DECISION_MAX_TOKENS || '', 10) || 4000,
+        model: modelConfig.decisionModel()
+      });
+      const nativeDecision = mapNativeDecision(state, nativeResp);
+      if (nativeDecision) {
+        logger.info('[agent] Decision made (native)', {
+          type: nativeDecision.decision,
+          tool: nativeDecision.tool,
+          provider: nativeResp.provider
+        });
+        return nativeDecision;
+      }
+      logger.warn('[agent] Native decision empty (no text, no tool calls); falling back to JSON path', { provider: nativeResp.provider });
+    } catch (e) {
+      logger.warn('[agent] Native tool-calling decide failed; falling back to JSON path', { error: e.message });
+    }
+  }
+
   const prompt = buildDecisionPrompt(state, observations);
 
   try {
@@ -479,7 +631,7 @@ async function decide(state, observations) {
     ], {
       temperature: 0.3,
       max_tokens: parseInt(process.env.AVA_DECISION_MAX_TOKENS || '', 10) || 4000,  // headroom so the decision JSON doesn't truncate mid-string
-      model: process.env.AVA_DECISION_MODEL || 'gpt-5.1'  // upgraded decision model
+      model: modelConfig.decisionModel()
     });
 
     const text = response.text || response.content || '';
@@ -526,7 +678,7 @@ async function decide(state, observations) {
           ], {
             temperature: 0.2,
             max_tokens: parseInt(process.env.AVA_DECISION_MAX_TOKENS || '', 10) || 4000,
-            model: process.env.AVA_DECISION_MODEL || 'gpt-5.1'
+            model: modelConfig.decisionModel()
           });
           retried = parseDecisionJson(r2.text || r2.content || '');
         } catch { retried = null; }
@@ -1233,5 +1385,7 @@ export default {
   storeAgent,
   AgentStatus,
   DecisionType,
-  createAgentState
+  createAgentState,
+  // Tier 1 #9: pure decision helpers exported for golden-path tests
+  _internals: { parseDecisionJson, isMultiStepGoal, mapNativeDecision, buildNativeTools, _toolAllowed }
 };

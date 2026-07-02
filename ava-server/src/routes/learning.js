@@ -17,7 +17,7 @@ import { verifyFileSyntax } from '../utils/verifyFileSyntax.js';
 import workflowEngine from '../services/workflowEngine.js';
 import contextCompression from '../services/contextCompression.js';
 import ftsIndex from '../services/ftsIndex.js';
-import memorySearch from '../services/memorySearch.js';
+import memoryHub from '../services/memoryHub.js';  // Tier 1 #5: one memory interface
 import { triggerMoltbookSelfPost, triggerMoltbookEngage, getPendingVerifications, submitMoltbookVerification, previewSelfPosts } from '../services/moltbookScheduler.js';
 import llmService from '../services/llm.js';
 import avaSelf from '../services/avaSelf.js';
@@ -771,12 +771,13 @@ router.post('/context/compress', async (req, res) => {
 // Inspect the lineage chain (parent->child summary generations) for a session.
 router.get('/context/lineage/:sessionId', (req, res) => { res.json({ ok: true, ...contextCompression.lineage(req.params.sessionId) }); });
 
-// ---- FTS memory search (SQLite FTS5) ----
+// ---- Unified memory search (Tier 1 #5: memoryHub — FTS5-first + durable store) ----
 // Search memory + conversation history; reports whether the FTS index served it.
-router.get('/memory/search', (req, res) => {
+router.get('/memory/search', async (req, res) => {
   try {
     const q = req.query.q || req.query.query || '';
-    res.json({ ok: true, fts: ftsIndex.available(), ...memorySearch.search(String(q), parseInt(req.query.limit || '8', 10)) });
+    const out = await memoryHub.search(String(q), parseInt(req.query.limit || '8', 10));
+    res.json({ ok: true, fts: ftsIndex.available(), ...out });
   } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
 });
 

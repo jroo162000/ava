@@ -7,7 +7,10 @@ import path from 'path';
 import os from 'os';
 import config from '../utils/config.js';
 import logger from '../utils/logger.js';
-import memoryService from './memory.js';
+import contextBudget from '../utils/contextBudget.js';
+import modelConfig from '../utils/modelConfig.js';
+import avaPaths from '../utils/paths.js';
+import memoryHub from './memoryHub.js';
 import moltbookService from './moltbook.js';
 import personaSvc from './persona.js';
 
@@ -23,10 +26,67 @@ function _providerCoolingDown(p) {
   return (_providerCooldown[p] || 0) > Date.now();
 }
 
+// ---- NATIVE FUNCTION CALLING (Tier 1 #4) ----
+// Tools flow through in OpenAI format: [{ type:'function', function:{ name, description, parameters } }]
+// (what toolsService.getToolsForLLM() returns). Each provider gets them converted to ITS native
+// wire format, and every completion returns a unified `toolCalls: [{ id, name, args }]` array.
+// This replaces prompt-listed tools + "respond with one JSON object" + the JSON-repair pipeline
+// as the PRIMARY decision mechanism (the old path survives only as a fallback in agentLoop).
+
+// Gemini accepts a restricted OpenAPI-style schema subset; strip everything else and make sure
+// every node has a type (schemas like `content: {}` would otherwise 400).
+const GEMINI_SCHEMA_KEYS = new Set(['type', 'format', 'description', 'nullable', 'enum', 'items', 'properties', 'required']);
+function _geminiSchema(schema) {
+  if (!schema || typeof schema !== 'object') return { type: 'string' };
+  const out = {};
+  for (const [k, v] of Object.entries(schema)) {
+    if (!GEMINI_SCHEMA_KEYS.has(k)) continue;
+    if (k === 'properties' && v && typeof v === 'object') {
+      const props = {};
+      for (const [pk, pv] of Object.entries(v)) props[pk] = _geminiSchema(pv);
+      out.properties = props;
+    } else if (k === 'items') {
+      out.items = _geminiSchema(v);
+    } else {
+      out[k] = v;
+    }
+  }
+  if (!out.type) out.type = out.properties ? 'object' : (out.items ? 'array' : 'string');
+  return out;
+}
+
+function _toolsForGemini(tools) {
+  const decls = (tools || []).filter(t => t && t.function && t.function.name).map(t => {
+    const d = { name: t.function.name, description: t.function.description || '' };
+    const p = t.function.parameters;
+    if (p && p.properties && Object.keys(p.properties).length) d.parameters = _geminiSchema(p);
+    return d;
+  });
+  return decls.length ? [{ functionDeclarations: decls }] : undefined;
+}
+
+function _toolsForClaude(tools) {
+  return (tools || []).filter(t => t && t.function && t.function.name).map(t => ({
+    name: t.function.name,
+    description: t.function.description || '',
+    input_schema: (t.function.parameters && t.function.parameters.type) ? t.function.parameters : { type: 'object', properties: {} },
+  }));
+}
+
+// Parse OpenAI-wire tool_calls (used verbatim by OpenAI, DeepSeek, Grok, Groq, LM Studio).
+function _parseOpenAIToolCalls(message) {
+  const raw = (message && message.tool_calls) || [];
+  return raw.filter(c => c && c.function && c.function.name).map(c => {
+    let args = {};
+    try { args = JSON.parse(c.function.arguments || '{}'); } catch { args = {}; }
+    return { id: c.id || '', name: c.function.name, args: (args && typeof args === 'object') ? args : {} };
+  });
+}
+
 // Load AVA identity if available
 function loadIdentity() {
   try {
-    const identityPath = path.join(config.AVA_INTEGRATION_DIR || path.join(os.homedir(), 'ava-integration'), 'ava_identity.json');
+    const identityPath = path.join(config.AVA_INTEGRATION_DIR || avaPaths.integrationDir(), 'ava_identity.json');
     if (fs.existsSync(identityPath)) {
       return JSON.parse(fs.readFileSync(identityPath, 'utf8'));
     }
@@ -39,7 +99,7 @@ function loadIdentity() {
 // Get available tools from cmp-use directory
 function getAvailableTools() {
   try {
-    const toolsDir = path.join(os.homedir(), 'cmp-use', 'cmpuse', 'tools');
+    const toolsDir = avaPaths.cmpuseToolsDir();
     if (fs.existsSync(toolsDir)) {
       const files = fs.readdirSync(toolsDir);
       return files
@@ -249,7 +309,29 @@ class LLMService {
     };
   }
 
-  async createCompletionOpenAI({ messages, system, temperature = 0.7, maxTokens = 1000, model }) {
+  // NATIVE FUNCTION CALLING entry point (Tier 1 #4). `tools` is OpenAI-format
+  // (toolsService.getToolsForLLM()); each provider converts to its own wire format.
+  // Returns { text, toolCalls: [{ id, name, args }], provider, model, usage }.
+  // A response with tool calls but no text is a SUCCESS here (unlike chat()).
+  async chatWithTools(messages, options = {}) {
+    const result = await this.createCompletion({
+      messages: messages.filter(m => m.role !== 'system'),
+      system: messages.find(m => m.role === 'system')?.content,
+      temperature: options.temperature ?? 0.3,
+      maxTokens: options.max_tokens || options.maxTokens || 2000,
+      model: options.model,
+      tools: options.tools || []
+    });
+    return {
+      text: result.content || '',
+      toolCalls: Array.isArray(result.toolCalls) ? result.toolCalls : [],
+      usage: result.usage,
+      model: result.model,
+      provider: result.provider
+    };
+  }
+
+  async createCompletionOpenAI({ messages, system, temperature = 0.7, maxTokens = 1000, model, tools }) {
     const apiKey = this.getApiKey('openai');
     if (!apiKey) throw new Error('OpenAI API key not configured');
 
@@ -263,6 +345,7 @@ class LLMService {
     // GPT-5 / o-series use max_completion_tokens and reject a custom temperature.
     const isNewer = /^(gpt-5|o[0-9])/.test(mdl);
     const payload = { model: mdl, messages: fullMessages };
+    if (Array.isArray(tools) && tools.length) payload.tools = tools;
     if (isNewer) {
       payload.max_completion_tokens = Math.max(maxTokens, 800); // headroom for reasoning tokens
     } else {
@@ -285,15 +368,17 @@ class LLMService {
     }
 
     const data = await response.json();
+    const msg = data.choices?.[0]?.message || {};
     return {
-      content: data.choices?.[0]?.message?.content || '',
+      content: msg.content || '',
+      toolCalls: _parseOpenAIToolCalls(msg),
       usage: data.usage,
       model: data.model,
       provider: 'openai'
     };
   }
 
-  async createCompletionGemini({ messages, system, temperature = 0.7, maxTokens = 1000, model }) {
+  async createCompletionGemini({ messages, system, temperature = 0.7, maxTokens = 1000, model, tools }) {
     const apiKey = this.getApiKey('gemini');
     if (!apiKey) throw new Error('Gemini API key not configured');
     // Default to the SAME recent model as the solidified self-mod chain — NOT the retired
@@ -308,19 +393,23 @@ class LLMService {
       parts: [{ text: msg.content }]
     }));
 
+    const body = {
+      contents,
+      systemInstruction: { parts: [{ text: systemMessage }] },
+      generationConfig: {
+        temperature,
+        maxOutputTokens: maxTokens
+      }
+    };
+    const gTools = _toolsForGemini(tools);
+    if (gTools) body.tools = gTools;
+
     const response = await fetch(
       `https://generativelanguage.googleapis.com/v1beta/models/${mdl}:generateContent?key=${apiKey}`,
       {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          contents,
-          systemInstruction: { parts: [{ text: systemMessage }] },
-          generationConfig: {
-            temperature,
-            maxOutputTokens: maxTokens
-          }
-        })
+        body: JSON.stringify(body)
       }
     );
 
@@ -330,17 +419,21 @@ class LLMService {
     }
 
     const data = await response.json();
-    const content = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
-    
+    const parts = data.candidates?.[0]?.content?.parts || [];
+    const content = parts.filter(p => typeof p.text === 'string').map(p => p.text).join('');
+    const toolCalls = parts.filter(p => p.functionCall && p.functionCall.name)
+      .map((p, i) => ({ id: `gemini-${i}`, name: p.functionCall.name, args: p.functionCall.args || {} }));
+
     return {
       content,
+      toolCalls,
       usage: data.usageMetadata,
       model: data.modelVersion || mdl,
       provider: 'gemini'
     };
   }
 
-  async createCompletionClaude({ messages, system, temperature = 0.7, maxTokens = 1000, model }) {
+  async createCompletionClaude({ messages, system, temperature = 0.7, maxTokens = 1000, model, tools }) {
     const apiKey = this.getApiKey('claude');
     if (!apiKey) throw new Error('Claude API key not configured');
 
@@ -354,6 +447,7 @@ class LLMService {
     const isNewerClaude = /claude-(opus|sonnet|haiku)-[4-9]/i.test(mdl);
     const claudeBody = { model: mdl, max_tokens: maxTokens, system: systemMessage, messages: convo };
     if (!isNewerClaude) claudeBody.temperature = Math.max(0, Math.min(1, temperature));
+    if (Array.isArray(tools) && tools.length) claudeBody.tools = _toolsForClaude(tools);
 
     const response = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
@@ -371,17 +465,21 @@ class LLMService {
     }
 
     const data = await response.json();
-    const content = data.content?.[0]?.text || '';
-    
+    const blocks = Array.isArray(data.content) ? data.content : [];
+    const content = blocks.filter(b => b.type === 'text').map(b => b.text).join('');
+    const toolCalls = blocks.filter(b => b.type === 'tool_use')
+      .map(b => ({ id: b.id || '', name: b.name, args: b.input || {} }));
+
     return {
       content,
+      toolCalls,
       usage: data.usage,
       model: data.model,
       provider: 'claude'
     };
   }
 
-  async createCompletionGroq({ messages, system, temperature = 0.7, maxTokens = 1000 }) {
+  async createCompletionGroq({ messages, system, temperature = 0.7, maxTokens = 1000, tools }) {
     const apiKey = this.getApiKey('groq');
     if (!apiKey) throw new Error('Groq API key not configured');
 
@@ -391,18 +489,21 @@ class LLMService {
       ...messages
     ];
 
+    const body = {
+      model: 'llama-3.3-70b-versatile',
+      messages: fullMessages,
+      temperature,
+      max_tokens: maxTokens
+    };
+    if (Array.isArray(tools) && tools.length) body.tools = tools;
+
     const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
       method: 'POST',
       headers: {
         'Authorization': `Bearer ${apiKey}`,
         'Content-Type': 'application/json'
       },
-      body: JSON.stringify({
-        model: 'llama-3.3-70b-versatile',
-        messages: fullMessages,
-        temperature,
-        max_tokens: maxTokens
-      })
+      body: JSON.stringify(body)
     });
 
     if (!response.ok) {
@@ -411,8 +512,10 @@ class LLMService {
     }
 
     const data = await response.json();
+    const msg = data.choices?.[0]?.message || {};
     return {
-      content: data.choices?.[0]?.message?.content || '',
+      content: msg.content || '',
+      toolCalls: _parseOpenAIToolCalls(msg),
       usage: data.usage,
       model: data.model,
       provider: 'groq'
@@ -420,11 +523,12 @@ class LLMService {
   }
 
   // OpenAI-compatible chat completion (OpenAI, DeepSeek, and xAI/Grok all use this wire format).
-  async _openaiCompat({ baseURL, apiKey, model, system, messages, maxTokens = 1500 }) {
+  async _openaiCompat({ baseURL, apiKey, model, system, messages, maxTokens = 1500, tools }) {
     if (!apiKey) throw new Error('no api key');
     const full = [{ role: 'system', content: system || getSystemPrompt() }, ...messages.filter(m => m.role !== 'system')];
     const isNewerOpenAI = /^(gpt-5|o[0-9])/.test(model);
     const payload = { model, messages: full };
+    if (Array.isArray(tools) && tools.length) payload.tools = tools;
     if (isNewerOpenAI) payload.max_completion_tokens = Math.max(maxTokens, parseInt(process.env.AVA_SM_OPENAI_MIN_COMPLETION || '1600', 10));
     else payload.max_tokens = maxTokens;
     const resp = await fetch(`${baseURL}/chat/completions`, {
@@ -437,52 +541,34 @@ class LLMService {
     const choice = d.choices?.[0] || {};
     return {
       content: choice.message?.content || '',
+      toolCalls: _parseOpenAIToolCalls(choice.message),
       model: d.model || model,
       finishReason: choice.finish_reason || '',
       usage: d.usage,
     };
   }
 
-  // Self-modification reasoning chain (user-chosen): Claude Opus 4.8 (PRIMARY) ->
-  // OpenAI self-mod model -> stable OpenAI fallback -> Gemini 3 -> DeepSeek -> Grok. Tries
-  // each highest-reasoning model in order until one returns
-  // text, so self-mod keeps working across provider outages / credit issues. Each is overridable
-  // via env (AVA_SM_*). Claude is primary and takes over automatically once its credits exist.
+  // Self-modification reasoning entry point. Tier 1 #8: this no longer maintains its OWN
+  // provider chain — it rides the ONE canonical chain in createCompletion (same AVA_SM_*
+  // models, same order: Claude -> OpenAI -> Gemini -> DeepSeek -> Grok -> Groq -> local),
+  // with requireText so an empty completion falls through to the next provider exactly
+  // like the old dedicated chain did.
   async chatSelfMod(messages, options = {}) {
-    const system = messages.find(m => m.role === 'system')?.content;
-    const conv = messages.filter(m => m.role !== 'system');
-    const maxTokens = options.max_tokens || 1500;
-    const env = process.env;
-    const key = (n) => config[n] || env[n] || '';
-    const primaryOpenAI = env.AVA_SM_OPENAI || 'gpt-5.5';
-    const stableOpenAI = env.AVA_SM_OPENAI_FALLBACK || 'gpt-5.1';
-    const openAIModels = [...new Set([primaryOpenAI, stableOpenAI].filter(Boolean))];
-    const chain = [
-      { name: 'claude/' + (env.AVA_SM_CLAUDE || 'claude-opus-4-8'), run: () => this.createCompletionClaude({ messages: conv, system, maxTokens, model: env.AVA_SM_CLAUDE || 'claude-opus-4-8' }) },
-      ...openAIModels.map(model => ({ name: 'openai/' + model, run: () => this._openaiCompat({ baseURL: 'https://api.openai.com/v1', apiKey: key('OPENAI_API_KEY'), model, system, messages: conv, maxTokens }) })),
-      { name: 'gemini/' + (env.AVA_SM_GEMINI || 'gemini-pro-latest'), run: () => this.createCompletionGemini({ messages: conv, system, maxTokens, model: env.AVA_SM_GEMINI || 'gemini-pro-latest' }) },
-      { name: 'deepseek/' + (env.AVA_SM_DEEPSEEK || 'deepseek-chat'), run: () => this._openaiCompat({ baseURL: 'https://api.deepseek.com', apiKey: key('DEEPSEEK_API_KEY'), model: env.AVA_SM_DEEPSEEK || 'deepseek-chat', system, messages: conv, maxTokens }) },
-      { name: 'grok/' + (env.AVA_SM_GROK || 'grok-4'), run: () => this._openaiCompat({ baseURL: 'https://api.x.ai/v1', apiKey: key('GROK_API_KEY'), model: env.AVA_SM_GROK || 'grok-4', system, messages: conv, maxTokens }) },
-      // Final fallback: the local model (LM Studio). Reached only if every cloud model above is down.
-      ...(env.AVA_LOCAL_LLM_OFF === '1' ? [] : [{ name: 'local/' + (env.AVA_LOCAL_LLM_MODEL || 'lm-studio'), run: () => this._openaiCompat({ baseURL: (env.AVA_LOCAL_LLM_URL || 'http://localhost:1234/v1').replace(/\/$/, ''), apiKey: env.AVA_LOCAL_LLM_KEY || 'lm-studio', model: env.AVA_LOCAL_LLM_MODEL || 'local-model', system, messages: conv, maxTokens }) }]),
-    ];
-    const errs = [];
-    for (const step of chain) {
-      try {
-        const res = await step.run();
-        const text = res.content || res.text || '';
-        if (text && text.trim()) { logger.info('[selfmod-llm] used ' + step.name); return { text, content: text, provider: step.name }; }
-        const emptyNote = [
-          'empty',
-          res.model ? `model=${res.model}` : '',
-          res.finishReason ? `finish=${res.finishReason}` : '',
-          res.usage ? `usage=${JSON.stringify(res.usage).slice(0, 220)}` : '',
-        ].filter(Boolean).join(' ');
-        errs.push(step.name + ': ' + emptyNote);
-      } catch (e) { errs.push(step.name + ': ' + (e.message || e)); }
+    try {
+      const result = await this.createCompletion({
+        messages: messages.filter(m => m.role !== 'system'),
+        system: messages.find(m => m.role === 'system')?.content,
+        maxTokens: options.max_tokens || 1500,
+        requireText: true,
+      });
+      const text = String(result.content || '').trim();
+      const name = `${result.provider}/${result.model || ''}`.replace(/\/$/, '');
+      logger.info('[selfmod-llm] used ' + name);
+      return { text, content: text, provider: name };
+    } catch (e) {
+      logger.warn('[selfmod-llm] entire chain failed', { error: e.message });
+      throw new Error('self-mod chain failed: ' + e.message);
     }
-    logger.warn('[selfmod-llm] entire chain failed', { errs });
-    throw new Error('self-mod chain failed: ' + errs.join(' | '));
   }
 
   async createCompletion(options) {
@@ -492,14 +578,23 @@ class LLMService {
     // AVA_SM_* env so the two chains never drift. When most providers are quota/credit-exhausted,
     // it keeps falling through instead of dying after gemini (the old bug that 404'd on gemini-2.0
     // and never reached DeepSeek/Grok).
+    // CONTEXT BUDGETING (Tier 1 #7): every LLM call flows through here, so token-count and
+    // trim ONCE with priorities (system > last user msg > newest history; middle-truncate
+    // oversized blocks) before any provider sees the payload. AVA_CONTEXT_BUDGET_TOKENS tunes it.
+    try {
+      const fitted = contextBudget.fit({
+        system: options.system,
+        messages: options.messages,
+        completionTokens: options.maxTokens || 1000
+      });
+      if (fitted.trimmed) {
+        logger.info('[llm] context budgeted', { tokens: fitted.tokens, messages: fitted.messages.length });
+        options = { ...options, system: fitted.system, messages: fitted.messages };
+      }
+    } catch (e) { logger.warn('[llm] context budgeting failed; sending unbudgeted', { error: e.message }); }
+
     const env = process.env;
-    const SM = {
-      claude: env.AVA_SM_CLAUDE || 'claude-opus-4-8',
-      openai: [...new Set([env.AVA_SM_OPENAI || 'gpt-5.5', env.AVA_SM_OPENAI_FALLBACK || 'gpt-5.1'])],
-      gemini: env.AVA_SM_GEMINI || 'gemini-pro-latest',
-      deepseek: env.AVA_SM_DEEPSEEK || 'deepseek-chat',
-      grok: env.AVA_SM_GROK || 'grok-4',
-    };
+    const SM = modelConfig.canonicalModels();  // Tier 1 #8: single source of truth
     // 'local' is last: the local LM Studio model only gets used when every cloud provider is
     // unavailable (quota/credit/outage), i.e. it's a true final fallback.
     const DEFAULT_ORDER = ['claude', 'openai', 'gemini', 'deepseek', 'grok', 'groq', 'local'];
@@ -525,41 +620,56 @@ class LLMService {
     for (const provider of _order) {
       const isForced = forced && provider === forced;  // use the requested model only for the forced family
       try {
+        let r = null;
         switch (provider) {
           case 'claude':
-            return await this.createCompletionClaude({ ...options, model: isForced ? options.model : SM.claude });
+            r = await this.createCompletionClaude({ ...options, model: isForced ? options.model : SM.claude });
+            break;
           case 'openai': {
             const models = isForced && options.model ? [options.model] : SM.openai;
             let lastErr;
             for (const m of models) {
-              try { return await this.createCompletionOpenAI({ ...options, model: m }); }
+              try { r = await this.createCompletionOpenAI({ ...options, model: m }); break; }
               catch (e) { lastErr = e; }
             }
-            throw lastErr || new Error('openai failed');
+            if (!r) throw lastErr || new Error('openai failed');
+            break;
           }
           case 'gemini':
-            return await this.createCompletionGemini({ ...options, model: isForced ? options.model : SM.gemini });
+            r = await this.createCompletionGemini({ ...options, model: isForced ? options.model : SM.gemini });
+            break;
           case 'deepseek': {
-            const r = await this._openaiCompat({ baseURL: 'https://api.deepseek.com', apiKey: this.getApiKey('deepseek'), model: isForced ? options.model : SM.deepseek, system: options.system, messages: options.messages, maxTokens: options.maxTokens });
-            return { ...r, provider: 'deepseek' };
+            const d = await this._openaiCompat({ baseURL: 'https://api.deepseek.com', apiKey: this.getApiKey('deepseek'), model: isForced ? options.model : SM.deepseek, system: options.system, messages: options.messages, maxTokens: options.maxTokens, tools: options.tools });
+            r = { ...d, provider: 'deepseek' };
+            break;
           }
           case 'grok': {
-            const r = await this._openaiCompat({ baseURL: 'https://api.x.ai/v1', apiKey: this.getApiKey('grok'), model: isForced ? options.model : SM.grok, system: options.system, messages: options.messages, maxTokens: options.maxTokens });
-            return { ...r, provider: 'grok' };
+            const g = await this._openaiCompat({ baseURL: 'https://api.x.ai/v1', apiKey: this.getApiKey('grok'), model: isForced ? options.model : SM.grok, system: options.system, messages: options.messages, maxTokens: options.maxTokens, tools: options.tools });
+            r = { ...g, provider: 'grok' };
+            break;
           }
           case 'groq':
-            return await this.createCompletionGroq(options);
+            r = await this.createCompletionGroq(options);
+            break;
           case 'local': {
             const base = (env.AVA_LOCAL_LLM_URL || 'http://localhost:1234/v1').replace(/\/$/, '');
             let lm = env.AVA_LOCAL_LLM_MODEL || this._localModel || '';
             if (!lm) { try { const mr = await fetch(base + '/models', { signal: AbortSignal.timeout(2500) }); const mj = await mr.json(); lm = (mj && mj.data && mj.data[0] && mj.data[0].id) || ''; this._localModel = lm; } catch { /* endpoint down */ } }
-            const r = await Promise.race([
-              this._openaiCompat({ baseURL: base, apiKey: env.AVA_LOCAL_LLM_KEY || 'lm-studio', model: isForced ? options.model : (lm || 'local-model'), system: options.system, messages: options.messages, maxTokens: options.maxTokens }),
+            const l = await Promise.race([
+              this._openaiCompat({ baseURL: base, apiKey: env.AVA_LOCAL_LLM_KEY || 'lm-studio', model: isForced ? options.model : (lm || 'local-model'), system: options.system, messages: options.messages, maxTokens: options.maxTokens, tools: options.tools }),
               new Promise((_, rej) => setTimeout(() => rej(new Error('local llm timeout')), parseInt(env.AVA_LOCAL_LLM_TIMEOUT_MS || '90000', 10)))
             ]);
-            return { ...r, provider: 'local' };
+            r = { ...l, provider: 'local' };
+            break;
           }
         }
+        if (!r) continue;
+        // requireText (Tier 1 #8, collapsed self-mod chain): callers that need actual TEXT
+        // treat an empty completion as a failure so the chain keeps falling through.
+        if (options.requireText && !String(r.content || '').trim() && !(r.toolCalls && r.toolCalls.length)) {
+          throw new Error(`empty completion${r.model ? ` (model=${r.model}${r.finishReason ? `, finish=${r.finishReason}` : ''})` : ''}`);
+        }
+        return r;
       } catch (error) {
         if (_isQuotaError(error.message)) {
           _providerCooldown[provider] = Date.now() + _cooldownMs;
@@ -593,61 +703,18 @@ class LLMService {
       // Add memory context if available
       let systemPrompt = personaBlock ? `${personaBlock}\n\n${getSystemPrompt()}` : getSystemPrompt();
 
+      // Caller-supplied addendum (e.g. /chat's NEED_TOOLS escalation instruction).
+      if (options.extraSystem) systemPrompt += `\n\n${options.extraSystem}`;
+
       if (options.includeMemory) {
-        const persona = memoryService.generatePersona();
-        const memoryResults = await memoryService.search(userMessage, 3);
+        // Tier 1 #5: ONE retrieval path (memoryHub) — curated memory, skills, conversation
+        // logs (FTS5) and the durable store in a single search. The old inline conversation-
+        // log scanner that lived here (a regex-triggered duplicate of memory_search) is gone.
+        const persona = memoryHub.generatePersona();
+        let memoryResults = [];
+        try { memoryResults = (await memoryHub.search(userMessage, 5)).results || []; } catch { memoryResults = []; }
 
-        // Enhanced recall: Search conversation logs for patterns
-        let conversationContext = '';
-        try {
-          const isRecallQuery = /what.*file.*asking|what.*been.*asking|remember.*conversation|past.*conversation|file.*requested|what.*file.*want/i.test(userMessage);
-
-          if (isRecallQuery) {
-            // Tier 0 fix: was hardcoded to conversation-2025-09-24.jsonl (a debugging
-            // leftover), which silently dead-ended this feature for every other day.
-            const logsDir = path.join(process.cwd(), 'logs', 'conversations');
-            const dayFile = (d) => path.join(logsDir, `conversation-${d.toISOString().slice(0, 10)}.jsonl`);
-            let conversationLogPath = dayFile(new Date());
-            if (!fs.existsSync(conversationLogPath)) {
-              conversationLogPath = dayFile(new Date(Date.now() - 24 * 3600 * 1000));
-            }
-
-            if (fs.existsSync(conversationLogPath)) {
-              const logContent = fs.readFileSync(conversationLogPath, 'utf8');
-              const lines = logContent.split('\n').filter(line => line.trim());
-
-              const fileRequests = lines
-                .map(line => {
-                  try { return JSON.parse(line); } catch { return null; }
-                })
-                .filter(entry => entry && entry.direction === 'user' &&
-                  /open.*file|claude.*sessions|file.*claude|read.*file|show.*file/i.test(entry.content))
-                .slice(-10);
-
-              if (fileRequests.length > 0) {
-                conversationContext = '\nRecent file requests:\n';
-                fileRequests.forEach(req => {
-                  conversationContext += `- User asked: "${req.content}"\n`;
-                });
-
-                const requestCounts = {};
-                fileRequests.forEach(req => {
-                  if (/claude.*sessions|open.*claude.*sessions/i.test(req.content)) {
-                    requestCounts['claude sessions file'] = (requestCounts['claude sessions file'] || 0) + 1;
-                  }
-                });
-
-                if (requestCounts['claude sessions file']) {
-                  conversationContext += `\nMost frequently requested: "claude sessions file" (${requestCounts['claude sessions file']} times)\n`;
-                }
-              }
-            }
-          }
-        } catch (logError) {
-          logger.warn('Failed to analyze conversation logs', { error: logError.message });
-        }
-
-        if (persona.summary || memoryResults.length > 0 || conversationContext) {
+        if (persona.summary || memoryResults.length > 0) {
           systemPrompt += '\n\nContext:\n';
           if (persona.summary) {
             systemPrompt += `User profile: ${persona.name}. ${persona.summary}\n`;
@@ -657,9 +724,6 @@ class LLMService {
             memoryResults.forEach(item => {
               systemPrompt += `- ${item.text}\n`;
             });
-          }
-          if (conversationContext) {
-            systemPrompt += conversationContext;
           }
         }
       }
@@ -691,13 +755,13 @@ class LLMService {
 
       // Store in memory if enabled
       if (options.storeInMemory) {
-        await memoryService.upsert({
+        await memoryHub.upsert({
           role: 'user',
           text: userMessage,
           meta: { sessionId, timestamp: Date.now() }
         });
-        
-        await memoryService.upsert({
+
+        await memoryHub.upsert({
           role: 'assistant',
           text: result.content,
           meta: { sessionId, timestamp: Date.now() }

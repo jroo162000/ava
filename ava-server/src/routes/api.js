@@ -18,7 +18,8 @@ import personaSvc from '../services/persona.js';
 import environmentContext from '../services/environmentContext.js';
 import actionHistory from '../services/actionHistory.js';
 import curatedMemory from '../services/curatedMemory.js';
-import memorySearch from '../services/memorySearch.js';
+import memoryHub from '../services/memoryHub.js';  // Tier 1 #5: one memory interface
+import avaPaths from '../utils/paths.js';  // Tier 1 #8: one path resolver
 import conversationHistory from '../services/conversationHistory.js';
 import contextCompression from '../services/contextCompression.js';
 import memoryReviewer from '../services/memoryReviewer.js';
@@ -1123,6 +1124,12 @@ router.post('/respond', async (req, res) => {
     // text is already logged above).
     userText = normalizeMoltbookMentions(userText);
 
+    // Tier 1 #6: the deterministic regex "fast paths" below (camera-see, browse, download-
+    // attachment, diagnose, open/append/read/find file, remember, recall) are OFF by default —
+    // tool selection is now the model's own native function calling in the agent loop, which
+    // sees every tool's full schema. Set AVA_FAST_PATHS=1 to re-enable the old hardwired routes.
+    const FAST_PATHS = process.env.AVA_FAST_PATHS === '1';
+
     if (isSelfSnapshotRequest(userText)) {
       const snapshot = createSelfSnapshot(userText);
       const finalText = shapeSpokenReply(
@@ -1236,7 +1243,7 @@ router.post('/respond', async (req, res) => {
     // CAMERA-SEE PATH: "tell me what you see / look through the camera / start the camera
     // and describe" — run camera_ops `see` directly (turns on + captures + describes) so she
     // never asks to confirm or picks the wrong action.
-    if (looksLikeCameraSee(userText) && !diagnoseTargetTool(userText)) {
+    if (FAST_PATHS && looksLikeCameraSee(userText) && !diagnoseTargetTool(userText)) {
       logger.info('[respond] Camera-see path', { text: userText.slice(0, 60) });
       let finalText = '';
       try {
@@ -1270,7 +1277,7 @@ router.post('/respond', async (req, res) => {
       let target = nm ? nm[1].trim().replace(/[.?!,]+$/, '') : '';
       const isFolderish = /\b(folder|directory|downloads?|documents?|desktop|pictures?|photos?|music|videos?|file|files)\b/i.test(target);
       const isAutomation = /\b(fill|click|type|submit|log ?in to .+ and|scrape|download .+ from|automate)\b/i.test(navText);
-      if (target && !isFolderish && !isAutomation) {
+      if (FAST_PATHS && target && !isFolderish && !isAutomation) {
         let url;
         if (/^https?:\/\//i.test(target)) url = target;
         else if (/^[\w-]+(\.[\w-]+)+(\/\S*)?$/.test(target)) url = 'https://' + target;
@@ -1295,7 +1302,7 @@ router.post('/respond', async (req, res) => {
     // just "find" it and stop instead of completing the download).
     {
       const dlText = String(userText || '');
-      const isDl = /\b(download|save|grab|pull|get)\b/i.test(dlText)
+      const isDl = FAST_PATHS && /\b(download|save|grab|pull|get)\b/i.test(dlText)
         && /\b(gmail|e-?mail|inbox|attachment)\b/i.test(dlText);
       if (isDl) {
         const fnMatch = dlText.match(/\b(?:download|save|grab|pull|get)\s+(?:my |the |a |an )?(.+?)\s+(?:attachment\s+)?(?:from|out of|in)\b/i)
@@ -1326,7 +1333,7 @@ router.post('/respond', async (req, res) => {
     // "diagnostic" otherwise shoves these at the agent, which mis-decides and falls back. Only the
     // diagnostic-FRAMED code questions land here; plain "have you been upgraded?" / "what changed in
     // your code?" stay on the warm conversational path (the env block answers those).
-    if (looksLikeCodeDiagnostics(userText)
+    if (FAST_PATHS && looksLikeCodeDiagnostics(userText)
         && /\b(diagnos|integrity|full (diagnosis|scan)|check your (own )?code|inspect your code)\b/i.test(String(userText || ''))) {
       let finalText = '';
       try {
@@ -1357,7 +1364,7 @@ router.post('/respond', async (req, res) => {
     // diagnose_tool DIRECTLY instead of letting the model call the tool itself (which it tends
     // to do, e.g. comm_ops to "check email"). Guidance alone didn't fix this reliably.
     {
-      const diag = diagnoseTargetTool(userText);
+      const diag = FAST_PATHS ? diagnoseTargetTool(userText) : null;
       if (diag) {
         logger.info('[respond] Diagnose path', { tool: diag.tool, label: diag.label });
         let finalText = '';
@@ -1422,7 +1429,7 @@ router.post('/respond', async (req, res) => {
     // open it (open_item) deterministically, instead of letting the model over-ask. Apps and
     // URLs are excluded by openFileTarget and continue through the normal path.
     {
-      const openHint = openFileTarget(userText);
+      const openHint = FAST_PATHS ? openFileTarget(userText) : null;
       if (openHint) {
         logger.info('[respond] Open-file path', { hint: openHint });
         let resolvedPath = '';
@@ -1452,7 +1459,7 @@ router.post('/respond', async (req, res) => {
     // file (file_gen mode:append). Deterministic so she never overwrites (which erased the
     // existing content) or no-ops. Apps/URLs/non-file adds are excluded by appendTarget.
     {
-      const ap = appendTarget(userText);
+      const ap = FAST_PATHS ? appendTarget(userText) : null;
       if (ap) {
         logger.info('[respond] Append-file path', { name: ap.name });
         let okAppend = false;
@@ -1480,7 +1487,7 @@ router.post('/respond', async (req, res) => {
     // READ-FILE PATH: "read <file> / first|second line / how many lines" — resolve (fs_find)
     // then read (fs_read) and answer directly, instead of prefixing fs_find or opening it.
     {
-      const rt = readFileTarget(userText);
+      const rt = FAST_PATHS ? readFileTarget(userText) : null;
       if (rt) {
         logger.info('[respond] Read-file path', { name: rt.name, want: rt.want });
         let content = '';
@@ -1510,7 +1517,7 @@ router.post('/respond', async (req, res) => {
     // FIND-FILES PATH: "find/locate/list the <X> files" — resolve by pattern (fs_find) and
     // name them, instead of letting the model guess fs_ops vs fs_find.
     {
-      const ff = findFilesTarget(userText);
+      const ff = FAST_PATHS ? findFilesTarget(userText) : null;
       if (ff) {
         logger.info('[respond] Find-files path', { pattern: ff.pattern });
         let names = [];
@@ -1538,14 +1545,14 @@ router.post('/respond', async (req, res) => {
     // COMMITMENT: "remind me to X" / "hold me to X" -> track it for proactive follow-up.
     {
       const _cm = String(userText || '').match(/^\s*(?:ava[\s,!.]*)?(?:please\s+)?(?:remind me to|hold me to|i need to remember to|add (?:a )?(?:commitment|task)(?:\s+to)?|track (?:a )?commitment(?:\s+to)?)\s*[:,\-]?\s*(.+)$/i);
-      if (_cm && (_cm[1] || '').trim().length > 2 && !looksLikeRecall(userText)) {
+      if (FAST_PATHS && _cm && (_cm[1] || '').trim().length > 2 && !looksLikeRecall(userText)) {
         try { (await import('../services/commitments.js')).default.add(_cm[1].trim(), { who: 'user' }); } catch { /* optional */ }
         const _t = shapeSpokenReply("Got it — I'm tracking that, and I'll keep you honest on it.", req.body || {});
         try { conversationLogger.logAssistantMessage(_t, { sessionId, responseType: 'commitment' }); } catch { /* optional */ }
         return res.json({ ok: true, output_text: String(_t || '').slice(0, 20000), agent: { id: 'commit-' + Date.now(), status: 'success', steps: 1, result: _t, errors: [] } });
       }
     }
-    if (/\b(remember that|save (my|this|that)|note that i|make a note that|keep in mind that|store (this|that))\b/.test(userText.toLowerCase()) && !looksLikeRecall(userText)) {
+    if (FAST_PATHS && /\b(remember that|save (my|this|that)|note that i|make a note that|keep in mind that|store (this|that))\b/.test(userText.toLowerCase()) && !looksLikeRecall(userText)) {
       logger.info('[respond] Remember path (memory_system save)', { text: userText.slice(0, 60) });
       let ok = false;
       try {
@@ -1569,7 +1576,7 @@ router.post('/respond', async (req, res) => {
     // results. Only ask the user to narrow down if the search genuinely finds nothing.
     // Recall intent wins even if a tool keyword is present (e.g. "what did we discuss
     // about the CAMERA" is recall, not "turn on the camera").
-    if (looksLikeRecall(userText) || looksLikeFollowupStatus(userText)) {
+    if (FAST_PATHS && (looksLikeRecall(userText) || looksLikeFollowupStatus(userText))) {
       logger.info('[respond] Recall path (history + memory_search)', { text: userText.slice(0, 60) });
       // 1) Keyword matches across memory + all logs. Call via executeTool so the sandbox
       //    LEDGER records memory_search (training checks read the ledger), and so this fires
@@ -1870,276 +1877,9 @@ Don't read raw tool names, JSON, or status codes, but you MAY describe your heal
   }
 });
 
-// --- Bridge configuration ---
-const BRIDGE_HOST = process.env.BRIDGE_HOST || '127.0.0.1';
-const BRIDGE_PORT = process.env.BRIDGE_PORT || 3333;
-const BRIDGE_TOKEN = process.env.BRIDGE_TOKEN || process.env.AVA_BRIDGE_TOKEN || 'local-dev-token';
-
-// --- Call bridge /tool endpoint ---
-async function callBridgeTool(tool, args) {
-  try {
-    const url = `http://${BRIDGE_HOST}:${BRIDGE_PORT}/tool`;
-    console.log(`[bridge-call] Calling ${url} with tool=${tool}, args=`, args);
-    const r = await fetch(url, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${BRIDGE_TOKEN}`
-      },
-      body: JSON.stringify({ tool, args })
-    });
-    console.log(`[bridge-call] Response status: ${r.status}`);
-    if (r.ok) {
-      const json = await r.json();
-      console.log(`[bridge-call] Response:`, json);
-      return json;
-    }
-    console.log(`[bridge-call] Error: Bridge returned ${r.status}`);
-    return { ok: false, error: `Bridge returned ${r.status}` };
-  } catch (e) {
-    console.log(`[bridge-call] Exception:`, e.message);
-    return { ok: false, error: e.message };
-  }
-}
-
-// Track vision monitoring state
-let visionMonitoringActive = false;
-
-// --- Simple intent → tool dispatcher (inline) ---
-async function tryHandleSimpleTools(userText){
-  try {
-    const text = String(userText||'');
-    const lower = text.toLowerCase();
-
-    // Camera CLOSE/STOP intent: "close camera", "turn off camera", "stop watching"
-    if (/\bcamera\b/.test(lower) && /\b(close|off|deactivate|stop|disable|shut)\b/.test(lower)) {
-      console.log(`[vision] Stopping vision monitoring`);
-      const result = await callBridgeTool('camera_ops', { action: 'stop_monitoring' });
-      visionMonitoringActive = false;
-      if (result.ok && result.status === 'ok') {
-        return { text: 'Camera closed. I stopped watching.', tool: 'camera_ops' };
-      }
-      // Try regular close as fallback
-      await callBridgeTool('camera_ops', { action: 'close' });
-      return { text: 'Camera closed.', tool: 'camera_ops' };
-    }
-
-    // Vision memory/learning recall: "what have you learned", "what have you seen", "observations"
-    if (/\b(what have you (learned|seen|observed)|what did you (learn|see|observe)|your observations|learned from (watching|seeing|the camera)|seen (so far|already|through))\b/.test(lower)) {
-      console.log(`[vision] User asking about learned observations`);
-      const obsResult = await callBridgeTool('camera_ops', { action: 'get_observations', count: 20 });
-
-      if (obsResult.ok && obsResult.status === 'ok') {
-        const summary = obsResult.data?.summary || obsResult.summary || '';
-        const observations = obsResult.data?.observations || obsResult.observations || [];
-
-        if (observations.length > 0 || summary) {
-          // Build a response from observations
-          let response = summary || '';
-
-          // Add recent AI observations if available
-          const aiObs = observations.filter(o => o.type === 'ai_analysis');
-          if (aiObs.length > 0) {
-            const recentDescriptions = aiObs.slice(-3).map(o => o.description).filter(Boolean);
-            if (recentDescriptions.length > 0) {
-              response += ' Recent observations: ' + recentDescriptions.join(' ');
-            }
-          }
-
-          if (response.trim()) {
-            return { text: response.trim(), tool: 'camera_ops' };
-          }
-        }
-        return { text: "I've been watching but haven't recorded any notable observations yet. Keep the camera active and ask me what I see to build up my memory.", tool: 'camera_ops' };
-      }
-      return { text: "I don't have any stored observations right now. Activate the camera and ask me what I see to start building my visual memory.", tool: 'camera_ops' };
-    }
-
-    // Vision analysis intent: "what do you see", "describe what you see", "tell me what you see"
-    if (/\b(what do you see|what can you see|describe what|tell me what you see|explain what you see|what are you seeing|what's happening)\b/.test(lower)) {
-      console.log(`[vision] User asking what I see, monitoring active: ${visionMonitoringActive}`);
-
-      // Get current frame from monitor (if active) or capture one
-      let framePath = null;
-
-      if (visionMonitoringActive) {
-        // Get current frame from continuous monitor
-        const frameResult = await callBridgeTool('camera_ops', { action: 'get_current_frame' });
-        if (frameResult.ok && frameResult.status === 'ok') {
-          framePath = frameResult.data?.frame_path || frameResult.frame_path;
-          console.log(`[vision] Got current frame from monitor: ${framePath}`);
-        }
-      }
-
-      // If no frame from monitor, capture one
-      if (!framePath) {
-        const tempDir = process.env.TEMP || process.env.TMP || os.tmpdir();
-        const savePath = path.join(tempDir, `ava_capture_${Date.now()}.png`);
-        const captureResult = await callBridgeTool('camera_ops', { action: 'capture', save_path: savePath });
-        if (captureResult.ok && captureResult.status === 'ok') {
-          framePath = captureResult.data?.file_path || savePath;
-        }
-      }
-
-      if (framePath) {
-        console.log(`[vision] Analyzing frame: ${framePath}`);
-        const visionResult = await callBridgeTool('vision_ops', {
-          action: 'describe_image',
-          image_path: framePath,
-          question: 'Describe what you see in this image in detail. Include people, objects, actions, and any notable details.'
-        });
-
-        if (visionResult.ok && visionResult.status === 'ok') {
-          const desc = visionResult.data?.description || visionResult.data?.analysis || visionResult.message || '';
-
-          // Store this observation in the monitor
-          if (visionMonitoringActive) {
-            await callBridgeTool('camera_ops', { action: 'add_observation', description: desc });
-          }
-
-          return { text: desc, tool: 'vision_ops' };
-        }
-        return { text: `I'm having trouble analyzing what I see: ${visionResult.message || 'unknown error'}`, tool: 'vision_ops' };
-      }
-
-      return { text: 'I need to activate my camera first. Say "activate the camera" so I can see.', tool: 'none' };
-    }
-
-    // Camera ACTIVATE intent: "activate camera", "turn on camera", "start watching"
-    if (/\bcamera\b/.test(lower) && /\b(activate|turn on|enable|start|open)\b/.test(lower) && !/\b(close|off|deactivate|stop|disable|shut)\b/.test(lower)) {
-      console.log(`[vision] Starting continuous vision monitoring`);
-
-      const result = await callBridgeTool('camera_ops', { action: 'start_monitoring', camera_index: 0 });
-
-      if (result.ok && result.status === 'ok') {
-        visionMonitoringActive = true;
-        return { text: 'Camera activated. I can see now. Ask me what I see whenever you want.', tool: 'camera_ops' };
-      }
-      return { text: 'I tried to activate the camera but something went wrong: ' + (result.message || result.error || 'unknown error'), tool: 'camera_ops' };
-    }
-
-    // Take a picture (explicit capture without analysis)
-    if (/\b(take|capture|snap)\b/.test(lower) && /\b(picture|photo|image|shot)\b/.test(lower)) {
-      const tempDir = process.env.TEMP || process.env.TMP || os.tmpdir();
-      const savePath = path.join(tempDir, `ava_capture_${Date.now()}.png`);
-      console.log(`[camera] Taking picture: ${savePath}`);
-
-      const result = await callBridgeTool('camera_ops', { action: 'capture', save_path: savePath });
-      if (result.ok && result.status === 'ok') {
-        return { text: `Photo taken and saved. (${result.data?.dimensions || ''})`, tool: 'camera_ops' };
-      }
-      return { text: 'I tried to take a photo but something went wrong: ' + (result.message || result.error || 'unknown error'), tool: 'camera_ops' };
-    }
-
-    // Screenshot intent
-    if (/\b(screenshot|screen shot|capture screen|grab screen)\b/.test(lower)) {
-      const savePath = path.join(os.homedir(), 'Desktop', `ava_screenshot_${Date.now()}.png`);
-      const result = await callBridgeTool('screen_ops', { action: 'screenshot', output_path: savePath });
-      if (result.ok && result.status === 'ok') {
-        return { text: `Screenshot saved to ${savePath}.`, tool: 'screen_ops' };
-      }
-      return { text: 'I tried to take a screenshot but something went wrong.' };
-    }
-
-    // Volume control
-    if (/\b(volume|sound)\b/.test(lower)) {
-      if (/\b(up|increase|louder|raise)\b/.test(lower)) {
-        const result = await callBridgeTool('audio_ops', { action: 'increase', amount: 10 });
-        return { text: result.ok ? 'Volume increased.' : 'Failed to change volume.', tool: 'audio_ops' };
-      }
-      if (/\b(down|decrease|quieter|lower)\b/.test(lower)) {
-        const result = await callBridgeTool('audio_ops', { action: 'decrease', amount: 10 });
-        return { text: result.ok ? 'Volume decreased.' : 'Failed to change volume.', tool: 'audio_ops' };
-      }
-      if (/\b(mute)\b/.test(lower)) {
-        const result = await callBridgeTool('audio_ops', { action: 'mute' });
-        return { text: result.ok ? 'Muted.' : 'Failed to mute.', tool: 'audio_ops' };
-      }
-      if (/\b(unmute)\b/.test(lower)) {
-        const result = await callBridgeTool('audio_ops', { action: 'unmute' });
-        return { text: result.ok ? 'Unmuted.' : 'Failed to unmute.', tool: 'audio_ops' };
-      }
-    }
-
-    // Window operations
-    if (/\b(list|show)\s+(windows?|apps?)\b/.test(lower)) {
-      const result = await callBridgeTool('window_ops', { action: 'list' });
-      if (result.ok && result.data?.windows) {
-        const wins = result.data.windows.slice(0, 5).map(w => w.title || w.name).join(', ');
-        return { text: `Open windows: ${wins}`, tool: 'window_ops' };
-      }
-      return { text: 'Could not list windows.' };
-    }
-
-    // Focus window
-    if (/\b(focus|switch to|open)\b/.test(lower) && /\b(window|app)\b/.test(lower)) {
-      const appMatch = text.match(/(?:focus|switch to|open)\s+(?:the\s+)?(\w+)/i);
-      const app = appMatch?.[1] || '';
-      if (app) {
-        const result = await callBridgeTool('window_ops', { action: 'focus', window_title: app });
-        return { text: result.ok ? `Focused ${app}.` : `Could not focus ${app}.`, tool: 'window_ops' };
-      }
-    }
-
-    // Smart home / lights
-    if (/\b(turn|switch)\s+(on|off)\b/.test(lower) && /\b(light|lights|lamp)\b/.test(lower)) {
-      const action = /\bon\b/.test(lower) ? 'turn_on' : 'turn_off';
-      const roomMatch = text.match(/\bin\s+(?:the\s+)?(\w+)/i);
-      const room = roomMatch?.[1] || '';
-      const result = await callBridgeTool('iot_ops', { action, room });
-      return { text: result.ok ? `Lights ${action.replace('_', ' ')}.` : 'Could not control lights.', tool: 'iot_ops' };
-    }
-
-    // System info
-    if (/\b(system|computer|device)\s*(info|status|information)\b/.test(lower)) {
-      const result = await callBridgeTool('sys_ops', { action: 'get_info' });
-      if (result.ok) {
-        const cpu = result.data?.cpu_percent || 'unknown';
-        const mem = result.data?.memory_percent || 'unknown';
-        return { text: `System status: CPU ${cpu}%, Memory ${mem}%.`, tool: 'sys_ops' };
-      }
-      return { text: 'Could not get system info.' };
-    }
-
-    // Calendar - list events
-    if (/\b(calendar|schedule|events?)\b/.test(lower) && /\b(today|tomorrow|list|show|what)\b/.test(lower)) {
-      const result = await callBridgeTool('calendar_ops', { action: 'get_today' });
-      if (result.ok && result.data?.events) {
-        const events = result.data.events;
-        if (events.length === 0) {
-          return { text: 'No events on your calendar today.', tool: 'calendar_ops' };
-        }
-        const summary = events.slice(0, 3).map(e => e.summary || e.title).join(', ');
-        return { text: `Today's events: ${summary}`, tool: 'calendar_ops' };
-      }
-      return { text: result.message || 'Could not check calendar.' };
-    }
-
-    // Create file intent: "create/make a file ... named X ... that says Y"
-    if (/\b(create|make)\b.*\bfile\b/.test(lower)){
-      const nameMatch = text.match(/named\s+([\w\-. ]+?)(?:\s+that|\s+with|\s+containing|\s+which|$)/i);
-      const contentMatch = text.match(/(?:that|with|containing)\s+(?:says|say|text\s+of|content|the\s+text)\s+(.+)$/i);
-      const filename = (nameMatch?.[1]||'').trim();
-      const content = (contentMatch?.[1]||'').trim() || text;
-      let dir = 'documents';
-      if (lower.includes('download')) dir = 'downloads';
-      const body = { format: 'txt', filename: filename || '', content, dir };
-      const url = `http://${config.HOST}:${config.PORT}/tools/file_gen`;
-      const r = await fetch(url, { method:'POST', headers:{ 'Content-Type':'application/json' }, body: JSON.stringify(body) }).catch(()=>null);
-      if (r && r.ok){
-        const j = await r.json().catch(()=>null);
-        if (j?.ok){
-          const p = j.path?.replace(/\\/g,'/')||'';
-          return { text: `I created the file ${p}.`, path: j.path };
-        }
-      }
-      return { text: 'I tried to create the file but something went wrong.' };
-    }
-  } catch (e) {
-    logger.warn('tryHandleSimpleTools failed', { error: e.message });
-  }
-  return null;
-}
+// Tier 1 #6: deleted the unused bridge caller (callBridgeTool) and the inline regex
+// "simple tools" dispatcher (tryHandleSimpleTools) — it was DEAD CODE (never invoked),
+// and tool selection is now the model's own native function calling (agentLoop).
 
 // Resolve user directories safely
 function userPath(which){
@@ -2458,7 +2198,7 @@ router.post('/train/suggest_task', async (req, res) => {
 });
 
 // ===================== Trainer dashboard (control panel) =====================
-function _intDir() { return process.env.AVA_INTEGRATION_DIR || path.join(os.homedir(), 'ava', 'ava-integration'); }
+function _intDir() { return avaPaths.integrationDir(); }  // Tier 1 #8: one path resolver
 function _helpDir() { return path.join(_intDir(), 'ava_session_helpers'); }
 function _trainDir() { return path.join(_intDir(), 'training'); }
 function _readText(p, max = 20000) { try { const t = fs.readFileSync(p, 'utf8'); return t.length > max ? t.slice(-max) : t; } catch { return ''; } }
@@ -2700,140 +2440,9 @@ router.get('/files/download', (req, res) => {
   }
 })
 
-// Intelligent file search function
-async function handleIntelligentFileSearch(message) {
-  try {
-    // Extract keywords from the message
-    const searchKeywords = [];
-    const words = message.toLowerCase().replace(',', ' ').replace('.', ' ').split(' ');
-    for (const word of words) {
-      const cleanWord = word.replace(/[.,!?]/g, '');
-      if (cleanWord.length > 2 && !['read', 'show', 'display', 'open', 'file', 'the', 'my', 'and', 'can', 'you', 'please'].includes(cleanWord)) {
-        searchKeywords.push(cleanWord);
-      }
-    }
-
-    logger.info('File search initiated', { keywords: searchKeywords });
-
-    // Enhanced search for specific files like "claude sessions" or contextual references
-    if (/claude.*sessions|sessions.*claude|open.*claude.*sessions|open\s+the\s+claude\s+sessions|open\s+that\s+file|open\s+it|please\s+open|open.*please|open\s+the\s+file.*asked|open\s+the\s+file.*just/i.test(message)) {
-      // If it's a contextual reference, default to "claude sessions" based on conversation history
-      const isContextualReference = /open\s+that\s+file|open\s+it|please\s+open|open.*please|open\s+the\s+file.*asked|open\s+the\s+file.*just/i.test(message);
-      const searchPattern = isContextualReference ? /claude.*sessions|sessions.*claude/i : /claude.*sessions|sessions.*claude/i;
-      // Direct search for claude sessions file
-      const searchPaths = [
-        'C:\\Users\\USER 1\\',
-        'C:\\Users\\USER 1\\Downloads\\',
-        'C:\\Users\\USER 1\\Documents\\',
-        'C:\\Users\\USER 1\\Desktop\\',
-        'C:\\Users\\USER 1\\OneDrive\\',
-        'C:\\Users\\USER 1\\AppData\\Local\\',
-        'C:\\Users\\USER 1\\.cache\\',
-        'C:\\Users\\USER 1\\.config\\'
-      ];
-
-      for (const searchPath of searchPaths) {
-        try {
-          if (fs.existsSync(searchPath)) {
-            const files = fs.readdirSync(searchPath);
-            for (const file of files) {
-              const fileLower = file.toLowerCase();
-              // For contextual references, search for claude sessions specifically
-              const shouldMatch = isContextualReference ?
-                /claude.*sessions|sessions.*claude/i.test(file) :
-                /claude.*sessions|sessions.*claude/i.test(file);
-
-              if (shouldMatch) {
-                const fullPath = path.join(searchPath, file);
-                logger.info('Found claude sessions file', { path: fullPath });
-
-                // Try to open the file
-                try {
-                  execSync(`start "" "${fullPath}"`, { shell: true, timeout: 5000 });
-
-                  return {
-                    success: true,
-                    response: `Found and opened "${file}" from ${searchPath}`,
-                    filePath: fullPath
-                  };
-                } catch (openError) {
-                  logger.error('Failed to open claude sessions file', { error: openError.message });
-                  return {
-                    success: true,
-                    response: `Found "${file}" at ${fullPath} but couldn't open it: ${openError.message}`,
-                    filePath: fullPath
-                  };
-                }
-              }
-            }
-          }
-        } catch (dirError) {
-          logger.warn('Directory search failed', { path: searchPath, error: dirError.message });
-        }
-      }
-
-      // If not found, return helpful message
-      return {
-        success: true,
-        response: `I searched for "claude sessions" file in your common directories but couldn't find it. The file might be in a different location or have a different name. Can you provide the full path or check if it exists?`,
-        filePath: null
-      };
-    }
-
-    // Original search logic for other files
-    const searchPaths = [
-      'C:\\Users\\USER 1\\',
-      'C:\\Users\\USER 1\\Downloads\\',
-      'C:\\Users\\USER 1\\Documents\\',
-      'C:\\Users\\USER 1\\Desktop\\',
-      'C:\\Users\\USER 1\\OneDrive\\'
-    ];
-
-    const foundFiles = [];
-    for (const searchPath of searchPaths) {
-      try {
-        if (fs.existsSync(searchPath)) {
-          const files = fs.readdirSync(searchPath);
-          for (const file of files) {
-            const fileLower = file.toLowerCase();
-            if (searchKeywords.some(keyword => fileLower.includes(keyword))) {
-              foundFiles.push(path.join(searchPath, file));
-            }
-          }
-        }
-      } catch (err) {
-        logger.warn('Search path inaccessible', { path: searchPath, error: err.message });
-      }
-    }
-
-    if (foundFiles.length === 0) {
-      logger.info('No files found matching keywords');
-      return { success: false, error: 'No matching files found' };
-    }
-
-    // Use the first matching file
-    const targetFile = foundFiles[0];
-    logger.info('File found', { file: targetFile });
-
-    try {
-      const fileContent = fs.readFileSync(targetFile, 'utf8');
-      const fileName = path.basename(targetFile);
-      
-      return {
-        success: true,
-        filePath: targetFile,
-        response: `📄 **${fileName}**\n\n${fileContent}`
-      };
-    } catch (readError) {
-      logger.error('Failed to read file', { file: targetFile, error: readError.message });
-      return { success: false, error: `Could not read file: ${readError.message}` };
-    }
-
-  } catch (error) {
-    logger.error('File search error', { error: error.message });
-    return { success: false, error: error.message };
-  }
-}
+// Tier 1 #6/#8: deleted handleIntelligentFileSearch — a regex file-search path with
+// hardcoded "C:\Users\USER 1\" directories from another machine; file requests now go
+// through the agent loop (fs_find/fs_read/open_item chosen natively by the model).
 
 // Health check
 router.get('/health', (_req, res) => {
@@ -2983,551 +2592,65 @@ router.post('/chat', async (req, res) => {
     // Repair STT/typo mishears of "Moltbook" before routing (original is logged above).
     text = normalizeMoltbookMentions(text);
 
-    // DIRECT OPENAI INTEGRATION - No external tool dependencies
     const startTime = Date.now();
 
-    // Handle simple direct queries
-    const lower = text.toLowerCase();
-
-    // Early recall: answer "what did we last talk about" from recent session logs
-    if (/(what did we (last )?(talk|speak) about|what did we discuss( last time)?)/i.test(lower)){
-      try {
-        const recent = conversationLogger.getRecentHistory(50)
-        const bySess = recent.filter(e=>String(e?.metadata?.sessionId||'default') === String(sessionId))
-        // Find last user message and/or assistant reply
-        const lastUser = [...bySess].reverse().find(e=>e.direction==='user')
-        const lastAssistant = [...bySess].reverse().find(e=>e.direction==='assistant')
-        let responseText = ''
-        if (lastUser) responseText = `Your last request was: "${lastUser.content}".`
-        if (lastAssistant) responseText += (responseText?' ':'') + `I replied: "${lastAssistant.content.replace(/\s+/g,' ').slice(0,200)}"`
-        if (!responseText) responseText = 'I do not have recent messages in this session yet.'
-        responseText = sanitizeChatText(responseText)
-        conversationLogger.logAssistantMessage(responseText, { sessionId, responseTime: Date.now() - startTime, userMessageId, responseType: 'recall' })
-        return res.json({ ok:true, text: responseText, sessionId })
-      } catch {}
-    }
-
-    // Early intent: deterministic document creation (ensures verified writes and clear diagnostics)
-    if (/(create|generate|make|write).*\b(pdf|docx|xlsx|pptx|rtf|txt|md|csv|json|html)\b/.test(lower)) {
-      try {
-        if (!config.ALLOW_WRITE) {
-          const msg = 'Writes are disabled (ALLOW_WRITE=0). Enable writes to create files.';
-          conversationLogger.logAssistantMessage(msg, { sessionId, responseTime: Date.now() - startTime, userMessageId, responseType: 'filegen_preview' });
-          return res.json({ ok: false, text: msg, sessionId });
-        }
-
-        // Parse format and content
-        const fmtMatch = lower.match(/\b(pdf|docx|xlsx|pptx|rtf|txt|md|csv|json|html)\b/);
-        const fmt = (fmtMatch ? fmtMatch[1] : 'txt').toLowerCase();
-        const dir = /documents?/.test(lower) ? 'documents' : 'downloads';
-        // Use a simple heuristic for "random" content
-        const content = /random/.test(lower) ? `Random message ${Math.random().toString(36).slice(2,8)} from AVA.` : (text || 'Generated by AVA.');
-        // Delegate to deterministic endpoint via local HTTP to reuse full logic (Edge/Office/minimal PDF)
-        const resp = await fetch(`http://127.0.0.1:${config.PORT}/tools/file_gen`, {
-          method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ format: fmt, content, dir })
-        })
-        const result = await resp.json().catch(()=>null)
-        if (!resp.ok || !result?.ok){
-          const errText = `I tried to create ${fmt.toUpperCase()} but could not verify the file on disk. Try enabling Office or Edge for richer formats, or use TXT/MD.`;
-          conversationLogger.logAssistantMessage(errText, { sessionId, responseTime: Date.now() - startTime, userMessageId, responseType: 'filegen_error' });
-          return res.status(400).json({ ok:false, text: errText, sessionId });
-        }
-
-        let responseText = `Created ${fmt.toUpperCase()}: ${result.path}`;
-        responseText = sanitizeChatText(responseText)
-        conversationLogger.logAssistantMessage(responseText, { sessionId, responseTime: Date.now() - startTime, userMessageId, responseType: 'filegen_success' });
-        return res.json({ ok:true, text: responseText, sessionId });
-      } catch (e) {
-        const errText = `File creation error: ${e.message}`;
-        conversationLogger.logAssistantMessage(errText, { sessionId, responseTime: Date.now() - startTime, userMessageId, responseType: 'filegen_error' });
-        return res.status(500).json({ ok:false, text: errText, sessionId });
-      }
-    }
-
-    // Handle time queries directly
-    if (/what time|current time|time is it|what's the time/.test(lower)) {
-      const now = new Date();
-      const timeString = now.toLocaleString();
-      const responseText = `The current time is ${timeString}`;
-
-      conversationLogger.logAssistantMessage(responseText, {
-        sessionId,
-        responseTime: Date.now() - startTime,
-        userMessageId,
-        responseType: 'direct_response'
-      });
-
-      return res.json({
-        ok: true,
-        text: responseText,
-        sessionId
-      });
-    }
-
-    // Handle date queries directly
-    if (/what date|today's date|what day|current date/.test(lower)) {
-      const now = new Date();
-      const dateString = now.toLocaleDateString('en-US', {
-        weekday: 'long',
-        year: 'numeric',
-        month: 'long',
-        day: 'numeric'
-      });
-      let responseText = `Today is ${dateString}`;
-      responseText = sanitizeChatText(responseText)
-
-      conversationLogger.logAssistantMessage(responseText, {
-        sessionId,
-        responseTime: Date.now() - startTime,
-        userMessageId,
-        responseType: 'direct_response'
-      });
-
-      return res.json({
-        ok: true,
-        text: responseText,
-        sessionId
-      });
-    }
-
-    // Handle Moltbook queries — only when it's an actual Moltbook COMMAND/data request, not just a
-    // passing mention. "what's on moltbook", "check my moltbook feed", "what have you learned on
-    // moltbook" → handled here; "I was thinking about moltbook", "does moltbook matter for this" →
-    // fall through to her normal brain (which has Moltbook context) so she answers in-character.
-    const _mentionsMoltbook = /\bmoltbook\b/i.test(lower);
-    const _moltbookCommand = _mentionsMoltbook && /\b(post|posts|posted|posting|comment|reply|replies|feed|search|find|status|karma|notif\w*|follower|publish|check|browse|open|learn|learned|learning|insight|account|profile|sign\s?in|log\s?in|latest|happening|what'?s on|whats on|my posts?)\b/i.test(lower);
-    if (_moltbookCommand) {
-      try {
-        let responseText = '';
-        const status = await moltbookService.getStatus();
-
-        // Search Moltbook
-        if (/search|find|look.*for|tips.*about|how.*do/i.test(lower)) {
-          const queryMatch = lower.match(/(?:search|find|look for|tips about|how do.*?)[\s:]+(.+)/i);
-          const query = queryMatch ? queryMatch[1].trim() : text;
-          const results = await moltbookService.search(query, 5);
-          if (results.length > 0) {
-            responseText = `I searched Moltbook for "${query}" and found ${results.length} results:\n\n`;
-            results.slice(0, 3).forEach((r, i) => {
-              responseText += `${i + 1}. "${r.title}" by ${r.author?.name || 'unknown'} in m/${r.submolt?.name || 'general'}\n`;
-              if (r.content) responseText += `   ${r.content.slice(0, 150)}...\n\n`;
-            });
-          } else {
-            responseText = `I searched Moltbook for "${query}" but didn't find any matching posts.`;
-          }
-        }
-        // Check feed
-        else if (/feed|happening|what.*posting|latest|new.*posts/i.test(lower)) {
-          const posts = await moltbookService.getFeed(5, 'hot');
-          if (posts.length > 0) {
-            responseText = `Here's what's happening on Moltbook:\n\n`;
-            posts.slice(0, 3).forEach((p, i) => {
-              responseText += `${i + 1}. "${p.title}" by ${p.author?.name || 'unknown'} (${p.upvotes || 0} upvotes)\n`;
-            });
-          } else {
-            responseText = `I couldn't fetch the Moltbook feed right now.`;
-          }
-        }
-        // What I've learned
-        else if (/learned|learning|insights|know.*from/i.test(lower)) {
-          const learnings = moltbookService.getRecentLearnings(5);
-          const summary = moltbookService.getLearningsSummary();
-          if (typeof summary === 'object' && summary.totalLearnings > 0) {
-            responseText = `I've collected ${summary.totalLearnings} insights from other agents on Moltbook.\n\n`;
-            responseText += `Recent topics: ${summary.recentTopics?.join(', ') || 'various'}\n`;
-            responseText += `Top communities: ${summary.topCommunities?.join(', ') || 'general'}\n\n`;
-            if (learnings.length > 0) {
-              responseText += `Recent learnings:\n`;
-              learnings.slice(0, 3).forEach((l, i) => {
-                responseText += `${i + 1}. "${l.title}" from ${l.author}\n`;
-              });
-            }
-          } else {
-            responseText = `I'm registered on Moltbook as "${status.agentName}" and subscribed to learning communities, but I haven't collected many insights yet. Let me check the feed to learn more.`;
-          }
-        }
-        // General Moltbook status
-        else {
-          responseText = `I'm "${status.agentName}" on Moltbook, a social network for AI agents. `;
-          responseText += status.claimed ? `I'm verified and active. ` : `I'm pending verification. `;
-          const summary = moltbookService.getLearningsSummary();
-          if (typeof summary === 'object' && summary.totalLearnings > 0) {
-            responseText += `I've learned ${summary.totalLearnings} things from other agents so far.`;
-          } else {
-            responseText += `I'm learning from other agents about self-improvement, troubleshooting, and becoming a better assistant.`;
-          }
-        }
-
-        if (responseText) {
-          conversationLogger.logAssistantMessage(responseText, { sessionId, responseTime: Date.now() - startTime, userMessageId, responseType: 'moltbook' });
-          return res.json({ ok: true, text: responseText, sessionId });
-        }
-      } catch (e) {
-        logger.warn('[chat] Moltbook query failed, falling through to LLM', { error: e.message });
-      }
-    }
-
-    // Handle creative writing requests directly using LLM
-    if (/write.*poem|create.*poem|compose.*poem|write.*story|creative|generate.*text|haiku|write.*haiku|create.*haiku/.test(lower)) {
-      try {
-        const llmResponse = await llmService.createCompletion({
-          messages: [{ role: 'user', content: text }],
-          system: 'You are a helpful creative writing assistant. Write the requested content directly without preamble.',
-          temperature: 0.9
-        });
-
-        conversationLogger.logAssistantMessage(llmResponse.content, {
-          sessionId,
-          responseTime: Date.now() - startTime,
-          userMessageId,
-          responseType: 'creative_direct'
-        });
-
-        return res.json({
-          ok: true,
-          text: llmResponse.content,
-          sessionId
-        });
-      } catch (error) {
-        logger.error('Creative writing failed', { error: error.message });
-      }
-    }
-
-    // Handle file operation requests
-    if (/\b(list|show)\b[\s\S]{0,15}\bfiles?\b|\bdirectory (content|listing)\b|\bls\b|\bdir\b|\bfiles in (this|the|current|that|my)\b/i.test(text)) {
-      try {
-        const files = fs.readdirSync(process.cwd());
-        const fileList = files.map(file => {
-          const stats = fs.statSync(path.join(process.cwd(), file));
-          const type = stats.isDirectory() ? 'DIR ' : 'FILE';
-          const size = stats.isFile() ? ` (${stats.size} bytes)` : '';
-          return `${type}: ${file}${size}`;
-        }).join('\n');
-
-        let responseText = `Files in current directory (${process.cwd()}):\n\n${fileList}`;
-        responseText = sanitizeChatText(responseText)
-
-        conversationLogger.logAssistantMessage(responseText, {
-          sessionId,
-          responseTime: Date.now() - startTime,
-          userMessageId,
-          responseType: 'file_direct'
-        });
-
-        return res.json({
-          ok: true,
-          text: responseText,
-          sessionId
-        });
-      } catch (error) {
-        const responseText = `I couldn't list the files. Error: ${error.message}`;
-
-        conversationLogger.logAssistantMessage(responseText, {
-          sessionId,
-          responseTime: Date.now() - startTime,
-          userMessageId,
-          responseType: 'file_error'
-        });
-
-        return res.json({
-          ok: true,
-          text: responseText,
-          sessionId
-        });
-      }
-    }
-
-    // Handle file reading requests
-    if (/read.*file|show.*content|cat\s|open.*file/i.test(text)) {
-      try {
-        // Extract filename from request
-        const fileMatch = text.match(/(?:read|show|cat|open)\s+(?:file\s+)?['"]*([^\s'"]+)['"]*|['"]*([^\s'"]+\.(txt|js|json|md|py|html|css))['"]/i);
-        if (!fileMatch) {
-          return res.json({
-            ok: true,
-            text: "Please specify a filename to read (e.g., 'read package.json')",
-            sessionId
-          });
-        }
-
-        const filename = fileMatch[1] || fileMatch[2];
-        const filepath = path.join(process.cwd(), filename);
-
-        if (!fs.existsSync(filepath)) {
-          return res.json({
-            ok: true,
-            text: `File '${filename}' not found in current directory.`,
-            sessionId
-          });
-        }
-
-        const content = fs.readFileSync(filepath, 'utf8');
-        const responseText = `Content of ${filename}:\n\n\`\`\`\n${content.substring(0, 2000)}${content.length > 2000 ? '\n... (truncated)' : ''}\n\`\`\``;
-
-        conversationLogger.logAssistantMessage(responseText, {
-          sessionId,
-          responseTime: Date.now() - startTime,
-          userMessageId,
-          responseType: 'file_read'
-        });
-
-        return res.json({
-          ok: true,
-          text: responseText,
-          sessionId
-        });
-      } catch (error) {
-        const responseText = `I couldn't read the file. Error: ${error.message}`;
-
-        conversationLogger.logAssistantMessage(responseText, {
-          sessionId,
-          responseTime: Date.now() - startTime,
-          userMessageId,
-          responseType: 'file_error'
-        });
-
-        return res.json({
-          ok: true,
-          text: responseText,
-          sessionId
-        });
-      }
-    }
-
-    // Handle memory/learning requests
-    if (/remember|memory|learn|store|recall/.test(lower)) {
-      try {
-        if (/remember/.test(lower)) {
-          // Store the information
-          const memoryText = text.replace(/remember\s+(that\s+)?/i, '');
-          await memoryService.upsert({
-            role: 'user',
-            text: memoryText,
-            meta: { sessionId, timestamp: Date.now(), type: 'memory_storage' }
-          });
-
-          const responseText = `I'll remember that: ${memoryText}`;
-
-          conversationLogger.logAssistantMessage(responseText, {
-            sessionId,
-            responseTime: Date.now() - startTime,
-            userMessageId,
-            responseType: 'memory_store'
-          });
-
-          return res.json({
-            ok: true,
-            text: responseText,
-            sessionId
-          });
-        }
-      } catch (error) {
-        logger.error('Memory operation failed', { error: error.message });
-      }
-    }
-
-    // Handle file writing/creation requests
-    if (/create.*file|write.*file|save.*file|make.*file/.test(lower)) {
-      try {
-        // Extract filename and content from request
-        const fileMatch = text.match(/(?:create|write|save|make)\s+(?:file\s+)?([^\s]+)\s+(?:with\s+)?(?:content\s+)?['"]*(.+?)['"]*$/i);
-        if (!fileMatch) {
-          return res.json({
-            ok: true,
-            text: "Please specify both filename and content (e.g., 'create file test.txt with content hello world')",
-            sessionId
-          });
-        }
-
-        const filename = fileMatch[1];
-        const content = fileMatch[2];
-        const filepath = path.join(process.cwd(), filename);
-
-        fs.writeFileSync(filepath, content, 'utf8');
-        const responseText = `File '${filename}' created successfully with content: "${content}"`;
-
-        conversationLogger.logAssistantMessage(responseText, {
-          sessionId,
-          responseTime: Date.now() - startTime,
-          userMessageId,
-          responseType: 'file_write'
-        });
-
-        return res.json({
-          ok: true,
-          text: responseText,
-          sessionId
-        });
-      } catch (error) {
-        const responseText = `I couldn't create the file. Error: ${error.message}`;
-
-        conversationLogger.logAssistantMessage(responseText, {
-          sessionId,
-          responseTime: Date.now() - startTime,
-          userMessageId,
-          responseType: 'file_error'
-        });
-
-        return res.json({
-          ok: true,
-          text: responseText,
-          sessionId
-        });
-      }
-    }
-
-    // Handle web automation requests directly
-    if (/navigate to|go to|open website|click.*on|type.*into|fill.*form|search.*for/i.test(text)) {
-      try {
-        const CMPUSE_API_URL = process.env.CMPUSE_API_URL || 'http://127.0.0.1:8001';
-
-        let webAction = {};
-
-        // Parse navigation requests
-        if (/navigate to|go to|open website/i.test(text)) {
-          const urlMatch = text.match(/(?:navigate to|go to|open website)\s+(.+)/i);
-          if (urlMatch) {
-            let url = urlMatch[1].trim();
-            if (!url.startsWith('http')) {
-              url = 'https://' + url;
-            }
-            webAction = { action: 'navigate', url };
-          }
-        }
-
-        // Parse click requests
-        else if (/click.*on/i.test(text)) {
-          const clickMatch = text.match(/click.*on\s+(.+)/i);
-          if (clickMatch) {
-            const selector = clickMatch[1].trim();
-            webAction = { action: 'click', selector };
-          }
-        }
-
-        // Parse type/input requests
-        else if (/type.*into|fill.*form/i.test(text)) {
-          const typeMatch = text.match(/(?:type|fill)\s+['"]*([^'"]+)['"]*\s+into\s+(.+)/i);
-          if (typeMatch) {
-            const textToType = typeMatch[1];
-            const selector = typeMatch[2];
-            webAction = { action: 'type', text: textToType, selector };
-          }
-        }
-
-        // Parse search requests
-        else if (/search.*for/i.test(text)) {
-          const searchMatch = text.match(/search.*for\s+['"]*([^'"]+)['"]*/i);
-          if (searchMatch) {
-            const searchText = searchMatch[1];
-            webAction = { action: 'search', text: searchText };
-          }
-        }
-
-        if (Object.keys(webAction).length > 0) {
-          const response = await fetch(`${CMPUSE_API_URL.replace(/\/$/, '')}/run?force=true`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ tool: 'web_automation', args: webAction })
-          });
-
-          if (response.ok) {
-            const cmpResult = await response.json();
-            const result = cmpResult[0] || {};
-
-            let responseText = '';
-            if (result.status === 'ok') {
-              if (webAction.action === 'navigate') {
-                responseText = `Successfully navigated to ${webAction.url}. Page title: ${result.title || 'Unknown'}`;
-              } else if (webAction.action === 'click') {
-                responseText = `Successfully clicked on element: ${webAction.selector}`;
-              } else if (webAction.action === 'type') {
-                responseText = `Successfully typed "${webAction.text}" into ${webAction.selector}`;
-              } else if (webAction.action === 'search') {
-                responseText = `Successfully searched for "${webAction.text}"`;
-              } else {
-                responseText = `Web automation completed: ${result.message}`;
-              }
-            } else {
-              responseText = `Web automation failed: ${result.message}`;
-            }
-
-            conversationLogger.logAssistantMessage(responseText, {
-              sessionId,
-              responseTime: Date.now() - startTime,
-              userMessageId,
-              responseType: 'web_automation'
-            });
-
-            return res.json({
-              ok: true,
-              text: responseText,
-              sessionId
-            });
-          }
-        }
-      } catch (error) {
-        logger.error('Web automation failed', { error: error.message });
-      }
-    }
-
-    // All requests go directly to OpenAI for natural conversation
 
 
-    // INTELLIGENT FILE SEARCH: Check if this is a file access request
-    const fileAccessKeywords = ['read my', 'show my', 'open my', 'deployment', 'summary', 'report', 'document', 'notes', 'log', 'file'];
-    // Debug: Log the text being tested
-    logger.info('Testing file request detection', { text, lowerText: text.toLowerCase() });
-
-    const isFileRequest = fileAccessKeywords.some(keyword => text.toLowerCase().includes(keyword)) ||
-                         /open.*file|read.*file|show.*file|claude.*sessions|sessions.*file|open\s+that\s+file|open\s+it|please\s+open|open.*please|open\s+the\s+file.*asked|open\s+the\s+file.*just/i.test(text);
-
-    logger.info('File request detection result', { isFileRequest, text });
-
-    if (isFileRequest) {
-      try {
-        const searchResult = await handleIntelligentFileSearch(text);
-        if (searchResult.success) {
-          // Log file access response
-          conversationLogger.logAssistantMessage(searchResult.response, {
-            sessionId,
-            responseTime: 0,
-            userMessageId,
-            responseType: 'file_access'
-          });
-
-          return res.json({
-            ok: true,
-            text: searchResult.response,
-            sessionId,
-            fileAccessed: searchResult.filePath
-          });
-        }
-      } catch (fileError) {
-        logger.warn('File search failed, falling back to LLM', { error: fileError.message });
-      }
-    }
+    // Tier 1 #6/#8: the typed-chat regex dispatcher (~500 lines of hardwired phrase→action
+    // mappings for recall/filegen/time/date/moltbook/creative/file ops/web automation/file
+    // search) is GONE. /chat now works like /respond's conversational path: her normal brain
+    // answers directly, and when the request needs real tools or live data she emits the
+    // NEED_TOOLS sentinel and escalates to the agent loop, where the model selects tools
+    // NATIVELY (full schemas via function calling).
+    const chatRouting = 'IMPORTANT: In this mode you can ONLY talk right now — you cannot directly run a tool this turn. If the user asks you to DO something (create/read/open files or documents, send messages or email, calendar changes, control the computer, browse or automate the web, post to or check Moltbook), OR asks about their CURRENT external data (their real calendar, inbox/emails, files, system status, the Moltbook feed), OR asks you to RECALL or SEARCH something from PAST conversations that is NOT already visible in the recent turns, do NOT guess, fake, promise, or say you can\'t — respond with EXACTLY this token and nothing else: NEED_TOOLS. That escalates to your real tools (including memory_search over your saved memory and full conversation history).';
 
     const result = await llmService.chatCompletion(sessionId, text, {
       includeMemory,
       storeInMemory,
-      freshSession
+      freshSession,
+      extraSystem: chatRouting
     });
+
+    let responseText = String(result.content || '').trim();
+    let usage = result.usage;
+
+    if (/\bNEED_TOOLS\b/i.test(responseText)) {
+      logger.info('[chat] escalating to agent loop', { text: text.slice(0, 60) });
+      const loopOptions = { source: 'chat' };
+      try { loopOptions.environment = await environmentContext.buildEnvironmentBlock(); } catch { /* optional */ }
+      try {
+        const recent = conversationLogger.getRecentHistoryAcrossDays(12) || [];
+        loopOptions.recentHistory = recent.slice(0, -1).slice(-8);
+        loopOptions.recentArtifacts = artifactMemory.recent(6);
+      } catch { /* context optional */ }
+      const state = await (await import('../services/agentLoop.js')).default.runAgentLoop(text, loopOptions);
+      try { artifactMemory.recordFromHistory(sessionId, state.history); } catch { /* optional */ }
+      try { actionHistory.recordTurn(sessionId, state); } catch { /* optional */ }
+      responseText = String(state.final_result || '').trim();
+      if (String(state.status || '') === 'waiting_user' && state.last_action?.question) {
+        responseText = state.last_action.question;
+      }
+      if (!responseText) responseText = "I tried to do that, but couldn't complete it.";
+      usage = undefined;
+    }
+
+    responseText = sanitizeChatText(responseText);
     const responseTime = Date.now() - startTime;
 
     // Log assistant response
-    conversationLogger.logAssistantMessage(result.content, {
+    conversationLogger.logAssistantMessage(responseText, {
       sessionId,
       responseTime,
       userMessageId,
-      tokens: result.usage,
+      tokens: usage,
       model: result.model || config.REALTIME_MODEL
     });
 
     res.json({
       ok: true,
-      text: result.content,
+      text: responseText,
       sessionId,
-      usage: result.usage
+      usage
     });
   } catch (error) {
     conversationLogger.logError(error, { 
@@ -3543,33 +2666,7 @@ router.post('/chat', async (req, res) => {
   }
 });
 
-// (Removed old LLM-based /respond; new /respond below routes to agent loop)
-
-// Simple message router
-function routeMessage(text) {
-  const lower = text.toLowerCase();
-  
-  if (/^what'?s your name|who are you|your name/.test(lower)) {
-    return { mode: 'direct' };
-  }
-  
-  return { mode: 'auto' };
-}
-
-function handleDirectResponse(text) {
-  const lower = text.toLowerCase();
-  
-  if (/^what'?s your name|who are you|your name/.test(lower)) {
-    try {
-      const status = buildSelfStatus();
-      return buildSelfResponseText(status);
-    } catch {
-      return "I'm your local assistant.";
-    }
-  }
-  
-  return "I'm here to help! What would you like to know?";
-}
+// Tier 1 #8: deleted dead routeMessage/handleDirectResponse (never called).
 
 // Tools endpoint placeholder
 router.get('/ava/tools', async (_req, res) => {

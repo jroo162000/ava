@@ -11,6 +11,7 @@ import path from 'path';
 import os from 'os';
 import logger from '../utils/logger.js';
 import curatedMemory from './curatedMemory.js';
+import avaPaths from '../utils/paths.js';
 
 let DatabaseSync = null;
 try { ({ DatabaseSync } = await import('node:sqlite')); }
@@ -35,15 +36,8 @@ function terms(q) {
     .filter((t) => t.length >= 3 && !STOP.has(t));
 }
 
-function logsDir() {
-  const cands = [
-    path.join(process.cwd(), 'logs', 'conversations'),
-    path.join(os.homedir(), 'ava', 'ava-server', 'logs', 'conversations'),
-    path.join(os.homedir(), 'ava-server', 'logs', 'conversations'),
-  ];
-  for (const c of cands) { try { if (fs.existsSync(c)) return c; } catch { /* ignore */ } }
-  return cands[0];
-}
+// Tier 1 #8: the conversation-logs location lives in ONE place now (utils/paths.js).
+function logsDir() { return avaPaths.conversationLogsDir(); }
 
 function sourceFiles() {
   const files = [];
