@@ -1699,9 +1699,19 @@ class LocalVoiceRunner:
         over_mult = _cfg_float(cfg, "AVA_BARGE_OVER_MULT", "over_mult", 1.35)
         confirm_needed = _cfg_int(cfg, "AVA_BARGE_CONFIRM_FRAMES", "confirm_frames", 4)
         guard_sec = _cfg_float(cfg, "AVA_BARGE_GUARD_SEC", "guard_sec", 0.6)
+        # Tuned 2026-07-02 from a live mic session (Jelani). The gain is meant to learn HER
+        # speaker bleed (mic/playback), but the old unbounded decaying-max learned the USER's
+        # voice whenever he spoke over her — inflating gain to 6-19x and shooting the threshold
+        # to 50k-99k, which SUPPRESSED barging until she hit a pause (the "third interrupt
+        # lagged" symptom). Real bleed measured 0.03-0.17. Fix: (1) only learn from frames where
+        # the mic looks like PURE bleed (mic <= learn_ratio * playback), skipping the user's own
+        # speech; (2) HARD-CAP the learned gain so one bad frame can't poison the window.
+        gain_max = _cfg_float(cfg, "AVA_BARGE_GAIN_MAX", "gain_max", 0.4)
+        learn_ratio = _cfg_float(cfg, "AVA_BARGE_GAIN_LEARN_RATIO", "gain_learn_ratio", 0.4)
+        warm_needed = _cfg_int(cfg, "AVA_BARGE_WARM_FRAMES", "warm_frames", 4)
         started = time.time()
         consecutive = 0
-        gain = 0.0                     # decaying max of mic/playback ratio (bleed transfer)
+        gain = 0.0                     # capped decaying max of mic/playback ratio (bleed transfer)
         gain_samples = 0
         next_eval_log = 0.0
         ring: deque = deque(maxlen=12)
@@ -1714,13 +1724,18 @@ class LocalVoiceRunner:
             mic = audioop.rms(data, SAMPLE_WIDTH)
             playback = int(getattr(self, "_playback_rms", 0) or 0)
             now = time.time()
-            # learn the bleed transfer while she is audibly playing
-            if playback > 400 and mic > 100:
-                gain = max(gain * 0.995, mic / float(playback))
+            # Learn the bleed transfer ONLY from frames that look like pure bleed (mic well below
+            # playback). A frame where mic is high relative to playback is almost certainly the
+            # USER speaking over her — learning from it inflates the gain and suppresses real
+            # barges. Cap the result so a single borderline frame can't poison the estimate.
+            if playback > 400 and 100 < mic <= playback * learn_ratio:
+                gain = min(gain_max, max(gain * 0.995, mic / float(playback)))
                 gain_samples += 1
+            elif gain > 0:
+                gain *= 0.999          # gentle relax when not learning, so a stale estimate fades
             expected_bleed = gain * playback
             threshold = max(abs_floor, expected_bleed * over_mult, vad_start * 2.5)
-            if playback > 400 and gain_samples < 8:
+            if playback > 400 and gain_samples < warm_needed:
                 threshold = max(threshold, 10_000_000)  # gain not warm yet: no triggers over live playback
             if now >= next_eval_log:
                 _log(f"barge_eval mic={mic} playback={playback} gain={gain:.2f} threshold={int(min(threshold, 99999))}")
