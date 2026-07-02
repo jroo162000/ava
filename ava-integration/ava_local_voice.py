@@ -151,8 +151,27 @@ COMMAND_VERBS = {
 }
 
 
+_LOG_FILE = None  # resolved once; AVA_LOCAL_VOICE_LOG=1 -> logs/local_voice.log (or set a path)
+
+
 def _log(message: str) -> None:
-    print(f"[local-voice] {message}", flush=True)
+    line = f"[local-voice] {message}"
+    print(line, flush=True)
+    # Tier 3 #20: optional file mirror — the runner's console isn't inspectable for tuning
+    # (VAD/barge thresholds); with AVA_LOCAL_VOICE_LOG set, every line also lands in a file.
+    global _LOG_FILE
+    env = os.environ.get("AVA_LOCAL_VOICE_LOG", "")
+    if not env:
+        return
+    try:
+        if _LOG_FILE is None:
+            p = Path(env) if env not in ("1", "true", "yes") else (APP_DIR / "logs" / "local_voice.log")
+            p.parent.mkdir(parents=True, exist_ok=True)
+            _LOG_FILE = p
+        with open(_LOG_FILE, "a", encoding="utf-8", errors="ignore") as fh:
+            fh.write(f"{datetime.now().isoformat(timespec='milliseconds')} {line}\n")
+    except Exception:
+        pass  # logging must never break the runner
 
 
 def _load_config() -> dict:
@@ -638,6 +657,7 @@ class LocalVoiceRunner:
         self._speak_lock = threading.RLock()
         self._announce_thread: Optional[threading.Thread] = None
         self._event_sender: Optional[_EventSender] = None  # lazy; tts.level telemetry (#17)
+        self._playback_rms = 0  # live rms of what SHE is playing right now (barge bleed reference, #20)
 
     def close(self) -> None:
         self.running = False
@@ -1550,7 +1570,9 @@ class LocalVoiceRunner:
         return text
 
     def _emit_tts_level(self, rms: int) -> None:
-        """Tier 3 #17: real speech amplitude for the UI core (~10Hz; batched ~4Hz)."""
+        """Tier 3 #17: real speech amplitude for the UI core (~10Hz; batched ~4Hz).
+        Also maintains _playback_rms — the barge monitor's live bleed reference (#20)."""
+        self._playback_rms = int(rms)
         if os.environ.get("AVA_TTS_LEVEL_OFF") == "1":
             return
         try:
@@ -1653,24 +1675,35 @@ class LocalVoiceRunner:
         frames_out: list,
         resp_holder: dict,
     ) -> None:
-        """Watch the mic while AVA speaks (open speakers + TONOR): trip `barge` on sustained
-        loud speech. Echo rejection = an ELEVATED threshold (her speaker bleed at the mic sits
-        far below close-talk speech) + N consecutive frames + a startup guard window. On barge:
-        cancel the current TTS utterance, close the live SSE response, and keep capturing the
-        user's speech into frames_out until the orchestrator takes over."""
+        """Watch the mic while AVA speaks: trip `barge` on the USER's voice, never her own.
+
+        Tier 3 #20 (measured 2026-07-02): with open speakers + the TONOR, her own bleed at the
+        mic peaks ~13700 rms while normal user speech reads ~7700 — NO fixed threshold can
+        separate them. So echo rejection is ADAPTIVE: we know exactly what she is playing
+        (_playback_rms, the tts.level feed), track the mic/playback gain as a decaying max,
+        and only barge when the mic EXCEEDS expected bleed by AVA_BARGE_OVER_MULT — or when
+        she's between sentences (playback silent), where the absolute floor applies. On barge:
+        cancel TTS, close the live SSE, keep capturing the user's speech into frames_out.
+
+        TRUE-POSITIVE sensitivity (how easily Jelani can cut her off) still needs live tuning
+        WITH him at the mic; this design makes the FALSE-positive (self-interrupt) case
+        structurally impossible as long as the gain estimate is warm."""
         stream_info = self.input_stream
         if stream_info is None:
             return
         stream = stream_info.stream
         frames_per_buffer = stream_info.frames_per_buffer
+        cfg = self.config.get("barge_in") or {}
         vad_start = int(getattr(self, "_vad_start", 0) or 0) or 900
-        mult = _cfg_float(self.config.get("barge_in") or {}, "AVA_BARGE_RMS_MULT", "rms_mult", 2.5)
-        floor = _cfg_int(self.config.get("barge_in") or {}, "AVA_BARGE_MIN_RMS", "min_rms", 1500)
-        threshold = max(int(vad_start * mult), floor)
-        confirm_needed = _cfg_int(self.config.get("barge_in") or {}, "AVA_BARGE_CONFIRM_FRAMES", "confirm_frames", 4)
-        guard_sec = _cfg_float(self.config.get("barge_in") or {}, "AVA_BARGE_GUARD_SEC", "guard_sec", 0.6)
+        abs_floor = _cfg_int(cfg, "AVA_BARGE_MIN_RMS", "min_rms", 3000)
+        over_mult = _cfg_float(cfg, "AVA_BARGE_OVER_MULT", "over_mult", 1.35)
+        confirm_needed = _cfg_int(cfg, "AVA_BARGE_CONFIRM_FRAMES", "confirm_frames", 4)
+        guard_sec = _cfg_float(cfg, "AVA_BARGE_GUARD_SEC", "guard_sec", 0.6)
         started = time.time()
         consecutive = 0
+        gain = 0.0                     # decaying max of mic/playback ratio (bleed transfer)
+        gain_samples = 0
+        next_eval_log = 0.0
         ring: deque = deque(maxlen=12)
         while not stop.is_set() and self.running:
             try:
@@ -1678,13 +1711,26 @@ class LocalVoiceRunner:
             except Exception:
                 return
             ring.append(data)
-            rms = audioop.rms(data, SAMPLE_WIDTH)
-            if time.time() - started < guard_sec:
+            mic = audioop.rms(data, SAMPLE_WIDTH)
+            playback = int(getattr(self, "_playback_rms", 0) or 0)
+            now = time.time()
+            # learn the bleed transfer while she is audibly playing
+            if playback > 400 and mic > 100:
+                gain = max(gain * 0.995, mic / float(playback))
+                gain_samples += 1
+            expected_bleed = gain * playback
+            threshold = max(abs_floor, expected_bleed * over_mult, vad_start * 2.5)
+            if playback > 400 and gain_samples < 8:
+                threshold = max(threshold, 10_000_000)  # gain not warm yet: no triggers over live playback
+            if now >= next_eval_log:
+                _log(f"barge_eval mic={mic} playback={playback} gain={gain:.2f} threshold={int(min(threshold, 99999))}")
+                next_eval_log = now + 2.0
+            if now - started < guard_sec:
                 continue
-            if rms >= threshold:
+            if mic >= threshold:
                 consecutive += 1
                 if consecutive >= max(1, confirm_needed) and not barge.is_set():
-                    _log(f"barge_in rms={rms} threshold={threshold} confirm={confirm_needed}")
+                    _log(f"barge_in mic={mic} playback={playback} gain={gain:.2f} threshold={int(min(threshold, 99999))} confirm={confirm_needed}")
                     frames_out.extend(ring)
                     barge.set()
                     try:

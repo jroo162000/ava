@@ -8,6 +8,8 @@ set "PYTHONUNBUFFERED=1"
 set "PYTHONIOENCODING=utf-8"
 set "AVA_TTS_CHUNKING=0"
 set "AVA_TTS_SEGMENTING=0"
+REM Tier 3 #20: mirror runner logs to logs\local_voice.log for VAD/barge tuning
+set "AVA_LOCAL_VOICE_LOG=1"
 
 echo ================================================================================
 echo AVA LOCAL VOICE - MINIMAL HALF-DUPLEX RUNNER
