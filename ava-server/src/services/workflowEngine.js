@@ -206,6 +206,9 @@ async function _runStage(wf, idx) {
 
   const state = await agentLoop.runAgentLoop(goal, {
     multiStep: true, runTools: true, stepLimit: STAGE_STEP_LIMIT, environment: env, source: 'workflow',
+    // Tier 3 #22: read-only workflows (self-initiated proactive investigation) can observe but
+    // never write — the agent-loop gate enforces it structurally, so writes stay gated on approval.
+    readOnly: !!wf.readOnly,
     deadlineAt: Date.now() + _stageTimeoutMs(),
     onStep,
   });
@@ -321,16 +324,20 @@ async function run(id) {
 }
 
 // Plan a goal into stages and START running it in the background. Returns the planned workflow.
-async function start(goal) {
+// opts.readOnly — the whole workflow runs under the agent-loop read-only gate (no side effects).
+// opts.origin   — a tag (e.g. 'proactive:env:ram') so callers can find + follow their workflow.
+async function start(goal, opts = {}) {
   goal = String(goal || '').trim();
   if (!goal) return { ok: false, error: 'no goal' };
   const stages = await planGoal(goal);
   if (!stages.length) return { ok: false, error: "I couldn't break that into a workable plan." };
   const id = 'wf-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 6);
-  const wf = { id, goal, status: 'running', stages, currentStage: 0, replans: 0, createdAt: Date.now(), updatedAt: Date.now(), heartbeatAt: Date.now(), supervisor: {}, log: [], result: '', error: '' };
+  const wf = { id, goal, status: 'running', stages, currentStage: 0, replans: 0,
+    readOnly: !!opts.readOnly, origin: opts.origin || '',
+    createdAt: Date.now(), updatedAt: Date.now(), heartbeatAt: Date.now(), supervisor: {}, log: [], result: '', error: '' };
   _checkpoint(wf);
   setImmediate(() => run(id).catch(() => {}));  // run in the background; caller gets the plan now
-  return { ok: true, id, goal, stages: stages.map(s => ({ n: s.n, title: s.title, goal: s.goal, status: s.status })) };
+  return { ok: true, id, goal, readOnly: wf.readOnly, origin: wf.origin, stages: stages.map(s => ({ n: s.n, title: s.title, goal: s.goal, status: s.status })) };
 }
 
 // SUPERVISOR (Tier 2 #14): tells "stuck" from "working". A workflow is WORKING when its step

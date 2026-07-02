@@ -193,6 +193,11 @@ function createAgentState(goal, options = {}) {
     step_count: 0,
     step_limit: Math.min(options.stepLimit || DEFAULT_STEP_LIMIT, MAX_STEP_LIMIT),
     runTools: options.runTools !== false,  // default true; false skips tool execution
+    // Tier 3 #22: READ-ONLY execution — a HARD, prompt-independent guarantee that this run can
+    // observe (read/scan/enumerate/search) but can NEVER write, send, delete, execute, or take
+    // any confirm-gated/high-risk/destructive action. Used by self-initiated proactive
+    // investigation so writes STAY behind the user's approval; enforced at the act() gate.
+    readOnly: !!options.readOnly,
     canDelegate: options.canDelegate !== false,  // LEAD may spawn subagents; subagents get false (no recursion)
     allowedTools: options.allowedTools || null,  // subagent ROLE tool scoping (allowlist of names/'*' patterns)
     deniedTools: options.deniedTools || null,    // optional denylist
@@ -769,6 +774,26 @@ async function act(state, decision) {
         if (!tool) {
           result = { status: 'error', message: `Tool not found: ${decision.tool}` };
           break;
+        }
+
+        // Tier 3 #22 READ-ONLY gate: for self-initiated proactive investigation, refuse any
+        // side-effectful action STRUCTURALLY (not via prompt). A tool is blocked when it's
+        // confirm-gated, high/medium risk, matches the destructive-family prefixes, or the model
+        // tried to sneak a confirm/confirmed flag. The stage still gets a clear result so it can
+        // record the finding as "would require your approval" instead of doing it.
+        if (state.readOnly) {
+          const RO_DESTRUCTIVE = /^(fs_(write|append|delete|move|copy|mkdir|rmdir)|ps_exec|file_gen|app_control|comm_|voice_|camera_|calendar_ops|iot_ops|remote_ops|web_automation|open_item|self_mod)/;
+          const risky = tool.requires_confirm || (tool.risk_level && tool.risk_level !== 'low')
+            || RO_DESTRUCTIVE.test(decision.tool) || action.args.confirm || action.args.confirmed;
+          if (risky) {
+            result = {
+              status: 'blocked_readonly',
+              message: `Read-only investigation: ${decision.tool} would take a real action, which needs your approval. Noting it as a recommendation instead of doing it.`,
+              tool: decision.tool,
+            };
+            logger.info('[agent] read-only gate blocked a side-effect', { tool: decision.tool });
+            break;
+          }
         }
 
         // Autonomy policy gate

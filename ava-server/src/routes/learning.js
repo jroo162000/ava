@@ -15,6 +15,7 @@ import selfImprove from '../services/selfImprove.js';
 import selfRestart from '../services/selfRestart.js';
 import { verifyFileSyntax } from '../utils/verifyFileSyntax.js';
 import workflowEngine from '../services/workflowEngine.js';
+import proactiveAutonomy from '../services/proactiveAutonomy.js';
 import contextCompression from '../services/contextCompression.js';
 import ftsIndex from '../services/ftsIndex.js';
 import memoryHub from '../services/memoryHub.js';  // Tier 1 #5: one memory interface
@@ -799,6 +800,16 @@ router.get('/workflows', (_req, res) => { res.json({ ok: true, workflows: workfl
 router.post('/workflow/:id/resume', (req, res) => { res.json(workflowEngine.resume(req.params.id)); });
 // Abort a running workflow at the next stage/step boundary (Tier 2 #14).
 router.post('/workflow/:id/abort', (req, res) => { res.json(workflowEngine.abort(req.params.id)); });
+
+// ---- Tier 3 #22: proactive autonomy (self-initiated read-only investigations + gated recs) ----
+// All initiatives (investigating / awaiting_approval / closed / failed).
+router.get('/proactive/initiatives', (_req, res) => { res.json({ ok: true, initiatives: proactiveAutonomy.list() }); });
+// Just the ones waiting on your approval (the attention surface).
+router.get('/proactive/pending', (_req, res) => { res.json({ ok: true, pending: proactiveAutonomy.pending() }); });
+// Force a scheduler pass now (for testing / on demand).
+router.post('/proactive/tick', async (_req, res) => { try { await proactiveAutonomy.tickOnce(); res.json({ ok: true, initiatives: proactiveAutonomy.list() }); } catch (e) { res.status(500).json({ ok: false, error: e.message }); } });
+// Dismiss an initiative you don't want to act on.
+router.post('/proactive/:id/dismiss', (req, res) => { res.json(proactiveAutonomy.dismiss(req.params.id)); });
 
 // ---- Context compression + lineage (Hermes-style) ----
 // Force/trigger a rolling-summary compression for a session and return the result.

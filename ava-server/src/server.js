@@ -26,6 +26,7 @@ import digestScheduler from './services/digestScheduler.js';
 import moltbookScheduler from './services/moltbookScheduler.js';
 import selfImprove from './services/selfImprove.js';
 import workflowEngine from './services/workflowEngine.js';
+import proactiveAutonomy from './services/proactiveAutonomy.js';
 import windowJanitor from './services/windowJanitor.js';
 import environmentContext from './services/environmentContext.js';   // Tier 3 #18: vitals source
 import { emitVoiceEvent } from './services/voiceBus.js';             // Tier 3 #18: sys.stats broadcast
@@ -195,6 +196,14 @@ server.listen(PORT, HOST, () => {
     selfImprove.start();
   } catch (e) {
     logger.warn('Failed to start self-improvement loop', { error: e.message });
+  }
+
+  // Tier 3 #22: proactive multi-day autonomy — she autonomously investigates high-value
+  // openings READ-ONLY over time and files approval-gated recommendations. AVA_PROACTIVE_AUTONOMY=0 off.
+  try {
+    proactiveAutonomy.start();
+  } catch (e) {
+    logger.warn('Failed to start proactive autonomy', { error: e.message });
   }
 
   // Proactive housekeeping: close leftover, unused Command Prompt and File Explorer windows around
