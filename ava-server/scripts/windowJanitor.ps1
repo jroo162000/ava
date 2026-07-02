@@ -65,8 +65,17 @@ foreach ($row in [AvaJan]::List()) {
   $name = $proc.ProcessName
   $isConsoleHost = ($cls -eq 'CASCADIA_HOSTING_WINDOW_CLASS' -or $cls -eq 'ConsoleWindowClass' -or $name -eq 'cmd' -or $name -eq 'WindowsTerminal' -or $name -eq 'OpenConsole')
   $isExplorer    = ($cls -eq 'CabinetWClass')
-  $isClassicCmd  = ($name -eq 'cmd')
-  $isTermCmd     = (($name -eq 'WindowsTerminal' -or $name -eq 'OpenConsole') -and ($title -match '(?i)command prompt|cmd'))
+  # PROTECTED: never close AVA's own long-lived service consoles. These run as `cmd /k npm ...`
+  # (process name 'cmd'), so a bare name -eq 'cmd' test wrongly matched and closed them -- which
+  # killed the UI/voice/server on the next sweep. Guard by their window titles.
+  $isProtected   = ($title -match '(?i)AVA (Client|Server|Local Voice)|:5173|:5051|npm|vite|voice')
+  # Only treat a classic cmd window as a closeable leftover if it looks like a default prompt
+  # (title is a path / "Command Prompt" / blank), matching the intent of the terminal-cmd rule.
+  $looksDefault  = ($title -eq '' -or $title -match '(?i)^(command prompt|c:\\|administrator:|windows\\system32)')
+  $isClassicCmd  = (($name -eq 'cmd') -and $looksDefault -and -not $isProtected)
+  $isTermCmd     = (($name -eq 'WindowsTerminal' -or $name -eq 'OpenConsole') -and ($title -match '(?i)command prompt|cmd') -and -not $isProtected)
+  # Stale-server cleanup is intentional and only fires when the live server is a hidden node,
+  # so the visible "AVA Server (5051)" console is genuinely a leftover -- it bypasses isProtected.
   $isStaleServer = ($serverHiddenNode -and $isConsoleHost -and ($title -match 'AVA Server \(5051\)'))
   if ($isExplorer -or $isClassicCmd -or $isTermCmd -or $isStaleServer) {
     $ageOk = $true
