@@ -50,12 +50,15 @@ class ErrorBoundary extends React.Component {
               >
                 Reload Page
               </button>
-              <button 
+              <button
                 onClick={() => this.setState({ hasError: false, error: null, errorInfo: null })}
                 className="btn btn-secondary"
               >
                 Try Again
               </button>
+              <a href="?classic=1" className="btn btn-secondary" style={{ textDecoration: 'none' }}>
+                Open classic UI
+              </a>
             </div>
           </div>
         </div>
