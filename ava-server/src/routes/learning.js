@@ -497,6 +497,15 @@ router.post('/self_mod', async (req, res) => {
             meta: { id: result.modification_id || req.body?.modification_id || null, file: appliedFile, action: 'applied' }
           });
         } catch { /* logging must never break apply */ }
+        // Tier 3 #21 auto A/B: if this applied change is routing-relevant, record a pending
+        // post-apply eval against the pre-apply baseline so the NEXT boot measures keep-vs-revert.
+        try {
+          const evalHarness = (await import('../services/evalHarness.js')).default;
+          if (evalHarness.isRoutingRelevant(appliedFile)) {
+            const autoEval = (await import('../services/autoEval.js')).default;
+            autoEval.recordApplied({ modId: result.modification_id || req.body?.modification_id, file: appliedFile, baseline: evalHarness.lastScore() });
+          }
+        } catch { /* auto-eval is best-effort */ }
         result.restart = selfRestart.scheduleServerRestart({
           reason: `UI approved proposal ${result.modification_id || req.body?.modification_id || ''}`.trim()
         });
@@ -810,6 +819,12 @@ router.get('/proactive/pending', (_req, res) => { res.json({ ok: true, pending: 
 router.post('/proactive/tick', async (_req, res) => { try { await proactiveAutonomy.tickOnce(); res.json({ ok: true, initiatives: proactiveAutonomy.list() }); } catch (e) { res.status(500).json({ ok: false, error: e.message }); } });
 // Dismiss an initiative you don't want to act on.
 router.post('/proactive/:id/dismiss', (req, res) => { res.json(proactiveAutonomy.dismiss(req.params.id)); });
+
+// ---- Tier 3 #21 auto A/B: post-apply keep-if-better evaluation ----
+// Inspect pending/resolved post-apply evaluations.
+router.get('/self/eval/auto', async (_req, res) => { try { res.json({ ok: true, records: (await import('../services/autoEval.js')).default.list() }); } catch (e) { res.status(500).json({ ok: false, error: e.message }); } });
+// Force the post-apply evaluation now (normally auto-armed after a restart).
+router.post('/self/eval/auto', async (_req, res) => { try { res.json(await (await import('../services/autoEval.js')).default.runPending()); } catch (e) { res.status(500).json({ ok: false, error: e.message }); } });
 
 // ---- Context compression + lineage (Hermes-style) ----
 // Force/trigger a rolling-summary compression for a session and return the result.

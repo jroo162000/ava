@@ -456,6 +456,16 @@ async function approveThroughSandbox(ids, fileById) {
       continue;
     }
 
+    // Tier 3 #21 auto A/B: record a pending post-apply eval for routing-relevant changes so the
+    // next boot measures keep-vs-revert (same as the UI approve path).
+    try {
+      const evalHarness = (await import('./evalHarness.js')).default;
+      if (evalHarness.isRoutingRelevant(f)) {
+        const autoEval = (await import('./autoEval.js')).default;
+        autoEval.recordApplied({ modId: id, file: f, baseline: evalHarness.lastScore() });
+      }
+    } catch { /* auto-eval is best-effort */ }
+
     const gateNote = gate.tests && gate.tests.ran
       ? ` It passed the sandbox first — ${gate.tests.passed} tests, no new failures.`
       : (gate.skipped ? ` Heads up: the sandbox step was skipped (${gate.skipped}), so it only had the syntax checks.` : '');

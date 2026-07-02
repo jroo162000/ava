@@ -894,6 +894,8 @@ PROTECTED_BASENAMES = {
     "selfModVoice.js",           # voice approval wiring (calls the sandbox gate)
     "verifyFileSyntax.js",       # post-apply syntax verifier the gate relies on
     "proposalVerifier.js",       # Tier 3 #21: the API-claims verifier gate
+    "autoEval.js",               # Tier 3 #21: the keep-if-better A/B loop
+    "evalHarness.js",            # Tier 3 #21: the routing-accuracy eval the A/B loop trusts
 }
 
 
