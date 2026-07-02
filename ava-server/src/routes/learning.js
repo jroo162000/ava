@@ -25,6 +25,7 @@ import financeKnowledge from '../services/financeKnowledge.js';
 import toolsService from '../services/tools.js';
 import evolutionLog from '../services/evolutionLog.js';
 import moltbookWatchlist from '../services/moltbookWatchlist.js';
+import selfModSandbox from '../services/selfModSandbox.js';  // Tier 2 #13: worktree + test gate
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -428,11 +429,31 @@ router.post('/self_mod', async (req, res) => {
       };
     }
 
+    // Tier 2 #13: SANDBOX GATE — before an approve may touch the live tree, apply the proposal
+    // in an isolated git worktree and validate it there (syntax + jest vs the known-failure
+    // baseline). Blocked proposals STAY PENDING so the user can see exactly why.
+    let sandboxGate = null;
+    if (action === 'approve' && selfModSandbox.isEnabled()) {
+      sandboxGate = await selfModSandbox.validateProposal(req.body?.modification_id);
+      if (!sandboxGate.ok) {
+        return res.json({
+          ok: true,
+          status: 'blocked_sandbox',
+          modification_id: req.body?.modification_id,
+          message: `Not applied — ${selfModSandbox.describeGate(sandboxGate)}. The proposal stays in the queue.`,
+          sandbox: sandboxGate,
+        });
+      }
+    }
+
     const response = await pythonWorker.selfMod(body);
     if (response.ok) {
       const result = response.result || {};
       if (['propose_fix','approve','rollback','undo','revert'].includes(action)) {
         result.safety_note = '⚠️ Code modification requires user approval.';
+      }
+      if (action === 'approve' && sandboxGate) {
+        result.sandbox = sandboxGate;
       }
       if (action === 'approve' && result.status === 'success') {
         // Verify the applied file actually PARSES before restarting into it. A broken approve that

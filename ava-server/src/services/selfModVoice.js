@@ -8,6 +8,8 @@ import pythonWorker from './pythonWorker.js';
 import selfImprove from './selfImprove.js';
 import selfRestart from './selfRestart.js';
 import { verifyFileSyntax } from '../utils/verifyFileSyntax.js';
+import selfModSandbox from './selfModSandbox.js';           // Tier 2 #13: worktree + test gate
+import { pushAnnouncement } from './announceQueue.js';      // spoken result of async approvals
 
 function isSelfSnapshotRequest(text = '') {
   const t = String(text || '').toLowerCase();
@@ -358,6 +360,24 @@ async function handleSelfModVoice(userText) {
   for (const m of pending) fileById[m.id] = m.file || m.file_path;
 
   const action = (clearReject || (wantsReject && !wantsApprove)) ? 'reject' : 'approve';
+
+  // Tier 2 #13: with the sandbox gate ON, voice approvals run ASYNC — validate the change in
+  // an isolated git worktree (syntax + the jest suite, a minute or two), apply only on pass,
+  // and announce the outcome aloud via the announcement queue. The immediate reply keeps the
+  // voice turn fast. AVA_SELFMOD_SANDBOX=0 restores the old synchronous apply below.
+  if (action === 'approve' && selfModSandbox.isEnabled()) {
+    const ids = targets.slice();
+    const files = { ...fileById };
+    setTimeout(() => {
+      approveThroughSandbox(ids, files).catch((e) => {
+        try { pushAnnouncement(`I hit an error while sandbox-testing a code change: ${e.message}. Nothing was applied.`); } catch { /* best effort */ }
+      });
+    }, 10);
+    return ids.length === 1
+      ? `On it — I'm test-driving change ${ids[0]} in an isolated sandbox first: syntax check plus my test suite, about a minute or two. Nothing touches my live code unless it passes, and I'll tell you the result out loud.`
+      : `On it — I'm test-driving those ${ids.length} changes in an isolated sandbox first: syntax checks plus my test suite. Nothing touches my live code unless each one passes, and I'll announce every result.`;
+  }
+
   const results = [];
   for (const id of targets) {
     try { const r = await pythonWorker.selfMod({ action, modification_id: id }); results.push({ id, r: (r && (r.result || r)) || {} }); }
@@ -398,6 +418,50 @@ async function handleSelfModVoice(userText) {
   }
   const ok = results.filter(x => x.r.status === 'success').map(x => x.id);
   return `Okay — rejected ${ok.length} change${ok.length > 1 ? 's' : ''} (${ok.join(', ')}). Nothing was applied.`;
+}
+
+// Background half of the async voice approval (Tier 2 #13): sandbox-validate each change,
+// apply only on pass, post-apply syntax-verify (with undo), then announce the outcome aloud.
+// Any scheduled restart is delayed past the runner's ~8s announcement poll so the spoken
+// result is never lost to the restart. (Restarts are a no-op when AVA_SELF_RESTART_OFF=1.)
+async function approveThroughSandbox(ids, fileById) {
+  const baseName = (f) => String(f || '').split(/[\\/]/).pop();
+  for (const id of ids) {
+    let gate;
+    try { gate = await selfModSandbox.validateProposal(id); }
+    catch (e) { gate = { ok: true, skipped: `gate error: ${e.message}`, warning: true }; }
+
+    if (!gate.ok) {
+      pushAnnouncement(`I did not apply change ${id} — ${selfModSandbox.describeGate(gate)}. It's still in the queue if you want to look at it.`);
+      continue;
+    }
+
+    let r;
+    try {
+      const resp = await pythonWorker.selfMod({ action: 'approve', modification_id: id });
+      r = (resp && (resp.result || resp)) || {};
+    } catch (e) { r = { status: 'error', message: e.message }; }
+    if (r.status !== 'success') {
+      pushAnnouncement(`Change ${id} passed the sandbox but failed to apply: ${r.message || 'unknown error'}. It's still in the queue.`);
+      continue;
+    }
+
+    const f = r.file || r.file_path || fileById[id];
+    const v = await verifyFileSyntax(f);
+    if (!v.ok) {
+      try { await pythonWorker.selfMod({ action: 'undo', modification_id: id }); } catch { /* best effort */ }
+      pushAnnouncement(`I applied change ${id}, but it failed the post-apply syntax check, so I reverted it — I won't leave broken code in place. (${baseName(f)}: ${v.error})`);
+      continue;
+    }
+
+    const gateNote = gate.tests && gate.tests.ran
+      ? ` It passed the sandbox first — ${gate.tests.passed} tests, no new failures.`
+      : (gate.skipped ? ` Heads up: the sandbox step was skipped (${gate.skipped}), so it only had the syntax checks.` : '');
+    pushAnnouncement(`Change ${id} is applied and verified.${gateNote}`);
+    setTimeout(() => {
+      try { selfRestart.scheduleServerRestart({ reason: `voice approved proposal ${id} (sandbox-validated)` }); } catch { /* best effort */ }
+    }, 12000);
+  }
 }
 
 export {

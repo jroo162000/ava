@@ -890,6 +890,9 @@ PROTECTED_BASENAMES = {
     "selfmod.js",                # server self-mod approval routes
     "security.js",               # security utilities
     "autonomyPolicy.js",         # autonomy policy gate
+    "selfModSandbox.js",         # Tier 2 #13: the worktree+test sandbox gate itself
+    "selfModVoice.js",           # voice approval wiring (calls the sandbox gate)
+    "verifyFileSyntax.js",       # post-apply syntax verifier the gate relies on
 }
 
 
