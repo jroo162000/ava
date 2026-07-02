@@ -158,7 +158,14 @@ function useCoreState() {
       workGuard.current = setTimeout(() => set('idle', ''), 1200);
     }
   }, [set]);
-  return { state, caption, onUserTurn, onDelta, onFinal, onWorking };
+  // #17: REAL audio drives SPEAKING — tts.level rms from the voice runner while Piper plays.
+  const onAudio = useCallback((rms) => {
+    if ((rms | 0) <= 60) return;                 // silence / settle frames don't flip state
+    clearTimeout(speakIdle.current);
+    set('speaking');
+    speakIdle.current = setTimeout(() => set(workingRef.current ? 'working' : 'idle'), 1200);
+  }, [set]);
+  return { state, caption, onUserTurn, onDelta, onFinal, onWorking, onAudio };
 }
 
 // ─── diff renderer (ported from MinimalAVA — real hunks, colored) ───────────
@@ -190,6 +197,8 @@ export default function Stage() {
   const dock = usePanelDock();
   const core = useCoreState();
   const orchId = useRef(null);                       // current orchestration card id
+  const [amp, setAmp] = useState(0);                 // #17: live speech amplitude (rms)
+  const ampDecay = useRef(null);
 
   const attention = pendingMods.length + pendingVerifs.length;
 
@@ -252,12 +261,24 @@ export default function Stage() {
           if (d.state === 'working.start') core.onWorking(true, d.goal);
           else if (d.state === 'working.end') core.onWorking(false);
           break;
+        case 'tts.level': {
+          // #17: real amplitude from the voice runner — the core pulses to HER voice.
+          const rms = (d && d.rms) | 0;
+          setAmp(rms);
+          core.onAudio(rms);
+          clearTimeout(ampDecay.current);
+          ampDecay.current = setTimeout(() => setAmp(0), 450);  // no frames -> settle
+          break;
+        }
         case 'tool.start':
-          dock.spawn({ kind: 'tool', title: d.tool || 'tool', detail: argHint(d.args), state: 'active' });
+          dock.spawn({ kind: 'tool', callId: d.callId || '', title: d.tool || 'tool', detail: argHint(d.args), state: 'active' });
           break;
         case 'tool.result':
           dock.patchWhere(
-            (c) => c.kind === 'tool' && c.title === (d.tool || 'tool') && c.state === 'active',
+            // #17: exact pairing by callId (server tags both events); name match is the
+            // fallback for events emitted before the server upgrade.
+            (c) => c.kind === 'tool' && c.state === 'active'
+              && (d.callId ? c.callId === d.callId : c.title === (d.tool || 'tool')),
             { state: 'resolved', ok: !!d.ok, detail: String(d.summary || d.status || (d.ok ? 'done' : 'failed')).slice(0, 180), resolvedAt: Date.now() }
           );
           break;
@@ -296,7 +317,15 @@ export default function Stage() {
         let ev = null;
         try { ev = JSON.parse(e.data); } catch { /* */ }
         if (!ev) return;
-        if (import.meta.env.DEV) console.log('[stage-ev]', ev.type, ev.source || '');
+        if (import.meta.env.DEV) {
+          if (ev.type === 'tts.level') {
+            // log arrival evidence without flooding: first frame + every 40th
+            window.__ttsN = (window.__ttsN || 0) + 1;
+            if (window.__ttsN === 1 || window.__ttsN % 40 === 0) console.log('[stage-ev] tts.level n=' + window.__ttsN + ' rms=' + ((ev.data || {}).rms | 0));
+          } else {
+            console.log('[stage-ev]', ev.type, ev.source || '');
+          }
+        }
         try { handleEvent(ev); } catch (err) { console.error('[stage-ev] handler', err); }
         publish(ev);   // theme / presenter / any other subscriber
       };
@@ -441,11 +470,11 @@ export default function Stage() {
         {sending && !liveText && <div className="st-turn ava live"><span className="st-who">ava</span><div className="st-md st-thinking">…</div></div>}
       </div>
 
-      {/* center: the core (CSS placeholder — the state machine is real; the body is Phase 2) */}
+      {/* center: the core — state machine is real; orb scale is HER live amplitude (#17) */}
       <div className="st-corewrap">
         <div className={`st-core ${coreState} ${attention ? 'attention' : ''}`}>
           <div className="st-ring r1" /><div className="st-ring r2" /><div className="st-ring r3" />
-          <div className="st-orb" />
+          <div className="st-orb" style={amp > 0 ? { transform: `scale(${1 + Math.min(amp / 9000, 0.55)})`, transition: 'transform 90ms linear', animation: 'none' } : undefined} />
         </div>
       </div>
 

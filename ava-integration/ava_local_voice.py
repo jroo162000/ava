@@ -331,6 +331,51 @@ def _server_respond(text: str, config: dict) -> str:
     return ""
 
 
+class _EventSender:
+    """Fire-and-forget batched poster to /voice/event/batch (Tier 3 #17: tts.level).
+
+    A tiny daemon thread drains a bounded queue every ~250ms and POSTs one batch; failures
+    and overflow drop silently — realtime telemetry must never block or break speech."""
+
+    def __init__(self, config: dict) -> None:
+        base = str(config.get("server_url") or DEFAULT_SERVER_URL).rstrip("/")
+        if base.endswith("/respond"):
+            base = base[: -len("/respond")]
+        self.url = base + "/voice/event/batch"
+        self.q: "queue.Queue[dict]" = queue.Queue(maxsize=256)
+        t = threading.Thread(target=self._worker, name="ava-event-sender", daemon=True)
+        t.start()
+
+    def push(self, type_: str, data: dict) -> None:
+        try:
+            self.q.put_nowait({"type": type_, "data": data or {}, "timestamp": time.time(), "source": "voice"})
+        except Exception:
+            pass  # full queue -> drop (telemetry, not truth)
+
+    def _worker(self) -> None:
+        while True:
+            batch = []
+            try:
+                batch.append(self.q.get(timeout=0.25))
+            except Exception:
+                continue
+            try:
+                while len(batch) < 32:
+                    batch.append(self.q.get_nowait())
+            except Exception:
+                pass
+            try:
+                body = json.dumps(batch).encode("utf-8")
+                req = urllib.request.Request(
+                    url=self.url, data=body,
+                    headers=_auth_headers({"Content-Type": "application/json"}), method="POST",
+                )
+                with urllib.request.urlopen(req, timeout=3) as resp:
+                    resp.read(64)
+            except Exception:
+                pass  # server restarting / unreachable -> drop the batch
+
+
 def _iter_sse_events(resp):
     """Yield (event, data_dict) tuples from a text/event-stream HTTP response."""
     event = "message"
@@ -592,6 +637,7 @@ class LocalVoiceRunner:
         # Serializes all TTS output so the proactive-announcement thread never overlaps a reply.
         self._speak_lock = threading.RLock()
         self._announce_thread: Optional[threading.Thread] = None
+        self._event_sender: Optional[_EventSender] = None  # lazy; tts.level telemetry (#17)
 
     def close(self) -> None:
         self.running = False
@@ -1503,6 +1549,17 @@ class LocalVoiceRunner:
             _log(f"ignored_empty_transcript=rms:{pcm_rms} max:{pcm_max}")
         return text
 
+    def _emit_tts_level(self, rms: int) -> None:
+        """Tier 3 #17: real speech amplitude for the UI core (~10Hz; batched ~4Hz)."""
+        if os.environ.get("AVA_TTS_LEVEL_OFF") == "1":
+            return
+        try:
+            if self._event_sender is None:
+                self._event_sender = _EventSender(self.config)
+            self._event_sender.push("tts.level", {"rms": int(rms)})
+        except Exception:
+            pass
+
     def _speak(self, text: str) -> None:
         self.last_spoken_text = text or ""
         if not text or self.tts is None:
@@ -1523,6 +1580,7 @@ class LocalVoiceRunner:
             def on_chunk(pcm: bytes) -> None:
                 if not pcm:
                     return
+                self._emit_tts_level(audioop.rms(pcm, SAMPLE_WIDTH))
                 if self.output_stream is None:
                     return
                 if source_rate == playback_rate:
@@ -1532,6 +1590,7 @@ class LocalVoiceRunner:
                 self.output_stream.write(out)
 
             self.tts.speak(spoken, on_chunk, frame_ms=100)
+            self._emit_tts_level(0)  # settle the core immediately at utterance end
             _log("state=COOLDOWN")
             time.sleep(0.35)
 
@@ -1575,6 +1634,7 @@ class LocalVoiceRunner:
                 return
             if abort_event is not None and abort_event.is_set():
                 return
+            self._emit_tts_level(audioop.rms(pcm, SAMPLE_WIDTH))
             if source_rate == playback_rate:
                 out = pcm
             else:
@@ -1584,6 +1644,7 @@ class LocalVoiceRunner:
             self.output_stream.write(out)
 
         self.tts.speak(spoken, on_chunk, frame_ms=100)
+        self._emit_tts_level(0)  # settle the core between sentence chunks / at end
 
     def _barge_monitor(
         self,

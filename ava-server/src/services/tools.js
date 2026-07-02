@@ -868,10 +868,15 @@ const toolsService = new ToolsService();
 
 // Mirror every tool execution to the live UI (voice bus) so the user can watch what
 // AVA does in real time. Wraps the method without touching its internals.
+// Tier 3 #17: both events carry the same callId so the UI pairs start/result exactly —
+// name-based pairing mis-resolves when the same tool runs twice in parallel (Tier 2's
+// parallel read-only tools made that real).
+let _toolCallSeq = 0;
 const _origExecuteTool = toolsService.executeTool.bind(toolsService);
 toolsService.executeTool = async function (name, args, dryRun = false, options = {}) {
   const src = (options && options.source) || '';
-  try { emitVoiceEvent('tool.start', { tool: name, args: _safeToolArgs(args), dryRun }, src || 'agent'); } catch { /* ignore */ }
+  const callId = `tc-${Date.now()}-${++_toolCallSeq}`;
+  try { emitVoiceEvent('tool.start', { callId, tool: name, args: _safeToolArgs(args), dryRun }, src || 'agent'); } catch { /* ignore */ }
   let res;
   try {
     res = await _origExecuteTool(name, args, dryRun, options);
@@ -881,6 +886,7 @@ toolsService.executeTool = async function (name, args, dryRun = false, options =
       const inner = (res && res.result && typeof res.result === 'object') ? res.result : res;
       const ok = !(res && res.ok === false) && !(inner && inner.status === 'error');
       emitVoiceEvent('tool.result', {
+        callId,
         tool: name,
         ok,
         status: (inner && inner.status) || (ok ? 'ok' : 'error'),

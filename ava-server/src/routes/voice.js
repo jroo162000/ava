@@ -46,10 +46,16 @@ function broadcastEvent(event) {
   }
 }
 
+// Tier 3 #17: high-frequency transient telemetry (speech amplitude for the UI core) is
+// broadcast-only — storing it would flood the debug buffer AND get replayed to clients by
+// the reconnect backlog, which is wrong for realtime-only signals.
+const TRANSIENT_TYPES = new Set(['tts.level']);
+
 /**
  * Store event in circular buffer
  */
 function storeEvent(event) {
+  if (event && TRANSIENT_TYPES.has(event.type)) return;
   recentEvents.push({
     ...event,
     received_at: Date.now()
@@ -203,28 +209,33 @@ router.post('/toggle', async (req, res) => {
 
 /**
  * POST /voice/speak
- * Request TTS synthesis (for manual text-to-speech)
+ * Request TTS synthesis (for manual text-to-speech).
+ * Tier 3 #17 fix: this endpoint used to only broadcast a tts.request event that nothing
+ * consumed — it now ALSO queues the text as an announcement, which the voice runner polls
+ * (~8s) and actually speaks aloud. That makes the endpoint do what it says.
  */
 router.post('/speak', async (req, res) => {
   const { text } = req.body;
-  
+
   if (!text) {
     return res.status(400).json({ ok: false, error: 'Missing text' });
   }
-  
-  // Broadcast speak request event
+
+  announceQueue.pushAnnouncement(String(text).slice(0, 800));
+
+  // Broadcast speak request event (UI visibility)
   const event = {
     type: 'tts.request',
     timestamp: Date.now() / 1000,
     data: { text },
     source: 'server'
   };
-  
+
   storeEvent(event);
   broadcastEvent(event);
-  
+
   logger.info('[voice] Speak requested', { text: text.substring(0, 50) });
-  
+
   res.json({ ok: true, queued: true });
 });
 
