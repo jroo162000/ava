@@ -860,7 +860,9 @@ async function act(state, decision) {
           result = _priorRun.result || { status: 'ok', message: 'Already done a moment ago.' };
           const _spinOk = String(result.status || '').toLowerCase() === 'ok';
           state.status = _spinOk ? AgentStatus.SUCCESS : AgentStatus.FAILED;
-          state.final_result = state.final_result || result.message || (_spinOk ? 'Done.' : 'I could not complete that.');
+          // Surface the REAL failure reason (tools return .error, not .message, on failure) so a
+          // dead-end says WHY instead of a bare "I could not complete that." (log-review fix).
+          state.final_result = state.final_result || result.message || result.error || (_spinOk ? 'Done.' : "I couldn't complete that — my last tool didn't return a result.");
           logger.info('[agent] Anti-spin: repeated tool+args, reusing prior result', { tool: decision.tool });
           break;
         }
@@ -1214,7 +1216,7 @@ async function runAgentLoop(goal, options = {}) {
           const _ok = String(_prior.result.status || '').toLowerCase() === 'ok';
           state.last_result = _prior.result;
           state.status = _ok ? AgentStatus.SUCCESS : AgentStatus.FAILED;
-          state.final_result = state.final_result || (_ok ? (_prior.result.message || 'Done.') : (_prior.result.message || 'I could not complete that.'));
+          state.final_result = state.final_result || (_ok ? (_prior.result.message || 'Done.') : (_prior.result.message || _prior.result.error || "I couldn't complete that — my last tool didn't return a result."));
           logger.info('[agent] Anti-spin: repeated tool+args, stopping with prior result', { tool: decision.tool });
           break;
         }
@@ -1336,7 +1338,7 @@ async function runAgentLoopFromState(state) {
           const _ok = String(_prior.result.status || '').toLowerCase() === 'ok';
           state.last_result = _prior.result;
           state.status = _ok ? AgentStatus.SUCCESS : AgentStatus.FAILED;
-          state.final_result = state.final_result || (_ok ? (_prior.result.message || 'Done.') : (_prior.result.message || 'I could not complete that.'));
+          state.final_result = state.final_result || (_ok ? (_prior.result.message || 'Done.') : (_prior.result.message || _prior.result.error || "I couldn't complete that — my last tool didn't return a result."));
           logger.info('[agent] Anti-spin: repeated tool+args, stopping with prior result', { tool: decision.tool });
           break;
         }

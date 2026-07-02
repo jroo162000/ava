@@ -494,6 +494,51 @@ class MoltbookService {
     return this.learnings.slice(-count).reverse();
   }
 
+  // Read actual learning CONTENT with real filters (fixes the "summarize what I learned today"
+  // dead-end: this used to only expose a count + 5 titles, so date/keyword requests failed).
+  // One of today / days / query / count selects the set; each item carries its real title +
+  // summary so a caller can synthesize a genuine answer. Newest first, bounded by limit.
+  readLearnings({ today = false, days = 0, query = '', count = 0, limit = 40 } = {}) {
+    const all = Array.isArray(this.learnings) ? this.learnings : [];
+    const tsOf = (l) => Date.parse(l.learnedAt || l.timestamp || l.at || '') || 0;
+    const shape = (l) => ({ title: l.title || '', summary: String(l.summary || '').slice(0, 400), submolt: l.submolt || '', author: l.author || '', learnedAt: l.learnedAt || '' });
+
+    let selected;
+    let scope;
+    if (query) {
+      const q = query.toLowerCase();
+      selected = all.filter(l => (`${l.title || ''} ${l.summary || ''}`).toLowerCase().includes(q));
+      scope = `matching "${query}"`;
+    } else if (today || days > 0) {
+      const cutoff = today
+        ? new Date(new Date().toDateString()).getTime()          // local midnight today
+        : Date.now() - days * 86400000;
+      selected = all.filter(l => tsOf(l) >= cutoff);
+      scope = today ? 'from today' : `from the last ${days} day(s)`;
+    } else {
+      selected = all.slice(-(count || 5));
+      scope = `most recent ${count || 5}`;
+    }
+
+    selected = selected.slice().sort((a, b) => tsOf(b) - tsOf(a));
+    const total = selected.length;
+    const items = selected.slice(0, limit).map(shape);
+
+    const bySubmolt = {};
+    for (const l of selected) bySubmolt[l.submolt || 'general'] = (bySubmolt[l.submolt || 'general'] || 0) + 1;
+    const topCommunities = Object.entries(bySubmolt).sort((a, b) => b[1] - a[1]).slice(0, 5).map(([n, c]) => `${n} (${c})`);
+
+    return {
+      scope,
+      totalMatching: total,
+      totalLearnings: all.length,
+      returned: items.length,
+      topCommunities,
+      learnings: items,
+      note: total > items.length ? `Showing ${items.length} of ${total} ${scope}; raise "limit" for more.` : undefined,
+    };
+  }
+
   getLearningsSummary() {
     if (this.learnings.length === 0) {
       return "I haven't learned anything from Moltbook yet. I need to be claimed first, then I can browse and learn from other agents.";

@@ -313,12 +313,16 @@ class ToolsService {
       },
       {
         name: 'moltbook_learnings',
-        description: 'Get a summary of what AVA has learned from Moltbook',
+        description: "Read AVA's Moltbook learnings — the real title + summary of each. Use `today:true` for what she learned today, `days:N` for the last N days, `query` to search all learnings by keyword, or `count` for the most recent. Returns actual learning CONTENT (not just a count) so you can summarize what she's learned.",
         source: 'builtin',
         schema: {
           type: 'object',
           properties: {
-            count: { type: 'number', description: 'Number of recent learnings (default 5)' }
+            count: { type: 'number', description: 'Number of recent learnings to return (default 5)' },
+            today: { type: 'boolean', description: 'Only learnings from today' },
+            days: { type: 'number', description: 'Only learnings from the last N days' },
+            query: { type: 'string', description: 'Search all learnings by keyword (matches title + summary)' },
+            limit: { type: 'number', description: 'Max learnings to return for today/days/query (default 40)' }
           }
         },
         requires_confirm: false,
@@ -604,10 +608,18 @@ class ToolsService {
 
       case 'moltbook_learnings':
         try {
-          const count = args.count || 5;
-          const recent = moltbookService.getRecentLearnings(count);
-          const summary = moltbookService.getLearningsSummary();
-          return { ok: true, result: { summary, recentLearnings: recent } };
+          // Fixed 2026-07-02: "summarize what I learned today from my 5000 learnings" used to
+          // dead-end ("I could not complete that") because this only returned a thin count +
+          // 5 titles. Now it returns real learning CONTENT filtered by today / days / query.
+          const limit = Math.max(1, Math.min(args.limit || 40, 200));
+          const report = moltbookService.readLearnings({
+            today: !!args.today,
+            days: args.days ? Number(args.days) : 0,
+            query: args.query ? String(args.query) : '',
+            count: args.count ? Number(args.count) : 0,
+            limit,
+          });
+          return { ok: true, result: report };
         } catch (e) {
           return { ok: false, error: e.message };
         }
