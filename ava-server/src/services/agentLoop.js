@@ -214,6 +214,10 @@ function createAgentState(goal, options = {}) {
     environment: options.environment || '',  // live OS-awareness block (foreground window, CPU/RAM, recent actions)
     memoryFilter: options.memoryFilter || null,
     eventSource: options.source || '',  // tags tool events for the live UI (e.g. 'voice')
+    // Tier 2 #14 long-horizon hooks (both optional; absent = identical behavior to before):
+    deadline_at: Number(options.deadlineAt) > 0 ? Number(options.deadlineAt) : 0,  // epoch ms wall-clock budget
+    started_at_ms: Date.now(),
+    onStep: typeof options.onStep === 'function' ? options.onStep : null,  // per-step heartbeat/progress callback
     created_at: new Date().toISOString(),
     updated_at: new Date().toISOString(),
     final_result: null
@@ -1125,6 +1129,15 @@ function shouldContinue(state) {
     return false;
   }
 
+  // Tier 2 #14: wall-clock deadline (set by long-horizon callers like the workflow engine).
+  // Checked between steps, so a stage that overruns its budget stops CLEANLY at the next
+  // boundary instead of running forever; the caller's retry/replan machinery takes over.
+  if (state.deadline_at && Date.now() > state.deadline_at) {
+    state.status = AgentStatus.FAILED;
+    state.final_result = `Deadline exceeded after ${state.step_count} steps (budget ${Math.round((state.deadline_at - state.started_at_ms) / 1000)}s). Last action: ${state.last_action?.tool || 'none'}`;
+    return false;
+  }
+
   if (state.step_count >= state.step_limit) {
     state.status = AgentStatus.STEP_LIMIT;
     state.final_result = `Step limit (${state.step_limit}) reached. Last action: ${state.last_action?.tool || 'none'}`;
@@ -1177,6 +1190,9 @@ async function runAgentLoop(goal, options = {}) {
 
       const actionResult = await act(state, decision);
       await record(state, observations, decision, actionResult);
+
+      // Tier 2 #14: per-step heartbeat for long-horizon supervisors (progress + stuck detection).
+      if (state.onStep) { try { state.onStep(state, decision, actionResult); } catch { /* never break the loop */ } }
 
       // Scope: a single-action goal stops after the FIRST successful tool result, so the
       // loop doesn't tack on unrequested follow-up actions (e.g. take screenshot THEN open).
@@ -1292,6 +1308,9 @@ async function runAgentLoopFromState(state) {
 
       const actionResult = await act(state, decision);
       await record(state, observations, decision, actionResult);
+
+      // Tier 2 #14: per-step heartbeat for long-horizon supervisors (progress + stuck detection).
+      if (state.onStep) { try { state.onStep(state, decision, actionResult); } catch { /* never break the loop */ } }
 
       // Scope: a single-action goal stops after the FIRST successful tool result, so the
       // loop doesn't tack on unrequested follow-up actions (e.g. take screenshot THEN open).

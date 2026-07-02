@@ -780,6 +780,8 @@ router.get('/workflow/:id', (req, res) => {
 router.get('/workflows', (_req, res) => { res.json({ ok: true, workflows: workflowEngine.list() }); });
 // Resume a paused/incomplete workflow on demand.
 router.post('/workflow/:id/resume', (req, res) => { res.json(workflowEngine.resume(req.params.id)); });
+// Abort a running workflow at the next stage/step boundary (Tier 2 #14).
+router.post('/workflow/:id/abort', (req, res) => { res.json(workflowEngine.abort(req.params.id)); });
 
 // ---- Context compression + lineage (Hermes-style) ----
 // Force/trigger a rolling-summary compression for a session and return the result.
