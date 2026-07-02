@@ -453,6 +453,18 @@ export default function Stage() {
     } finally { setBusyId(''); }
   };
 
+  // Open a file / folder / URL on the machine (click-to-access for the dock cards). A URL just
+  // opens in a new browser tab; a local file path can't be opened by the browser, so we ask the
+  // server to open it on the machine via open_item.
+  const openTarget = useCallback(async (target) => {
+    const t = String(target || '').trim();
+    if (!t) return;
+    if (/^https?:\/\//i.test(t)) { window.open(t, '_blank', 'noopener'); return; }
+    try {
+      await fetch(`${API_BASE}/files/open`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ target: t }) });
+    } catch { /* best-effort; server may be restarting */ }
+  }, []);
+
   // ---- command line (plan §9: NO client-side intent regex — the server routes) ----
   const send = async () => {
     const text = input.trim();
@@ -568,11 +580,15 @@ export default function Stage() {
               <button className="st-ghost" onClick={() => dock.togglePin(c.id)} title={c.pinned ? 'unpin' : 'pin'}>{c.pinned ? '📌' : '·'}</button>
               <button className="st-ghost" onClick={() => dock.dismiss(c.id)} title="dismiss">✕</button>
             </div>
-            {/* data-true skin body — the real query / url / path from the tool's own args */}
+            {/* data-true skin body — the real query / url / path from the tool's own args.
+                Files + URLs are CLICKABLE: clicking opens the item on the machine (a browser
+                link can't open a local file, so it posts to /files/open → open_item). */}
             {c.skin && c.skin.kind === 'search' && c.skin.query ? <div className="st-skin">“{c.skin.query}”</div> : null}
-            {c.skin && c.skin.kind === 'web' && c.skin.url ? <div className="st-skin mono">{c.skin.url}</div> : null}
+            {c.skin && c.skin.kind === 'web' && c.skin.url ? (
+              <div className="st-skin mono st-open" title="Open in your browser" onClick={() => openTarget(c.skin.url)}>{c.skin.url}</div>
+            ) : null}
             {c.skin && c.skin.kind === 'file' && c.skin.path ? (
-              <div className="st-skin mono">{String(c.skin.path).split(/[\\/]/).filter(Boolean).map((seg, i, arr) => (
+              <div className="st-skin mono st-open" title="Open this file" onClick={() => openTarget(c.skin.path)}>{String(c.skin.path).split(/[\\/]/).filter(Boolean).map((seg, i, arr) => (
                 <span key={i}>{i > 0 ? <span className="st-crumb">/</span> : null}<span className={i === arr.length - 1 ? 'st-leaf' : ''}>{seg}</span></span>
               ))}</div>
             ) : null}
@@ -741,6 +757,9 @@ body { background: #000204; }
 .st-cdot.mini { width: 6px; height: 6px; margin-left: 2px; }
 .st-skin { font-size: 11.5px; color: #a5b0c4; margin-top: 4px; word-break: break-all; line-height: 1.4; }
 .st-skin.mono { font-family: ui-monospace, monospace; font-size: 11px; color: #7c869c; }
+.st-skin.st-open { cursor: pointer; border-radius: 6px; padding: 2px 4px; margin-left: -4px; transition: background 0.12s, color 0.12s; }
+.st-skin.st-open:hover { background: rgba(139,92,246,0.14); color: #cbd5e1; }
+.st-skin.st-open:hover .st-leaf { color: var(--ava-accent2); }
 .st-crumb { color: #475569; margin: 0 2px; }
 .st-leaf { color: #cbd5e1; font-weight: 600; }
 

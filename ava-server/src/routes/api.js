@@ -448,6 +448,22 @@ router.get('/files/download', (req, res) => {
   }
 })
 
+// Open a file / folder / URL on the machine in its default app — the "click a card to access it"
+// action for the Stage popup panels (a file path can't be opened by a browser link, so the UI
+// posts here and the server opens it locally via open_item). Deliberate user action, so it just
+// opens what was asked. URLs open in the real browser; files/folders in their default handler.
+router.post('/files/open', async (req, res) => {
+  try {
+    const target = String(req.body?.target || req.body?.path || req.body?.url || '').trim();
+    if (!target) return res.status(400).json({ ok: false, error: 'missing target' });
+    const r = await toolsService.executeTool('open_item', { target, confirm: true, confirmed: true },
+      false, { source: 'ui-panel', bypassIdempotency: true });
+    const inner = (r && (r.result || r)) || {};
+    const ok = !(r && r.ok === false) && String(inner.status || 'ok').toLowerCase() !== 'error';
+    res.json({ ok, target, result: inner });
+  } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+});
+
 // Tier 1 #6/#8: deleted handleIntelligentFileSearch — a regex file-search path with
 // hardcoded "C:\Users\USER 1\" directories from another machine; file requests now go
 // through the agent loop (fs_find/fs_read/open_item chosen natively by the model).

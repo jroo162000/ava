@@ -1112,13 +1112,21 @@ Don't read raw tool names, JSON, or status codes, but you MAY describe your heal
       } catch (e) { /* fall back to whatever finalText we had */ }
     }
 
-    // HONESTY GUARD: if NO tool actually ran this turn but the user asked for an
-    // ACTION, never let a chatty "I'll do it" / "done" pass as success.
+    // HONESTY GUARD: if NO tool actually ran this turn, never let a chatty "I'll do it" / "done" /
+    // "let me get that" / "I'm working on it" pass as if she's actually doing something. Widened
+    // 2026-07-02 (Jelani: "sometimes she says 'I'm working on it' or 'let me get that' and doesn't
+    // actually do anything"): the promise set now includes progress/filler phrases, the request
+    // set includes lookup/retrieval verbs, and a "bare/no-substance" gate keeps it from ever
+    // clobbering a real answer that happens to contain "I'll" mid-sentence.
     if (!_ground && !_waiting) {
-      const actiony = /\b(send|reply|email|e-?mail|text|message|create|add|schedule|set\s+(up|a|an)|book|delete|remove|cancel|update|change|move|rename|open|write|post|turn\s+(on|off))\b/i.test(userText);
-      const claimsDoneOrPromise = !finalText || /\b(sent|replied|created|added|scheduled|booked|deleted|removed|updated|changed|opened|posted|done|i'?ll|i will|on it|just a moment|i'?ve|i have)\b/i.test(finalText);
-      if (actiony && claimsDoneOrPromise) {
-        finalText = "I wasn't actually able to do that — nothing ran on my end, so I won't tell you it's done. Want me to try again, or give me a bit more detail?";
+      const actiony = /\b(send|reply|email|e-?mail|text|message|create|add|schedule|set\s+(up|a|an)|book|delete|remove|cancel|update|change|move|rename|open|write|post|turn\s+(on|off)|check|find|look(\s*up)?|get|pull|grab|fetch|search|read|list|show|see|bring up|take a look)\b/i.test(userText);
+      const promiseOrDone = /\b(sent|replied|created|added|scheduled|booked|deleted|removed|updated|changed|opened|posted|done|i'?ll|i will|i'?ve|i have|on it|working on it|just a (sec|second|moment|minute)|give me a (sec|second|moment|minute)|hang on|one (sec|second|moment)|let me (get|grab|check|look|pull|find|see|fetch|take a look|look into|bring)|getting (that|it)|pulling (that|it)|looking into (that|it)|i'?m (on|getting|pulling|looking|working))\b/i.test(String(finalText || ''));
+      // "bare" = there's no actual answer/data — a short reply with no numbers, no "here's/found",
+      // no list. A substantive reply (even if it opens with "I'll") is NOT clobbered.
+      const hasSubstance = /[0-9]|\bhere('?s| is| are)\b|\bfound\b|\bshows?\b|\bthere (is|are)\b|:\s*\S|\n\s*[-*]/i.test(String(finalText || ''));
+      const bare = !finalText || (String(finalText).trim().length < 160 && !hasSubstance);
+      if (actiony && promiseOrDone && bare) {
+        finalText = "I wasn't actually able to do that just now — nothing ran on my end, so I won't pretend I'm on it. Want me to try again, or give me a bit more detail?";
       }
     }
 
