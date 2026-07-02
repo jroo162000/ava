@@ -389,5 +389,55 @@ if ((process.env.AVA_FINANCE_AUTOPOPULATE || '1') !== '0') {
   if (t0.unref) t0.unref();
 }
 
-export default { ingest, search, stats, runPopulate, popStatus };
+// ── getLocalTaxRates(userLocation) ──
+// Returns state-specific income-tax rate data from the embedded knowledge base.
+// Searches recent_research (the vector index) for tax-rate content matching the user's location
+// and yields structured rate info if found (e.g. MA 5.0%, NH no income tax, etc.).
+// Falls back to a null result (no assumptions) when the KB lacks data.
+export async function getLocalTaxRates(userLocation) {
+  if (!userLocation || typeof userLocation !== 'string') return { location: null, rates: null };
+  const loc = userLocation.trim();
+  // Normalize: strip common prefixes/suffixes like "in", "for", "state of", etc.
+  const normalized = loc.replace(/^(in|for|the|state of)\s+/i, '').replace(/\s+(state|income|tax|rates?)$/i, '').trim();
+  // Build queries: search for rate-specific terms + location
+  const queries = [
+    `${normalized} individual income tax rate`,
+    `${normalized} income tax brackets`,
+    `${normalized} state income tax rate 2024`,
+    `${normalized} no income tax`,
+  ];
+  const results = [];
+  for (const q of queries) {
+    try {
+      const hits = await search(q, 3);
+      if (hits && hits.length > 0) {
+        for (const h of hits) {
+          // Score each hit by text relevance (if location name appears in the text)
+          const textLower = h.text.toLowerCase();
+          const locLower = normalized.toLowerCase();
+          const locWords = new Set(locLower.split(/[^a-z0-9]+/).filter(Boolean));
+          const wordMatches = [...locWords].filter(w => textLower.includes(w)).length;
+          const matchRatio = locWords.size > 0 ? wordMatches / locWords.size : 0;
+          results.push({ text: h.text, score: h.score * (1 + matchRatio * 0.5), source: h.source, url: h.url });
+        }
+      }
+    } catch { /* skip query */ }
+  }
+  // Sort by combined score descending
+  results.sort((a, b) => b.score - a.score);
+  if (results.length === 0) return { location: normalized, rates: null, note: 'No tax-rate data found in knowledge base.' };
+  // Try to extract structured rate info from the best result(s).
+  // Pattern: "5.0%" near "income tax", "no personal income tax", or bracket ranges like "$0 – $8,025"
+  const ratePattern = /(no\s+personal\s+income\s+tax|no\s+state\s+income\s+tax|(flat\s+)?rate\s*:?\s*([\d.]+)\s*%?|(?:rate|tax)\s+(?:of\s+)?([\d.]+)\s*%?|bracket\s*:?\s*\$[\d,]+\s*[-–]\s*\$[\d,]+)/gi;
+  const bestText = results.slice(0, 3).map(r => r.text).join(' ');
+  const match = bestText.match(ratePattern);
+  if (match) {
+    const rates = match.map(m => m.trim());
+    return { location: normalized, rates, sources: results.slice(0, 3).map(r => r.url || r.source).filter(Boolean) };
+  }
+  // If no explicit rate pattern, return the full text snippets as reference
+  return { location: normalized, rates: results.slice(0, 3).map(r => r.text.slice(0, 300)), sources: results.slice(0, 3).map(r => r.url || r.source).filter(Boolean) };
+}
+
+export default { ingest, search, stats, runPopulate, popStatus, getLocalTaxRates };
 // scrape-hardening: dead-URL blacklist + alternate discovery + source-level dedup (rev)

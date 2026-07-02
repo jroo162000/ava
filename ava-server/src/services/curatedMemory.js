@@ -73,6 +73,46 @@ export function buildMemoryBlock(force = false) {
 }
 
 // Bounded write API used by the P2 background reviewers (and manual edits).
+// Structured observation storage — appends timestamped text lines to the correct memory file.
+export function storeObservation(category, text_lines) {
+  ensureSeed();
+  if (!Array.isArray(text_lines) || text_lines.length === 0) return { ok: false, error: 'empty_lines', stored: 0 };
+  const validCats = { 'USER.md': 'user', 'MEMORY.md': 'env' };
+  const fileKey = validCats[category];
+  if (!fileKey) return { ok: false, error: 'invalid_category', stored: 0 };
+  const p = fileKey === 'user' ? userPath() : memoryPath();
+  const cap = fileKey === 'user' ? USER_CAP : MEMORY_CAP;
+  const ts = new Date().toISOString();
+  const header = `[observation @ ${ts}]`;
+  const cleanLines = [];
+  for (const line of text_lines) {
+    const clean = String(line || '').replace(/\s+/g, ' ').trim();
+    if (clean) cleanLines.push(clean);
+  }
+  if (cleanLines.length === 0) return { ok: true, stored: 0 };
+  const body = cleanLines.map(l => `  - ${l}`).join('\n');
+  const block = `\n${header}\n${body}\n`;
+  try {
+    let t = fs.existsSync(p) ? fs.readFileSync(p, 'utf8') : '';
+    const newContent = t.trimEnd() + block;
+    const totalChars = newContent.length;
+    let trimmed = newContent;
+    while (trimmed.length > cap) {
+      // Remove oldest observation block (from start)
+      const idx = trimmed.indexOf('\n[observation @ ');
+      if (idx === -1) break;
+      const endIdx = trimmed.indexOf('\n[observation @ ', idx + 1);
+      const blockEnd = (endIdx === -1) ? trimmed.length : endIdx;
+      trimmed = trimmed.slice(0, idx) + trimmed.slice(blockEnd);
+    }
+    fs.writeFileSync(p, trimmed, 'utf8');
+    _cache = null;
+    return { ok: true, stored: cleanLines.length };
+  } catch (e) {
+    return { ok: false, error: e.message, stored: 0 };
+  }
+}
+
 export function appendFact(target, line) {
   ensureSeed();
   const p = target === 'user' ? userPath() : memoryPath();

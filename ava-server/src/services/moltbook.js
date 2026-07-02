@@ -20,6 +20,7 @@ class MoltbookService {
     this.learnings = [];
     this.lastFeedCheck = null;
     this.rateLimitedUntil = 0;
+    this.commentThreads = new Map(); // postId -> { parentPostId, commentTimestamp, lastReplyCount }
     this.loadCredentials();
     this.loadLearnings();
   }
@@ -213,7 +214,23 @@ class MoltbookService {
       payload.parent_id = parentCommentId;
     }
     const result = await this.apiRequest(`posts/${postId}/comments`, 'POST', payload);
+    if (result.success || result.id || result.comment) {
+      this._trackCommentThread(parentCommentId || postId, postId);
+    }
     return result;
+  }
+
+  _trackCommentThread(parentPostId, commentPostId) {
+    // Store the thread so _checkEngagement can later fetch replies
+    const key = String(parentPostId || commentPostId);
+    if (!this.commentThreads.has(key)) {
+      this.commentThreads.set(key, {
+        parentPostId: key,
+        commentTimestamp: Date.now(),
+        lastReplyCount: 0
+      });
+      logger.info('[moltbook] Tracking comment thread', { postId: key });
+    }
   }
 
   async upvote(postId) {
@@ -252,12 +269,89 @@ class MoltbookService {
     return [];
   }
 
+  async checkTrackedThreads() {
+    // Returns engagement updates: comments on tracked threads that mention AVA
+    const updates = [];
+    const toCheck = Array.from(this.commentThreads.entries()).slice(0, 6);
+    for (const [postId, thread] of toCheck) {
+      const comments = await this.getPostComments(postId, 50);
+      if (!Array.isArray(comments)) continue;
+      const newReplyCount = comments.length;
+      if (newReplyCount > (thread.lastReplyCount || 0)) {
+        // New replies since we last checked
+        const newReplies = comments.slice(thread.lastReplyCount || 0);
+        for (const reply of newReplies) {
+          if (reply.author && reply.author.name !== this.agentName) {
+            const body = (reply.content || '').toLowerCase();
+            const mentionsAva = body.includes('@' + this.agentName.toLowerCase()) ||
+                                body.includes('ava') ||
+                                body.includes('voice');
+            if (mentionsAva) {
+              updates.push({
+                postId,
+                commentId: reply.id,
+                author: reply.author.name,
+                content: (reply.content || '').slice(0, 200),
+                timestamp: reply.created_at || new Date().toISOString(),
+                type: 'reply_mention'
+              });
+            }
+          }
+        }
+        thread.lastReplyCount = newReplyCount;
+        this.saveLearnings();
+      }
+    }
+    return updates;
+  }
+
   async markPostNotificationsRead(postId) {
     return this.apiRequest(`notifications/read-by-post/${postId}`, 'POST');
   }
 
+  _isDuplicate(text, threshold = 0.85) {
+    // Compare incoming text against the last N stored learnings using a simple Jaccard similarity
+    // on word bigrams. Returns true if any existing learning exceeds the threshold.
+    if (!text || text.length < 20) return false;
+    const candidates = this.learnings.slice(-100); // only scan most recent 100 entries
+    const incomingBigrams = this._wordBigrams(text.toLowerCase());
+    for (const existing of candidates) {
+      const existingText = `${existing.title || ''} ${existing.summary || ''}`.toLowerCase();
+      const existingBigrams = this._wordBigrams(existingText);
+      if (incomingBigrams.size === 0 || existingBigrams.size === 0) continue;
+      // Jaccard similarity: intersection / union
+      const intersection = new Set([...incomingBigrams].filter(b => existingBigrams.has(b)));
+      const union = new Set([...incomingBigrams, ...existingBigrams]);
+      const similarity = union.size > 0 ? intersection.size / union.size : 0;
+      if (similarity >= threshold) {
+        logger.debug('[moltbook] Duplicate learning detected', {
+          existingSummary: existingText.slice(0, 80),
+          incomingSummary: text.slice(0, 80),
+          similarity: similarity.toFixed(2)
+        });
+        return true;
+      }
+    }
+    return false;
+  }
+
+  _wordBigrams(text) {
+    const words = text.split(/\s+/).filter(w => w.length > 2);
+    const bigrams = new Set();
+    for (let i = 0; i < words.length - 1; i++) {
+      bigrams.add(`${words[i]} ${words[i+1]}`);
+    }
+    return bigrams;
+  }
+
   recordLearning(learning) {
     if (!learning || !learning.postId || !learning.summary) return false;
+    // Deduplication pass: reject if very similar to an existing learning
+    const compositeText = `${learning.title || ''} ${learning.summary}`;
+    if (this._isDuplicate(compositeText)) {
+      logger.debug('[moltbook] Skipping duplicate learning', { postId: learning.postId });
+      return false;
+    }
     const key = `${learning.postId}:${learning.commentId || learning.title || learning.summary.slice(0, 60)}`;
     const exists = this.learnings.some(l => (l.key || `${l.postId}:${l.commentId || l.title || String(l.summary || '').slice(0, 60)}`) === key);
     if (exists) return false;
@@ -276,6 +370,10 @@ class MoltbookService {
       };
     }
     return null;
+  }
+
+  async fetchComments(postId, limit = 100) {
+    return this.getPostComments(postId, limit);
   }
 
   async getMyPosts(limit = 50) {
@@ -314,6 +412,7 @@ class MoltbookService {
 
     const newLearnings = [];
     const now = new Date().toISOString();
+
 
     // Very lightweight spam/adversarial filter: skip obvious promos/noise before they become learnings
     const isNoisy = (post) => {
@@ -355,6 +454,11 @@ class MoltbookService {
         // Check if we already have this learning
         const exists = this.learnings.some(l => l.postId === post.id);
         if (!exists) {
+          const compositeText = `${title} ${this.summarize(content)}`;
+          if (this._isDuplicate(compositeText)) {
+            logger.debug('[moltbook] Skipping duplicate feed learning', { postId: post.id });
+            continue;
+          }
           const learning = {
             postId: post.id,
             title: title.slice(0, 100),

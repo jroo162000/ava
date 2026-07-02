@@ -63,4 +63,32 @@ export async function lessonFromError({ tool, args, error, goal } = {}) {
   }
 }
 
-export default { lessonFromError };
+export async function processRejection({ rawReason, tool, args, goal } = {}) {
+  try {
+    if (process.env.AVA_LESSONS_OFF === '1') return { saved: false, reason: 'disabled' };
+    const reasonStr = (rawReason || '').slice(0, 600);
+    if (!reasonStr) return { saved: false, reason: 'insufficient' };
+
+    // Extract core pattern: e.g. "calls pythonWorker.execute() which does not exist"
+    const sys = `You are given a rejected proposal and its rejection reason. Extract the core technical mistake pattern in one short, specific sentence (max 150 chars). Example: "avoid calling pythonWorker.execute() — use pythonWorker.executeTool() instead". If no clear pattern exists, output exactly: null. Never include secrets.`;
+    const usr = `REJECTION CONTEXT\nTOOL: ${tool || 'unknown'}\nARGS: ${JSON.stringify(args || {}).slice(0, 200)}\nGOAL: ${goal || ''}\nREJECTION: ${reasonStr}`;
+
+    let text = '';
+    try {
+      const r = await llmService.chat([{ role: 'system', content: sys }, { role: 'user', content: usr }], { temperature: 0.2, max_tokens: 150 });
+      text = (r.text || r.content || '').trim();
+    } catch (e) { return { saved: false, error: e.message }; }
+
+    if (!text || /^null\b/i.test(text) || text.toLowerCase() === 'null') return { saved: false, reason: 'no lesson' };
+    const lesson = text.replace(/\s+/g, ' ').trim().slice(0, 240);
+    if (!safe(lesson)) { logger?.warn?.('[lessonLearner] rejected unsafe rejection lesson'); return { saved: false, reason: 'guard' }; }
+
+    const res = curatedMemory.appendFact('memory', `Lesson: ${lesson}`);
+    logger?.info?.('[lessonLearner] saved rejection lesson', { lesson: lesson.slice(0, 80) });
+    return { saved: !!(res.ok && !res.deduped), lesson };
+  } catch (e) {
+    return { saved: false, error: e.message };
+  }
+}
+
+export default { lessonFromError, processRejection };

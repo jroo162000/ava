@@ -9,6 +9,60 @@ import llmService from './llm.js';
 import conversationLogger from './conversationLogger.js';
 import curatedMemory from './curatedMemory.js';
 
+// Lesson-hash deduplication set — stores normalized keys derived from rejected
+// proposal lessons so that the same mistake pattern is not re-proposed.
+const lessonHashes = new Set();
+
+// Normalize a lesson string into a stable hash key for deduplication.
+function _lessonKey(lesson) {
+  if (!lesson || typeof lesson !== 'string') return '';
+  return lesson.replace(/\s+/g, ' ').trim().toLowerCase().slice(0, 120);
+}
+
+// Read the `prior_mistake_lessons` array from AVA state (passed as an array) and
+// store deduplication keys. Accepts state.priorMistakeLessons or a direct array.
+export function ingestMistakeLessons(lessons) {
+  const list = Array.isArray(lessons) ? lessons : (lessons && lessons.priorMistakeLessons) || [];
+  let count = 0;
+  for (const entry of list) {
+    const src = (entry && entry.source) || '';
+    const lesson = (entry && entry.lesson) || '';
+    const key = _lessonKey(src + '|' + lesson);
+    if (key && !lessonHashes.has(key)) {
+      lessonHashes.add(key);
+      count++;
+    }
+  }
+  return count;
+}
+
+// Check whether a proposal string matches any stored lesson pattern.
+export function isLessonKnown(proposalText) {
+  if (!proposalText || typeof proposalText !== 'string') return false;
+  const probe = _lessonKey(proposalText);
+  for (const key of lessonHashes) {
+    // If the lesson key is a substring of the proposal (or vice versa) it's a repeat.
+    if (probe.includes(key) || key.includes(probe)) return true;
+  }
+  return false;
+}
+
+// Ingest lessons from the signal's proposal_tests field (each test result).
+export function ingestProposalTests(tests) {
+  if (!Array.isArray(tests)) return 0;
+  let count = 0;
+  for (const t of tests) {
+    if (t && t.lesson) {
+      const key = _lessonKey(t.lesson);
+      if (key && !lessonHashes.has(key)) {
+        lessonHashes.add(key);
+        count++;
+      }
+    }
+  }
+  return count;
+}
+
 // Reject patterns — never let untrusted conversation text become a behavior-altering or
 // secret "memory" (AVA reads email/web/files, so this guard matters).
 const REJECT = [
@@ -83,6 +137,15 @@ Return ONLY a JSON array, max 5 items: [{"target":"user"|"memory","fact":"..."}]
   }
 }
 
+// Public method: given the full AVA state (or at least { priorMistakeLessons, proposalTests }),
+// ingest all previously-rejected lessons so they are skipped in future proposals.
+export function reviewMistakeLessons(state) {
+  if (!state) return { ingested: 0, total: lessonHashes.size };
+  const fromLessons = ingestMistakeLessons(state.priorMistakeLessons);
+  const fromTests = ingestProposalTests(state.proposalTests);
+  return { ingested: fromLessons + fromTests, total: lessonHashes.size };
+}
+
 async function consolidateIfNeeded() {
   const targets = [
     { name: 'user', cap: 1500, path: curatedMemory.paths.userPath() },
@@ -107,4 +170,4 @@ async function consolidateIfNeeded() {
   }
 }
 
-export default { reviewAndUpdate };
+export default { reviewAndUpdate, ingestMistakeLessons, ingestProposalTests, reviewMistakeLessons, isLessonKnown };

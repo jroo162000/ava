@@ -32,6 +32,29 @@ function save(rules) {
 
 export function listRules() { return load().rules; }
 
+// Active guardrail: before every tool invocation or conversation turn, call this to retrieve
+// lessons relevant to the current action string (e.g., tool name, intent). It scans the loaded
+// rules for patterns that match the action, and returns a system-context string to inject.
+// This prevents AVA from repeating rejected patterns (like calling nonexistent `executeTool`).
+export function retrieveAndApplyLessons(currentAction) {
+  if (process.env.AVA_GUIDANCE_OFF === '1') return '';
+  if (!currentAction || typeof currentAction !== 'string') return '';
+  const rules = load().rules;
+  if (!rules.length) return '';
+  const actionLower = currentAction.toLowerCase();
+  const matched = rules.filter(r => {
+    const text = (r.text || '').toLowerCase();
+    // Match if the action contains a meaningful (>3 char) term from the lesson text.
+    // (Review fix: the original second clause matched ANY token with no length filter —
+    // one-char words like "a" made every rule match every action.)
+    const terms = text.split(/\s+/).filter(t => t.length > 3);
+    return terms.some(term => actionLower.includes(term));
+  });
+  if (!matched.length) return '';
+  const body = matched.map(r => `- ${r.text}`).join('\n');
+  return `ACTIVE LESSONS (relevant to current action — follow these to avoid rejected patterns):\n${body}`;
+}
+
 export function addRule(text) {
   const clean = String(text || '').replace(/\s+/g, ' ').trim().slice(0, MAX_LEN);
   if (!clean) return null;
@@ -79,4 +102,4 @@ export function addRejectedProposalLesson(text) {
   return addRule(`Rejected proposal/review lesson: ${text}`);
 }
 
-export default { listRules, addRule, addRejectedProposalLesson, setRules, buildGuidanceBlock };
+export default { listRules, addRule, addRejectedProposalLesson, setRules, buildGuidanceBlock, retrieveAndApplyLessons };

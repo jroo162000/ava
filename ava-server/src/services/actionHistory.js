@@ -86,4 +86,36 @@ export function summarize(limit = 6) {
   return items.length ? items.map(a => a.summary).join('; ') : '';
 }
 
-export default { recordTurn, recent, summarize };
+export function pruneByAge(maxAgeMs, minRetain = 3) {
+  _load();
+  if (!_ring.length) return 0;
+  const cutoff = Date.now() - maxAgeMs;
+  // Always keep the last minRetain entries regardless of age
+  const keep = Math.min(minRetain, _ring.length);
+  const alwaysKeep = _ring.slice(-keep);
+  const candidates = _ring.slice(0, -keep);
+  const lenBefore = _ring.length;
+  const pruned = candidates.filter(e => {
+    const ts = e && e.ts;
+    if (!ts) return true;
+    const t = new Date(ts).getTime();
+    return !isNaN(t) && t >= cutoff;
+  });
+  _ring = [...pruned, ...alwaysKeep];
+  const removed = lenBefore - _ring.length;
+  if (removed > 0) _persist();
+  return removed;
+}
+
+function _persist() {
+  try {
+    _ensure();
+    fs.writeFileSync(LOG, _ring.map(e => JSON.stringify(e)).join('\n') + '\n', 'utf8');
+  } catch { /* ignore */ }
+}
+
+export function prune() {
+  return pruneByAge(24 * 60 * 60 * 1000, 5);
+}
+
+export default { recordTurn, recent, summarize, pruneByAge, prune };

@@ -7,6 +7,12 @@ import fs from 'fs';
 import path from 'path';
 import logger from '../utils/logger.js';
 import llmService from './llm.js';
+
+// Rough token estimate: ~140 characters per 100 tokens (observed average for English text)
+function _estimateTokens(text) {
+  if (!text) return 0;
+  return Math.ceil(text.length / 1.4);
+}
 import conversationLogger from './conversationLogger.js';
 
 const FILE = path.join(process.cwd(), 'data', 'lineage.json');
@@ -79,5 +85,36 @@ async function maybeCompress(sessionId, opts = {}) {
   }
 }
 
-export { summaryFor, lineage, maybeCompress };
+// Prune older non-system, non-tool-result messages when the conversation exceeds a token budget.
+// Preserves the most recent messages up to budgetTokens, then removes earlier ones (except system).
+// Returns the pruned conversation array (mutates in place by reference).
+function compressConversation(messages, budgetTokens = 8000) {
+  if (!Array.isArray(messages) || messages.length < 2) return messages;
+  // Always keep all system messages
+  const systemMsgs = messages.filter((m) => m?.role === 'system');
+  const nonSystem = messages.filter((m) => m?.role !== 'system');
+  if (!nonSystem.length) return messages;
+  let totalTokens = 0;
+  let keepCount = 0;
+  // Walk from newest to oldest, accumulating until budget is reached
+  for (let i = nonSystem.length - 1; i >= 0; i--) {
+    const tokens = _estimateTokens(nonSystem[i].content || '');
+    if (totalTokens + tokens > budgetTokens) {
+      // This message exceeds remaining budget — stop here (keep what we have)
+      break;
+    }
+    totalTokens += tokens;
+    keepCount++;
+  }
+  // If we can keep everything, no change needed
+  if (keepCount >= nonSystem.length) return messages;
+  const keepNonSystem = nonSystem.slice(nonSystem.length - keepCount);
+  const pruned = [...systemMsgs, ...keepNonSystem];
+  // Reflect the change in the original array (for callers that rely on mutation)
+  messages.length = 0;
+  messages.push(...pruned);
+  return pruned;
+}
+
+export { summaryFor, lineage, maybeCompress, compressConversation };
 export default { summaryFor, lineage, maybeCompress };
