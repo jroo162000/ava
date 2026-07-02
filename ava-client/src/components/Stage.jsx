@@ -1,6 +1,10 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+import React, { useState, useEffect, useRef, useCallback, Suspense, lazy } from 'react';
 import { publish, subscribe } from '../liveBus.js';
 import ArtifactPanel from './ArtifactPanel.jsx';
+
+// #17b: the holographic core is lazy — three.js loads in its own chunk, and any load
+// failure just leaves the CSS orb (the Suspense fallback / degrade path) in place.
+const Core3D = lazy(() => import('./Core3D.jsx'));
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Stage — Tier 3 #16 (Phase 1 of the UI merge, docs/UI_MERGE_PLAN.md).
@@ -199,6 +203,9 @@ export default function Stage() {
   const orchId = useRef(null);                       // current orchestration card id
   const [amp, setAmp] = useState(0);                 // #17: live speech amplitude (rms)
   const ampDecay = useRef(null);
+  const ampRef = useRef(0);                          // #17b: ref mirror for the 3D core (no re-render churn)
+  const stateRef = useRef('idle');
+  const [degraded3d, setDegraded3d] = useState(false); // #17b: auto-degrade -> CSS orb
 
   const attention = pendingMods.length + pendingVerifs.length;
 
@@ -265,9 +272,10 @@ export default function Stage() {
           // #17: real amplitude from the voice runner — the core pulses to HER voice.
           const rms = (d && d.rms) | 0;
           setAmp(rms);
+          ampRef.current = rms;
           core.onAudio(rms);
           clearTimeout(ampDecay.current);
-          ampDecay.current = setTimeout(() => setAmp(0), 450);  // no frames -> settle
+          ampDecay.current = setTimeout(() => { setAmp(0); ampRef.current = 0; }, 450);  // no frames -> settle
           break;
         }
         case 'tool.start':
@@ -436,7 +444,15 @@ export default function Stage() {
 
   const ticker = turns.slice(-6);
   const coreState = core.state;
+  stateRef.current = coreState;   // ref mirror for the 3D core's frame loop
   const stateLabel = { idle: 'idle', thinking: 'thinking…', speaking: 'speaking', working: 'working…' }[coreState] || '';
+
+  const cssCore = (
+    <div className={`st-core ${coreState} ${attention ? 'attention' : ''}`}>
+      <div className="st-ring r1" /><div className="st-ring r2" /><div className="st-ring r3" />
+      <div className="st-orb" style={amp > 0 ? { transform: `scale(${1 + Math.min(amp / 9000, 0.55)})`, transition: 'transform 90ms linear', animation: 'none' } : undefined} />
+    </div>
+  );
 
   return (
     <div className={`stage ${attention ? 'attn' : ''}`}>
@@ -470,12 +486,16 @@ export default function Stage() {
         {sending && !liveText && <div className="st-turn ava live"><span className="st-who">ava</span><div className="st-md st-thinking">…</div></div>}
       </div>
 
-      {/* center: the core — state machine is real; orb scale is HER live amplitude (#17) */}
+      {/* center: the core — state machine is real; motion/pulse is HER live amplitude (#17).
+          3D holographic core (#17b) with the CSS orb as Suspense fallback + degrade path. */}
       <div className="st-corewrap">
-        <div className={`st-core ${coreState} ${attention ? 'attention' : ''}`}>
-          <div className="st-ring r1" /><div className="st-ring r2" /><div className="st-ring r3" />
-          <div className="st-orb" style={amp > 0 ? { transform: `scale(${1 + Math.min(amp / 9000, 0.55)})`, transition: 'transform 90ms linear', animation: 'none' } : undefined} />
-        </div>
+        {degraded3d ? cssCore : (
+          <div className={`st-core3d ${attention ? 'attention' : ''}`}>
+            <Suspense fallback={cssCore}>
+              <Core3D stateRef={stateRef} ampRef={ampRef} onDegrade={(why) => { console.warn('[stage] 3D core degraded:', why); setDegraded3d(true); }} />
+            </Suspense>
+          </div>
+        )}
       </div>
 
       {/* right: unified panel dock — ToolTrace + orchestration cards */}
@@ -623,6 +643,8 @@ body { background: #000204; }
 .st-core.working .st-orb { box-shadow: 0 0 55px rgba(251,146,60,0.55); }
 .st-core.working .st-ring { border-top-color: rgba(251,146,60,0.8); animation-duration: 2.2s; }
 .st-core.attention::after { content: ''; position: absolute; inset: -14px; border-radius: 50%; border: 2px solid rgba(245,158,11,0.55); animation: stAttn 2.4s ease-in-out infinite; }
+.st-core3d { position: relative; width: min(46vh, 480px); height: min(46vh, 480px); }
+.st-core3d.attention::after { content: ''; position: absolute; inset: 18%; border-radius: 50%; border: 2px solid rgba(245,158,11,0.55); animation: stAttn 2.4s ease-in-out infinite; pointer-events: none; }
 
 .st-dock { position: absolute; right: 16px; top: 48px; width: 330px; max-height: calc(100vh - 190px); display: flex; flex-direction: column; gap: 8px; z-index: 20; overflow-y: auto; }
 .st-card { background: rgba(10,14,26,0.92); border: 1px solid rgba(255,255,255,0.08); border-radius: 12px; padding: 8px 10px; animation: stIn 200ms cubic-bezier(.2,.9,.3,1.2); backdrop-filter: blur(6px); }
