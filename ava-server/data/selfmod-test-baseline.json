@@ -1,7 +1,7 @@
 {
-  "generatedAt": "2026-07-02T07:40:23.257Z",
-  "note": "known pre-existing failures; the selfmod sandbox gate only blocks NEW failures",
-  "totalTests": 92,
+  "generatedAt": "2026-07-02T12:48:11.269Z",
+  "note": "known pre-existing failures; the selfmod sandbox gate only blocks NEW failures and suite-load regressions",
+  "totalTests": 101,
   "failed": [
     "Chat API Tests POST /respond should not route spoken self-description prompts to the Done fallback",
     "Idempotency Cache Tests Tool Execution Idempotency (API) should block repeated tool execution within TTL",
@@ -18,5 +18,18 @@
     "AutonomyPolicy responsibility trigger can ask_permission at high urgency",
     "AutonomyPolicy curiosity never interrupts and requires relevance threshold",
     "AutonomyPolicy high risk always forces ask_permission"
-  ]
+  ],
+  "suites": {
+    "chat.test.js": 5,
+    "idempotency.test.js": 26,
+    "api.test.js": 20,
+    "fileGen.test.js": 5,
+    "curiositySupervisor.test.js": 4,
+    "autonomyPolicy.test.js": 5,
+    "capabilities.test.js": 2,
+    "doctor.test.js": 2,
+    "longHorizon.test.js": 9,
+    "coreLoop.test.js": 22,
+    "configPath.test.js": 1
+  }
 }

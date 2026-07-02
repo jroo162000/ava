@@ -21,17 +21,22 @@ await new Promise((resolve) => {
 
 const j = JSON.parse(fs.readFileSync(tmpOut, 'utf8'));
 const failed = [];
+const suites = {};   // #19: suite basename -> tests that ran, for the suite-load gate
 for (const tr of (j.testResults || [])) {
-  for (const ar of (tr.assertionResults || [])) {
+  const suite = path.basename(tr.name || tr.testFilePath || 'unknown');
+  const asserts = tr.assertionResults || [];
+  suites[suite] = asserts.length;
+  for (const ar of asserts) {
     if (ar.status === 'failed') failed.push(ar.fullName || ar.title || 'unknown test');
   }
 }
 fs.mkdirSync(path.join(serverDir, 'data'), { recursive: true });
 fs.writeFileSync(path.join(serverDir, 'data', 'selfmod-test-baseline.json'), JSON.stringify({
   generatedAt: new Date().toISOString(),
-  note: 'known pre-existing failures; the selfmod sandbox gate only blocks NEW failures',
+  note: 'known pre-existing failures; the selfmod sandbox gate only blocks NEW failures and suite-load regressions',
   totalTests: j.numTotalTests | 0,
   failed,
+  suites,
 }, null, 2));
 try { fs.unlinkSync(tmpOut); } catch { /* best effort */ }
-console.log(`selfmod test baseline recorded: ${failed.length} known failures of ${j.numTotalTests} tests`);
+console.log(`selfmod test baseline recorded: ${failed.length} known failures of ${j.numTotalTests} tests across ${Object.keys(suites).length} suites`);
