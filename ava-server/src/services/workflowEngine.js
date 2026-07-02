@@ -26,6 +26,7 @@ import llmService from './llm.js';
 import agentLoop from './agentLoop.js';
 import environmentContext from './environmentContext.js';
 import { pushAnnouncement } from './announceQueue.js';
+import { emitVoiceEvent } from './voiceBus.js';  // Tier 3 #18: live workflow pipeline for the Stage
 
 const FILE = path.join(process.cwd(), 'data', 'workflows.json');
 const MAX_STORED = 50;
@@ -65,6 +66,26 @@ function _checkpoint(wf) {
   const map = _loadAll();
   map[wf.id] = wf;
   _saveAll(map);
+  _emitWf(wf);
+}
+
+// Tier 3 #18: broadcast a compact snapshot of the workflow to the Stage on every checkpoint
+// (plan/start/stage-transition/done). Broadcast-only telemetry — the Stage renders it as a
+// live pipeline card; the durable state stays in the checkpoint file.
+function _emitWf(wf) {
+  if (process.env.AVA_WORKFLOW_EVENTS === '0') return;
+  try {
+    emitVoiceEvent('workflow', {
+      id: wf.id,
+      goal: String(wf.goal || '').slice(0, 120),
+      status: wf.status || 'running',
+      currentStage: wf.currentStage | 0,
+      stages: (wf.stages || []).map(s => ({
+        title: String(s.title || s.goal || 'stage').slice(0, 60),
+        status: s.status || 'pending',
+      })),
+    }, 'workflow');
+  } catch { /* ui push is best-effort */ }
 }
 
 function _parseLooseJson(text) {

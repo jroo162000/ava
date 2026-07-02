@@ -125,4 +125,22 @@ export async function buildEnvironmentBlock() {
   return 'LIVE ENVIRONMENT — read-only awareness of the user\'s Windows machine right now. Use this so "this window", "this screen/tab", "why is it slow/full", and "what did you just do / undo what you just did" map to reality; do NOT guess or speculate when these tell you the answer, and don\'t read this aloud unless it\'s relevant:\n- ' + lines.join('\n- ');
 }
 
-export default { buildEnvironmentBlock };
+// Tier 3 #18: structured vitals for the Stage's vitals strip. Same cached data the prompt
+// block uses (window/cpu/disk refresh in the background; RAM/uptime are instant Node-os).
+// Triggers the same background refresh when stale; never blocks.
+export function getVitals() {
+  if (Date.now() - _cache.ts > 6000) { _refresh().catch(() => {}); }
+  const v = { foreground: _cache.window || '', cpu: _cache.cpu || '', disk: _cache.disk || '', ramPct: null, ramUsedGb: null, ramTotalGb: null, uptimeSec: 0 };
+  try {
+    const total = os.totalmem(), free = os.freemem();
+    if (total > 0) {
+      v.ramPct = Math.round((1 - free / total) * 100);
+      v.ramUsedGb = +((total - free) / 1073741824).toFixed(1);
+      v.ramTotalGb = +(total / 1073741824).toFixed(1);
+    }
+    v.uptimeSec = Math.floor(os.uptime());
+  } catch { /* optional */ }
+  return v;
+}
+
+export default { buildEnvironmentBlock, getVitals };

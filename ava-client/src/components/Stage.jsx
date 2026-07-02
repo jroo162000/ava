@@ -70,6 +70,24 @@ function md(src) {
 }
 
 const rid = () => `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+
+// #18: tool-specific visualizer skins (all data-true) — icon + a compact typed body derived
+// from the REAL args/result. Returns { icon, kind } for the card; the body is rendered from
+// the tool's own args (breadcrumb path, url, query) — nothing decorative or invented.
+function toolSkin(tool, args) {
+  const t = String(tool || '').toLowerCase();
+  const a = args || {};
+  if (/web_search|search/.test(t)) return { icon: '🔎', kind: 'search', query: a.query || a.q || '' };
+  if (/web_scrape|net_ops|browser|open_item|navigate/.test(t)) return { icon: '🌐', kind: 'web', url: a.url || a.target || '' };
+  if (/fs_|file_|open_file|read|write|append/.test(t)) return { icon: '📄', kind: 'file', path: a.path || a.file || a.file_path || a.pattern || '' };
+  if (/image_ops|model3d|scene3d/.test(t)) return { icon: '🎨', kind: 'media', prompt: a.prompt || a.description || '' };
+  if (/camera|vision|screen/.test(t)) return { icon: '📷', kind: 'vision' };
+  if (/comm_ops|email|calendar/.test(t)) return { icon: '✉️', kind: 'comm' };
+  if (/memory|recall|self_/.test(t)) return { icon: '🧠', kind: 'memory' };
+  if (/sys_ops|window_ops|app_control|ps_exec/.test(t)) return { icon: '🖥️', kind: 'system' };
+  return { icon: '⚙️', kind: 'generic' };
+}
+
 const argHint = (a) => {
   try {
     if (!a) return '';
@@ -206,6 +224,8 @@ export default function Stage() {
   const ampRef = useRef(0);                          // #17b: ref mirror for the 3D core (no re-render churn)
   const stateRef = useRef('idle');
   const [degraded3d, setDegraded3d] = useState(false); // #17b: auto-degrade -> CSS orb
+  const [vitals, setVitals] = useState(null);        // #18: sys.stats machine vitals
+  const [workflows, setWorkflows] = useState([]);    // #18: live workflow pipelines
 
   const attention = pendingMods.length + pendingVerifs.length;
 
@@ -278,8 +298,24 @@ export default function Stage() {
           ampDecay.current = setTimeout(() => { setAmp(0); ampRef.current = 0; }, 450);  // no frames -> settle
           break;
         }
+        case 'sys.stats':
+          setVitals(d);
+          break;
+        case 'workflow': {
+          // #18: live pipeline card. Keep the latest snapshot per workflow id; drop finished
+          // ones after a short hold so the dock doesn't accumulate.
+          setWorkflows(prev => {
+            const others = prev.filter(w => w.id !== d.id);
+            const next = [...others, { ...d, at: Date.now() }];
+            return next.slice(-3);
+          });
+          if (d.status === 'done' || d.status === 'failed' || d.status === 'aborted') {
+            setTimeout(() => setWorkflows(prev => prev.filter(w => w.id !== d.id)), 8000);
+          }
+          break;
+        }
         case 'tool.start':
-          dock.spawn({ kind: 'tool', callId: d.callId || '', title: d.tool || 'tool', detail: argHint(d.args), state: 'active' });
+          dock.spawn({ kind: 'tool', callId: d.callId || '', title: d.tool || 'tool', detail: argHint(d.args), skin: toolSkin(d.tool, d.args), state: 'active' });
           break;
         case 'tool.result':
           dock.patchWhere(
@@ -458,11 +494,17 @@ export default function Stage() {
     <div className={`stage ${attention ? 'attn' : ''}`}>
       <style>{STAGE_CSS}</style>
 
-      {/* top strip: connection + state (vitals arrive in Phase 3) */}
+      {/* top strip: connection + state, then the live vitals strip (#18, from sys.stats) */}
       <div className="st-top">
         <span className={`st-dot ${connected ? 'on' : ''}`} />
         <span className="st-topline">{connected ? 'live' : 'connecting…'}</span>
         <span className="st-topstate">{stateLabel}{coreState === 'working' && core.caption ? ` — ${core.caption}` : ''}</span>
+        <span className="st-vitals">
+          {vitals && vitals.cpu ? <span className="st-vital" title="CPU usage">CPU {String(vitals.cpu).replace('%', '')}%</span> : null}
+          {vitals && vitals.ramPct != null ? <span className={`st-vital ${vitals.ramPct >= 90 ? 'hot' : ''}`} title="RAM used">RAM {vitals.ramPct}%</span> : null}
+          {vitals && vitals.disk ? <span className="st-vital" title="Disk used">DISK {String(vitals.disk).replace(/^.*\s/, '')}</span> : null}
+          {vitals && vitals.foreground ? <span className="st-vital st-fg" title={vitals.foreground}>▤ {vitals.foreground}</span> : null}
+        </span>
         <button className="st-ghost" onClick={() => setHistoryOpen(o => !o)} title="Toggle full history">{historyOpen ? 'close history' : 'history'}</button>
         <a className="st-ghost" href="?classic=1" title="Classic UI fallback">classic</a>
       </div>
@@ -498,16 +540,43 @@ export default function Stage() {
         )}
       </div>
 
-      {/* right: unified panel dock — ToolTrace + orchestration cards */}
+      {/* right: unified panel dock — workflow pipelines (#18), ToolTrace + orchestration cards */}
       <div className="st-dock">
+        {workflows.map((w) => (
+          <div key={w.id} className={`st-card wf ${w.status}`}>
+            <div className="st-cardhead">
+              <span className={`st-cdot ${w.status === 'running' ? 'run' : w.status === 'done' ? 'ok' : (w.status === 'failed' || w.status === 'aborted') ? 'err' : 'run'}`} />
+              <span className="st-ctitle">⛓ {w.goal || 'workflow'}</span>
+              <span className="st-dim">{w.status}</span>
+            </div>
+            <div className="st-wf">
+              {(w.stages || []).map((s, i) => (
+                <div key={i} className={`st-wfstage ${s.status}${i === w.currentStage && w.status === 'running' ? ' cur' : ''}`}>
+                  <span className="st-wfdot">{s.status === 'done' ? '●' : s.status === 'running' ? '◌' : s.status === 'failed' ? '✕' : '○'}</span>
+                  <span className="st-wflabel">{s.title}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+        ))}
         {dock.cards.map((c) => (
           <div key={c.id} className={`st-card ${c.state} ${c.kind}`}>
             <div className="st-cardhead">
-              <span className={`st-cdot ${c.state === 'active' ? 'run' : c.ok ? 'ok' : 'err'}`} />
+              {c.skin ? <span className="st-cskin">{c.skin.icon}</span> : <span className={`st-cdot ${c.state === 'active' ? 'run' : c.ok ? 'ok' : 'err'}`} />}
               <span className="st-ctitle">{c.title}</span>
+              <span className={`st-cdot mini ${c.state === 'active' ? 'run' : c.ok ? 'ok' : 'err'}`} />
               <button className="st-ghost" onClick={() => dock.togglePin(c.id)} title={c.pinned ? 'unpin' : 'pin'}>{c.pinned ? '📌' : '·'}</button>
               <button className="st-ghost" onClick={() => dock.dismiss(c.id)} title="dismiss">✕</button>
             </div>
+            {/* data-true skin body — the real query / url / path from the tool's own args */}
+            {c.skin && c.skin.kind === 'search' && c.skin.query ? <div className="st-skin">“{c.skin.query}”</div> : null}
+            {c.skin && c.skin.kind === 'web' && c.skin.url ? <div className="st-skin mono">{c.skin.url}</div> : null}
+            {c.skin && c.skin.kind === 'file' && c.skin.path ? (
+              <div className="st-skin mono">{String(c.skin.path).split(/[\\/]/).filter(Boolean).map((seg, i, arr) => (
+                <span key={i}>{i > 0 ? <span className="st-crumb">/</span> : null}<span className={i === arr.length - 1 ? 'st-leaf' : ''}>{seg}</span></span>
+              ))}</div>
+            ) : null}
+            {c.skin && c.skin.kind === 'media' && c.skin.prompt ? <div className="st-skin">“{c.skin.prompt}”</div> : null}
             {c.detail ? <div className="st-cdetail">{c.detail}</div> : null}
             {c.kind === 'orch' && c.body && c.body.nodes && c.body.nodes.length > 0 && (
               <div className="st-orch">
@@ -608,8 +677,11 @@ body { background: #000204; }
 .st-dot { width: 8px; height: 8px; border-radius: 50%; background: #475569; }
 .st-dot.on { background: #34d399; box-shadow: 0 0 8px #34d399; }
 .st-topstate { color: var(--ava-accent); font-family: ui-monospace, monospace; }
-.st-top .st-ghost { margin-left: auto; }
-.st-top .st-ghost + .st-ghost { margin-left: 0; }
+/* vitals is always present and flexes to fill, pushing the ghost buttons to the far right */
+.st-vitals { flex: 1; margin-left: 8px; display: flex; justify-content: flex-end; gap: 10px; align-items: center; font-family: ui-monospace, monospace; font-size: 11px; overflow: hidden; }
+.st-vital { color: #7c869c; white-space: nowrap; }
+.st-vital.hot { color: #fb923c; }
+.st-vital.st-fg { color: #64748b; max-width: 240px; overflow: hidden; text-overflow: ellipsis; }
 .st-ghost { background: transparent; border: 1px solid rgba(255,255,255,0.1); color: #64748b; border-radius: 7px; padding: 2px 9px; font-size: 11px; cursor: pointer; text-decoration: none; }
 .st-ghost:hover { color: #cbd5e1; border-color: rgba(255,255,255,0.25); }
 
@@ -663,6 +735,29 @@ body { background: #000204; }
 .st-node.synth .st-nodeicon { color: var(--ava-accent2); }
 .st-nodelabel { color: #cbd5e1; }
 .st-nodedetail { color: #5b6577; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* #18: tool visualizer skins */
+.st-cskin { font-size: 14px; flex-shrink: 0; width: 18px; text-align: center; }
+.st-cdot.mini { width: 6px; height: 6px; margin-left: 2px; }
+.st-skin { font-size: 11.5px; color: #a5b0c4; margin-top: 4px; word-break: break-all; line-height: 1.4; }
+.st-skin.mono { font-family: ui-monospace, monospace; font-size: 11px; color: #7c869c; }
+.st-crumb { color: #475569; margin: 0 2px; }
+.st-leaf { color: #cbd5e1; font-weight: 600; }
+
+/* #18: workflow pipeline card */
+.st-card.wf { border-color: rgba(139,92,246,0.3); }
+.st-card.wf.done { border-color: rgba(52,211,153,0.35); }
+.st-card.wf.failed, .st-card.wf.aborted { border-color: rgba(248,113,113,0.4); }
+.st-wf { margin-top: 6px; display: flex; flex-direction: column; gap: 2px; }
+.st-wfstage { display: flex; gap: 7px; align-items: baseline; font-size: 11.5px; padding: 1px 4px; border-radius: 5px; }
+.st-wfstage.cur { background: rgba(139,92,246,0.12); }
+.st-wfstage.done .st-wfdot { color: #34d399; }
+.st-wfstage.running .st-wfdot { color: var(--ava-accent); animation: stPulse 1s ease-in-out infinite; }
+.st-wfstage.failed .st-wfdot { color: #f87171; }
+.st-wfstage.pending .st-wfdot { color: #475569; }
+.st-wfdot { flex-shrink: 0; width: 12px; }
+.st-wflabel { color: #cbd5e1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.st-wfstage.pending .st-wflabel { color: #6b7590; }
 
 .st-tray { position: absolute; left: 20px; bottom: 86px; width: min(38vw, 520px); max-height: 46vh; overflow-y: auto; display: flex; flex-direction: column; gap: 8px; z-index: 25; }
 .st-attn { background: rgba(20,15,3,0.94); border: 1px solid rgba(245,158,11,0.4); border-radius: 12px; padding: 10px 12px; animation: stIn 220ms ease; }

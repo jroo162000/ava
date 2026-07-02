@@ -27,6 +27,8 @@ import moltbookScheduler from './services/moltbookScheduler.js';
 import selfImprove from './services/selfImprove.js';
 import workflowEngine from './services/workflowEngine.js';
 import windowJanitor from './services/windowJanitor.js';
+import environmentContext from './services/environmentContext.js';   // Tier 3 #18: vitals source
+import { emitVoiceEvent } from './services/voiceBus.js';             // Tier 3 #18: sys.stats broadcast
 
 // Phase 7: Security audit at startup
 const isProd = process.env.NODE_ENV === 'production';
@@ -218,6 +220,18 @@ server.listen(PORT, HOST, () => {
     moltbookScheduler.startMoltbookScheduler();
   } catch (e) {
     logger.warn('Failed to force-start Moltbook scheduler', { error: e.message });
+  }
+
+  // Tier 3 #18: broadcast live machine vitals (cpu/ram/foreground/disk/uptime) to the Stage's
+  // vitals strip every 5s. Broadcast-only transient (voiceBus marks sys.stats non-storable), so
+  // it never fills the debug buffer or gets replayed on reconnect. Disable with AVA_SYS_STATS_OFF=1.
+  if (process.env.AVA_SYS_STATS_OFF !== '1') {
+    const emitStats = () => {
+      try { emitVoiceEvent('sys.stats', environmentContext.getVitals(), 'server'); } catch { /* best effort */ }
+    };
+    const statsTimer = setInterval(emitStats, parseInt(process.env.AVA_SYS_STATS_MS || '5000', 10) || 5000);
+    if (statsTimer.unref) statsTimer.unref();
+    setTimeout(emitStats, 1500);
   }
 });
 
