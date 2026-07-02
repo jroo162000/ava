@@ -1,7 +1,7 @@
 {
-  "generatedAt": "2026-07-02T12:48:11.269Z",
+  "generatedAt": "2026-07-02T19:18:16.403Z",
   "note": "known pre-existing failures; the selfmod sandbox gate only blocks NEW failures and suite-load regressions",
-  "totalTests": 101,
+  "totalTests": 111,
   "failed": [
     "Chat API Tests POST /respond should not route spoken self-description prompts to the Done fallback",
     "Idempotency Cache Tests Tool Execution Idempotency (API) should block repeated tool execution within TTL",
@@ -28,8 +28,9 @@
     "autonomyPolicy.test.js": 5,
     "capabilities.test.js": 2,
     "doctor.test.js": 2,
-    "longHorizon.test.js": 9,
     "coreLoop.test.js": 22,
+    "longHorizon.test.js": 9,
+    "proposalVerifier.test.js": 10,
     "configPath.test.js": 1
   }
 }
