@@ -766,6 +766,17 @@ async function runScan({ reason = 'scheduled', max = 1, avoid = [], diag: trigge
       reviewReason: proposalReview.reason,
       reviewers: proposalReview.reviewers,
     };
+    // Tier 3 #21: for a change that touches ROUTING/GUIDANCE behavior, stamp the current
+    // behavioral eval score as the baseline this change will be judged against. Cheap — reads
+    // the last recorded eval, never runs a fresh suite inline. Re-run POST /self/eval after
+    // applying to see the delta.
+    try {
+      const evalHarness = (await import('./evalHarness.js')).default;
+      if (evalHarness.isRoutingRelevant(plan.file)) {
+        const base = evalHarness.lastScore();
+        metadata.evalBaseline = base ? { score: base.score, passed: base.passed, total: base.total, at: base.at } : { score: null, note: 'no eval recorded yet — run POST /self/eval' };
+      }
+    } catch (e) { logger.warn('[selfImprove] eval baseline stamp failed', { error: e.message }); }
     const pf = await pythonWorker.selfMod({ action: 'propose_fix', file: plan.file, content: newContent, reason: plan.reason || `auto-improvement (${reason})`, metadata });
     const res = (pf && (pf.result || pf)) || {};
     logEntry({

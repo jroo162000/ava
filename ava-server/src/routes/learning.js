@@ -279,6 +279,17 @@ router.post('/self/digest/flush', async (_req, res) => {
   } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
 });
 
+// Tier 3 #21: run the lightweight behavioral routing eval against the live server and record
+// the score. On-demand (a handful of turns); use it to score a routing/guidance change before
+// and after applying it. Returns { score, passed, total, tasks }.
+router.post('/self/eval', async (_req, res) => {
+  try {
+    const evalHarness = (await import('../services/evalHarness.js')).default;
+    const result = await evalHarness.runEval({ record: true });
+    res.json({ ok: true, ...result });
+  } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+});
+
 router.post('/self/learn_correction', async (req, res) => {
   try {
     const { user_input, wrong, correct, context } = req.body || {};
