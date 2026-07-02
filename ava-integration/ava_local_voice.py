@@ -331,6 +331,114 @@ def _server_respond(text: str, config: dict) -> str:
     return ""
 
 
+def _iter_sse_events(resp):
+    """Yield (event, data_dict) tuples from a text/event-stream HTTP response."""
+    event = "message"
+    data_lines: list[str] = []
+    while True:
+        try:
+            raw = resp.readline()
+        except Exception:
+            break
+        if not raw:
+            break
+        line = raw.decode("utf-8", errors="ignore").rstrip("\r\n")
+        if not line:
+            if data_lines:
+                try:
+                    yield event, json.loads("\n".join(data_lines))
+                except Exception:
+                    pass
+            event = "message"
+            data_lines = []
+            continue
+        if line.startswith("event:"):
+            event = line[6:].strip()
+        elif line.startswith("data:"):
+            data_lines.append(line[5:].strip())
+
+
+def _server_respond_stream(
+    text: str,
+    config: dict,
+    on_sentence,
+    should_abort=None,
+    resp_holder: Optional[dict] = None,
+) -> tuple[Optional[str], int]:
+    """POST /respond/stream and speak-as-you-go.
+
+    Calls on_sentence(spoken_sentence) for each `sentence` SSE event; returns
+    (final_output_text, sentences_seen). Returns (None, 0) on total failure so the
+    caller can fall back to the blocking /respond path. `resp_holder["resp"]` exposes
+    the live HTTP response so a barge-in can close it from another thread.
+    """
+    url = str(config.get("server_url") or DEFAULT_SERVER_URL)
+    if not url.rstrip("/").endswith("/respond"):
+        url = DEFAULT_SERVER_URL
+    url = url.rstrip("/") + "/stream"
+
+    # run_tools=False routes chat-shaped turns onto the server's STREAMABLE conversational
+    # path; the server itself escalates to the agent loop when tools are needed (its
+    # looksLikeToolRequest gate catches obvious tool turns upfront, and the model emits the
+    # NEED_TOOLS sentinel for the rest) — same design the typed /chat path uses. allow_write
+    # stays on so escalated tool turns can act. The blocking fallback path is unchanged.
+    payload = {
+        "sessionId": "local-voice",
+        "messages": [{"role": "user", "content": text}],
+        "freshSession": True,
+        "run_tools": False,
+        "allow_write": True,
+        "voice_mode": "spoken",
+        "spoken_reply_budget": {
+            "max_sentences": 300,
+            "max_words": 4000,
+            "prefer_brief": False,
+        },
+        "persona": "AVA",
+        "style": "first_person",
+    }
+    body = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url=url,
+        data=body,
+        headers=_auth_headers({"Content-Type": "application/json", "Accept": "text/event-stream"}),
+        method="POST",
+    )
+    sentences = 0
+    final_text = ""
+    try:
+        resp = urllib.request.urlopen(req, timeout=180)
+    except Exception as exc:
+        _log(f"/respond/stream connect error: {exc}")
+        return None, 0
+    if resp_holder is not None:
+        resp_holder["resp"] = resp
+    try:
+        for event, data in _iter_sse_events(resp):
+            if should_abort is not None and should_abort():
+                break
+            if event == "sentence":
+                sentence = str((data or {}).get("text") or "").strip()
+                if sentence:
+                    sentences += 1
+                    on_sentence(sentence)
+            elif event == "done":
+                final_text = str((data or {}).get("output_text") or "").strip()
+                break
+    except Exception as exc:
+        _log(f"/respond/stream read error: {exc}")
+    finally:
+        try:
+            resp.close()
+        except Exception:
+            pass
+        if resp_holder is not None:
+            resp_holder["resp"] = None
+    if sentences == 0 and not final_text:
+        return None, 0
+    return final_text, sentences
+
+
 def _resample_pcm16(pcm: bytes, src_rate: int, dst_rate: int) -> bytes:
     if not pcm or src_rate == dst_rate:
         return pcm
@@ -919,7 +1027,12 @@ class LocalVoiceRunner:
         )
         return start, stop
 
-    def _capture_utterance(self, start_rms: int, stop_rms: int) -> CapturedUtterance:
+    def _capture_utterance(
+        self,
+        start_rms: int,
+        stop_rms: int,
+        seed_frames: Optional[list] = None,
+    ) -> CapturedUtterance:
         assert self.input_stream is not None
         stream = self.input_stream.stream
         frames_per_buffer = self.input_stream.frames_per_buffer
@@ -930,6 +1043,16 @@ class LocalVoiceRunner:
         speech_frames = 0
         silence_started = 0.0
         started_at = 0.0
+        if seed_frames:
+            # Barge-in handoff: the barge monitor already captured the start of the user's
+            # utterance while AVA was speaking. Seed it here and continue mid-speech, so the
+            # first words aren't lost and we don't wait for a fresh speech_start.
+            speaking = True
+            started_at = time.time()
+            for frame in seed_frames:
+                if frame:
+                    active.append(frame)
+                    active_rms.append(audioop.rms(frame, SAMPLE_WIDTH))
         vad_cfg = self.config.get("local_vad") or self.config.get("vad") or {}
         start_confirm_frames = max(
             1,
@@ -1412,6 +1535,203 @@ class LocalVoiceRunner:
             _log("state=COOLDOWN")
             time.sleep(0.35)
 
+    # ---- Tier 2 streaming voice (#10/#11): sentence-chunked TTS + barge-in ----
+
+    def _stream_enabled(self) -> bool:
+        """Streaming replies via /respond/stream. Revert wholesale with AVA_STREAM_VOICE=0."""
+        env = os.getenv("AVA_STREAM_VOICE")
+        if env is not None:
+            return env.strip().lower() not in {"0", "false", "no", "off"}
+        streaming_cfg = self.config.get("streaming") or {}
+        return bool(streaming_cfg.get("enabled", True))
+
+    def _barge_enabled(self) -> bool:
+        """Barge-in (interrupt AVA mid-reply). Disable with AVA_BARGE_IN=0. Needs a REAL mic
+        (synthetic WAV test streams have device_index=None) and live playback."""
+        env = os.getenv("AVA_BARGE_IN")
+        if env is not None and env.strip().lower() in {"0", "false", "no", "off"}:
+            return False
+        return (
+            self.input_stream is not None
+            and self.input_stream.device_index is not None
+            and self.output_stream is not None
+        )
+
+    def _speak_chunk(self, text: str, abort_event: Optional[threading.Event] = None) -> None:
+        """Speak one sentence/fragment. Caller must hold _speak_lock; no per-chunk cooldown.
+        The ratecv state resets per chunk — chunk boundaries are sentence boundaries (natural
+        pauses), so the mid-utterance discontinuity fix (022ce7c) is preserved within chunks."""
+        if not text or self.tts is None:
+            return
+        self.last_spoken_text = text
+        spoken = _apply_pron_lexicon(text)
+        playback_rate = int((self.config.get("audio") or {}).get("playback_rate") or 44100)
+        source_rate = int(getattr(self.tts, "current_sample_rate", playback_rate) or playback_rate)
+        _log(f"state=SPEAKING chunk={spoken[:80]!r}")
+        rs_state = [None]
+
+        def on_chunk(pcm: bytes) -> None:
+            if not pcm or self.output_stream is None:
+                return
+            if abort_event is not None and abort_event.is_set():
+                return
+            if source_rate == playback_rate:
+                out = pcm
+            else:
+                out, rs_state[0] = audioop.ratecv(
+                    pcm, SAMPLE_WIDTH, CHANNELS, source_rate, playback_rate, rs_state[0]
+                )
+            self.output_stream.write(out)
+
+        self.tts.speak(spoken, on_chunk, frame_ms=100)
+
+    def _barge_monitor(
+        self,
+        barge: threading.Event,
+        stop: threading.Event,
+        frames_out: list,
+        resp_holder: dict,
+    ) -> None:
+        """Watch the mic while AVA speaks (open speakers + TONOR): trip `barge` on sustained
+        loud speech. Echo rejection = an ELEVATED threshold (her speaker bleed at the mic sits
+        far below close-talk speech) + N consecutive frames + a startup guard window. On barge:
+        cancel the current TTS utterance, close the live SSE response, and keep capturing the
+        user's speech into frames_out until the orchestrator takes over."""
+        stream_info = self.input_stream
+        if stream_info is None:
+            return
+        stream = stream_info.stream
+        frames_per_buffer = stream_info.frames_per_buffer
+        vad_start = int(getattr(self, "_vad_start", 0) or 0) or 900
+        mult = _cfg_float(self.config.get("barge_in") or {}, "AVA_BARGE_RMS_MULT", "rms_mult", 2.5)
+        floor = _cfg_int(self.config.get("barge_in") or {}, "AVA_BARGE_MIN_RMS", "min_rms", 1500)
+        threshold = max(int(vad_start * mult), floor)
+        confirm_needed = _cfg_int(self.config.get("barge_in") or {}, "AVA_BARGE_CONFIRM_FRAMES", "confirm_frames", 4)
+        guard_sec = _cfg_float(self.config.get("barge_in") or {}, "AVA_BARGE_GUARD_SEC", "guard_sec", 0.6)
+        started = time.time()
+        consecutive = 0
+        ring: deque = deque(maxlen=12)
+        while not stop.is_set() and self.running:
+            try:
+                data = stream.read(frames_per_buffer, exception_on_overflow=False)
+            except Exception:
+                return
+            ring.append(data)
+            rms = audioop.rms(data, SAMPLE_WIDTH)
+            if time.time() - started < guard_sec:
+                continue
+            if rms >= threshold:
+                consecutive += 1
+                if consecutive >= max(1, confirm_needed) and not barge.is_set():
+                    _log(f"barge_in rms={rms} threshold={threshold} confirm={confirm_needed}")
+                    frames_out.extend(ring)
+                    barge.set()
+                    try:
+                        if self.tts is not None and hasattr(self.tts, "cancel_current_utterance"):
+                            self.tts.cancel_current_utterance()
+                    except Exception:
+                        pass
+                    try:
+                        live = resp_holder.get("resp")
+                        if live is not None:
+                            live.close()
+                    except Exception:
+                        pass
+                    # Keep capturing the user's ongoing speech until the orchestrator resumes.
+                    while not stop.is_set() and self.running:
+                        try:
+                            more = stream.read(frames_per_buffer, exception_on_overflow=False)
+                        except Exception:
+                            break
+                        frames_out.append(more)
+                    return
+            else:
+                consecutive = 0
+
+    def _handle_barge_capture(self, seed_frames: list) -> None:
+        """Finish capturing the utterance that interrupted AVA, then handle it as a
+        wake-free follow-up command."""
+        start_rms = int(getattr(self, "_vad_start", 0) or 0) or 500
+        stop_rms = int(getattr(self, "_vad_stop", 0) or 0) or 220
+        _log("state=LISTENING barge_followup")
+        utterance = self._capture_utterance(start_rms, stop_rms, seed_frames=seed_frames)
+        transcript = self._transcribe(utterance)
+        if not _normalize(transcript):
+            _log("barge_no_transcript")
+            self._open_followup("barge_empty")
+            return
+        self._open_followup("barge_in")  # allow the interruption without a wake word
+        self._handle_transcript(transcript)
+
+    def _respond_streaming(self, command: str) -> bool:
+        """Streamed reply: sentences are spoken as the server generates them, and the user can
+        interrupt (barge-in). Returns False on total stream failure so the caller can fall back
+        to the blocking /respond path."""
+        barge = threading.Event()
+        stop_monitor = threading.Event()
+        barge_frames: list = []
+        resp_holder: dict = {"resp": None}
+        sentence_queue: "queue.Queue[Optional[str]]" = queue.Queue()
+
+        with self._speak_lock:
+            monitor: Optional[threading.Thread] = None
+            if self._barge_enabled():
+                monitor = threading.Thread(
+                    target=self._barge_monitor,
+                    args=(barge, stop_monitor, barge_frames, resp_holder),
+                    name="ava-barge-monitor",
+                    daemon=True,
+                )
+                monitor.start()
+
+            def speaker() -> None:
+                while True:
+                    item = sentence_queue.get()
+                    if item is None or barge.is_set() or not self.running:
+                        break
+                    self._speak_chunk(item, abort_event=barge)
+
+            speaker_thread = threading.Thread(target=speaker, name="ava-stream-speaker", daemon=True)
+            speaker_thread.start()
+
+            def on_sentence(sentence: str) -> None:
+                sentence_queue.put(sentence)
+
+            def should_abort() -> bool:
+                return barge.is_set() or not self.running
+
+            final_text, sentences = _server_respond_stream(
+                command, self.config, on_sentence, should_abort, resp_holder
+            )
+            sentence_queue.put(None)
+            speaker_thread.join(timeout=600.0)
+
+            if final_text is None and sentences == 0 and not barge.is_set():
+                stop_monitor.set()
+                if monitor is not None:
+                    monitor.join(timeout=2.0)
+                return False  # nothing arrived at all -> let the caller use blocking /respond
+
+            if not barge.is_set() and sentences == 0 and final_text:
+                # Non-streamable turn (tool fast path etc.): the reply arrived whole in `done`.
+                # The monitor is still watching, so even this whole-reply speak is barge-able.
+                self.last_reply = final_text
+                self._speak_chunk(final_text, abort_event=barge)
+            else:
+                self.last_reply = final_text or self.last_spoken_text or ""
+
+            stop_monitor.set()
+            if monitor is not None:
+                monitor.join(timeout=2.0)
+            _log(f"state=COOLDOWN streamed_sentences={sentences} barged={barge.is_set()}")
+            time.sleep(0.35)
+
+        if barge.is_set():
+            self._handle_barge_capture(barge_frames)
+            return True
+        self._open_followup("answered_server")
+        return True
+
     def _announcements_url(self) -> str:
         """Derive http://host:port/voice/announcements from the configured /respond URL."""
         base = str(self.config.get("server_url") or DEFAULT_SERVER_URL)
@@ -1518,6 +1838,13 @@ class LocalVoiceRunner:
             return
 
         _log(f"state=RESPONDING command={command!r}")
+        if self._stream_enabled():
+            try:
+                if self._respond_streaming(command):
+                    return
+                _log("stream_unavailable; falling back to blocking /respond")
+            except Exception as exc:  # noqa: BLE001 — never let the stream path kill the turn
+                _log(f"stream_path_error={exc}; falling back to blocking /respond")
         reply = _server_respond(command, self.config)
         if reply:
             self.last_reply = reply
@@ -1597,6 +1924,7 @@ class LocalVoiceRunner:
         self.initialize()
         self._start_announce_thread()
         start_rms, stop_rms = self._calibrate_noise()
+        self._vad_start, self._vad_stop = int(start_rms), int(stop_rms)
         while self.running:
             _log("state=LISTENING")
             utterance = self._capture_utterance(start_rms, stop_rms)

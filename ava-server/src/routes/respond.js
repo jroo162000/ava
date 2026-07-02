@@ -306,8 +306,32 @@ function buildSpokenSelfResponseText() {
 
 const router = express.Router();
 
+// Tier 2 #10/#11: text-reply LLM calls stream their tokens out through req._streamDelta when
+// the request came in via POST /respond/stream (which sets that hook). Blocking /respond calls
+// never set the hook, so this is a pass-through to llmService.chat there. If streaming fails
+// BEFORE any token was emitted we quietly fall back to the blocking call; a mid-stream partial
+// is returned as-is (it has already been spoken).
+async function _chatMaybeStream(req, messages, options = {}) {
+  if (typeof req._streamDelta === 'function') {
+    try {
+      const r = await llmService.streamText({
+        messages: messages.filter(m => m.role !== 'system'),
+        system: messages.find(m => m.role === 'system')?.content,
+        temperature: options.temperature,
+        maxTokens: options.max_tokens || options.maxTokens || 1000,
+      }, req._streamDelta);
+      if (String(r.content || '').trim()) return r;
+    } catch (e) {
+      logger.warn('[respond/stream] streamText failed; falling back to blocking chat', { error: e.message });
+    }
+  }
+  return llmService.chat(messages, options);
+}
+
 // Realtime compatibility: route text/messages to Agent Loop with memory/tools
-router.post('/respond', async (req, res) => {
+router.post('/respond', respondHandler);
+
+async function respondHandler(req, res) {
   try {
     const { text, messages, sessionId = 'voice-default', freshSession = false,
             run_tools, memory_filter } = req.body || {};
@@ -828,7 +852,7 @@ router.post('/respond', async (req, res) => {
         try {
           const sys = `${personaSvc.buildPersonaBlock()}\n\nThe user is asking you to recall or summarize past conversations. You DO have your conversation history below — each line is tagged with its date, time, and who said it (You = the user, AVA = you). Answer their question using ONLY this context: summarize what was said, discussed, or decided, and cite WHEN (e.g. "on June 23" or "yesterday around 7pm") where it helps. Be as detailed as the question warrants — it's fine to give a thorough multi-point summary. If the user is asking for a SPECIFIC detail they were given earlier — a file name, a full path, a number, an address, a value — scan the transcript line by line and quote it back EXACTLY; such details are almost always present in the recent turns (e.g. a file path you stated when you saved something), so do NOT say you can't find it without checking carefully first. If the context genuinely does not cover the specific topic they asked about, say so plainly and ask for a detail. Do NOT invent anything beyond the context. This answer is spoken aloud AND shown on screen, so write it naturally for the ear, but for the screen you MAY use light Markdown — **bold** a date or key detail, and use a short "- " bullet list when you enumerate several things. Keep it conversational, not a document.`;
           const usr = `User asked: "${userText}"\n\n${ctx}`;
-          const r = await llmService.chat([{ role: 'system', content: sys }, { role: 'user', content: usr }], { temperature: 0.3, max_tokens: 1400 });
+          const r = await _chatMaybeStream(req, [{ role: 'system', content: sys }, { role: 'user', content: usr }], { temperature: 0.3, max_tokens: 1400 });
           finalText = (r.text || r.content || '').trim();
         } catch (e) { /* fall through to fallback */ }
       }
@@ -956,7 +980,7 @@ router.post('/respond', async (req, res) => {
           );
         } catch { /* best effort */ }
       }
-      const llmResult = await llmService.chat([
+      const llmResult = await _chatMaybeStream(req, [
         { role: 'system', content: _sysFull },
         ...priorMessages,
         { role: 'user', content: userText }
@@ -1047,7 +1071,7 @@ router.post('/respond', async (req, res) => {
 - If this was a self-DIAGNOSIS or capability check: relay your health and, if a plain-language capability summary is present (e.g. a "capability_summary" describing what you can do), tell the user what you can do in natural language. Do NOT refuse or say you "can't provide a list" — you have the information.
 Don't read raw tool names, JSON, or status codes, but you MAY describe your health and what you can do in plain, natural language. This reply is also shown on screen, so when you're naming several items (emails, files, windows, results) you MAY format them as a short "- " Markdown list and **bold** a key value; otherwise keep it to 1-2 natural sentences.`;
         const sumUsr = `User said: "${userText}"\nResult from "${_ground.tool}" (status=${_st}):\n${JSON.stringify(_ground.result).slice(0, 1800)}`;
-        const sum = await llmService.chat([{ role: 'system', content: sumSys }, { role: 'user', content: sumUsr }], { temperature: 0.2, max_tokens: 2000 });
+        const sum = await _chatMaybeStream(req, [{ role: 'system', content: sumSys }, { role: 'user', content: sumUsr }], { temperature: 0.2, max_tokens: 2000 });
         const t = (sum.text || sum.content || '').trim();
         if (t) finalText = t;
       } catch (e) { /* fall back to whatever finalText we had */ }
@@ -1096,10 +1120,115 @@ Don't read raw tool names, JSON, or status codes, but you MAY describe your heal
     logger.error('Respond failed', { error: error.message });
     res.status(500).json({ ok: false, error: error.message });
   }
-});
+}
 
 // Tier 1 #6: deleted the unused bridge caller (callBridgeTool) and the inline regex
 // "simple tools" dispatcher (tryHandleSimpleTools) — it was DEAD CODE (never invoked),
 // and tool selection is now the model's own native function calling (agentLoop).
+
+// ---- POST /respond/stream (Tier 2 #10/#11) ----
+// SSE wrapper around the SAME /respond handler (zero behavioral fork): the handler runs
+// unchanged against a captured response object, and any text-reply LLM call inside it streams
+// its tokens out through req._streamDelta. This route assembles those raw tokens into complete
+// sentences, shapes each one for TTS (shapeSpokenReply), and emits them as they finish — so the
+// voice runner starts speaking ~1 sentence into the reply instead of after the whole thing.
+//
+// Events:
+//   event: sentence  data: {"text": "<TTS-shaped sentence>"}
+//   event: done      data: {<full /respond JSON payload>, streamed_sentences: N, http_status: 200}
+//
+// Paths that can't stream (fast paths, tool loop internals) simply never call the hook; their
+// reply arrives whole in the `done` event, identical to blocking /respond. The conversational
+// path's NEED_TOOLS escalation sentinel is swallowed here so it is never spoken.
+router.post('/respond/stream', async (req, res) => {
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no');
+  if (typeof res.flushHeaders === 'function') { try { res.flushHeaders(); } catch { /* ignore */ } }
+
+  const send = (event, obj) => {
+    try { res.write(`event: ${event}\ndata: ${JSON.stringify(obj)}\n\n`); } catch { /* client gone */ }
+  };
+
+  const SENTINEL = 'NEED_TOOLS';
+  let buf = '';
+  let sentinelChecked = false;
+  let sentencesSent = 0;
+
+  const emitSentence = (part) => {
+    const raw = String(part || '').trim();
+    if (!raw) return;
+    let spoken = '';
+    try { spoken = shapeSpokenReply(raw, req.body || {}); } catch { spoken = raw; }
+    if (spoken) {
+      sentencesSent++;
+      send('sentence', { text: spoken });
+    }
+  };
+
+  // Strip a leading NEED_TOOLS sentinel. NO \b after it: when the conversational reply is
+  // exactly "NEED_TOOLS" and the escalated turn's grounding stream appends straight after it,
+  // the buffer reads "NEED_TOOLSYour clipboard..." — a word-boundary regex fails there and the
+  // sentinel leaks into speech (caught in live verification).
+  const stripSentinel = () => {
+    if (new RegExp('^\\s*' + SENTINEL).test(buf)) {
+      buf = buf.replace(new RegExp('^\\s*' + SENTINEL + '[.!:,\\s]*'), '');
+    }
+    sentinelChecked = true;
+  };
+
+  // Pull complete sentences off the front of the buffer. A sentence ends at .!?… (+ closing
+  // quote/paren) followed by whitespace, or at a newline; require >=12 chars so fragments like
+  // "Dr." or list numbers don't fire alone. force=true flushes whatever remains.
+  const flushSentences = (force = false) => {
+    if (force && !sentinelChecked) stripSentinel();  // short buffers may never hit the check threshold
+    if (!sentinelChecked) return;
+    for (;;) {
+      const m = buf.match(/^([\s\S]{12,}?[.!?…][)"'’”]*)\s+([\s\S]*)$/);
+      if (m) { emitSentence(m[1]); buf = m[2]; continue; }
+      const nl = buf.indexOf('\n');
+      if (nl >= 12) { emitSentence(buf.slice(0, nl)); buf = buf.slice(nl + 1); continue; }
+      break;
+    }
+    if (force && buf.trim()) { emitSentence(buf); buf = ''; }
+  };
+
+  req._streamDelta = (piece) => {
+    buf += String(piece || '');
+    if (!sentinelChecked) {
+      // Hold emission until we can rule out the escalation sentinel (it arrives as the whole
+      // reply: "NEED_TOOLS", sometimes with grounding-stream text appended right after). Once
+      // ruled out (or stripped), stream normally.
+      if (buf.trim().length < SENTINEL.length + 2) return;
+      stripSentinel();
+    }
+    flushSentences(false);
+  };
+
+  // Captured response: the handler only ever uses res.json / res.status(...).json.
+  const captured = {
+    _status: 200,
+    _payload: null,
+    status(code) { this._status = code; return this; },
+    json(payload) { this._payload = payload; return this; },
+  };
+
+  try {
+    await respondHandler(req, captured);
+  } catch (e) {
+    logger.error('[respond/stream] handler failed', { error: e.message });
+    captured._status = 500;
+    captured._payload = captured._payload || { ok: false, error: e.message };
+  }
+
+  // If the handler's final spoken text matches what we streamed, flush any tail still in the
+  // buffer; the runner speaks streamed sentences and only falls back to done.output_text when
+  // nothing was streamed.
+  flushSentences(true);
+  const payload = captured._payload || { ok: false, error: 'no response produced' };
+  send('done', { ...payload, streamed_sentences: sentencesSent, http_status: captured._status });
+  try { res.end(); } catch { /* ignore */ }
+});
 
 export default router;

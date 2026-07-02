@@ -83,6 +83,25 @@ function _parseOpenAIToolCalls(message) {
   });
 }
 
+// ---- STREAMING (Tier 2 #10/#11) ----
+// Parse an SSE body (fetch Response) into its `data:` payload strings. Works for OpenAI-compat
+// (OpenAI/DeepSeek/Grok/Groq/LM Studio), Anthropic, and Gemini (`?alt=sse`) streaming responses.
+async function* _sseData(response) {
+  const decoder = new TextDecoder();
+  let buf = '';
+  for await (const chunk of response.body) {
+    buf += decoder.decode(chunk, { stream: true });
+    let idx;
+    while ((idx = buf.indexOf('\n')) >= 0) {
+      const line = buf.slice(0, idx).replace(/\r$/, '');
+      buf = buf.slice(idx + 1);
+      if (line.startsWith('data:')) yield line.slice(5).trim();
+    }
+  }
+  const tail = buf.replace(/\r$/, '');
+  if (tail.startsWith('data:')) yield tail.slice(5).trim();
+}
+
 // Load AVA identity if available
 function loadIdentity() {
   try {
@@ -546,6 +565,209 @@ class LLMService {
       finishReason: choice.finish_reason || '',
       usage: d.usage,
     };
+  }
+
+  // ---- STREAMING PROVIDERS (Tier 2 #10/#11) ----
+  // Text-only token streaming (no native tools — streaming is used for SPOKEN/TEXT replies,
+  // tool decisions stay on the blocking chatWithTools path). Each returns { content, model }
+  // and calls onDelta(piece) as tokens arrive.
+
+  async _streamOpenAICompat({ baseURL, apiKey, model, system, messages, temperature, maxTokens = 1500, onDelta }) {
+    if (!apiKey) throw new Error('no api key');
+    const full = [{ role: 'system', content: system || getSystemPrompt() }, ...(messages || []).filter(m => m.role !== 'system')];
+    const isNewerOpenAI = /^(gpt-5|o[0-9])/.test(model);
+    const payload = { model, messages: full, stream: true };
+    if (isNewerOpenAI) {
+      payload.max_completion_tokens = Math.max(maxTokens, parseInt(process.env.AVA_SM_OPENAI_MIN_COMPLETION || '1600', 10));
+    } else {
+      payload.max_tokens = maxTokens;
+      if (typeof temperature === 'number') payload.temperature = temperature;
+    }
+    const resp = await fetch(`${baseURL}/chat/completions`, {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    if (!resp.ok) { const t = await resp.text().catch(() => ''); throw new Error(`${resp.status} ${t.slice(0, 160)}`); }
+    let content = '';
+    let mdl = model;
+    for await (const data of _sseData(resp)) {
+      if (data === '[DONE]') break;
+      let j; try { j = JSON.parse(data); } catch { continue; }
+      mdl = j.model || mdl;
+      const piece = j.choices?.[0]?.delta?.content || '';
+      if (piece) { content += piece; try { onDelta && onDelta(piece); } catch { /* consumer errors never kill the stream */ } }
+    }
+    return { content, model: mdl };
+  }
+
+  async _streamClaude({ system, messages, temperature = 0.7, maxTokens = 1000, model, onDelta }) {
+    const apiKey = this.getApiKey('claude');
+    if (!apiKey) throw new Error('Claude API key not configured');
+    const convo = (messages || []).filter(m => m.role !== 'system').map(m => ({ role: m.role, content: m.content }));
+    const mdl = (model && /^claude/i.test(model)) ? model : (process.env.AVA_CLAUDE_MODEL || 'claude-3-5-haiku-latest');
+    const isNewerClaude = /claude-(opus|sonnet|haiku)-[4-9]/i.test(mdl);
+    const body = { model: mdl, max_tokens: maxTokens, system: system || getSystemPrompt(), messages: convo, stream: true };
+    if (!isNewerClaude) body.temperature = Math.max(0, Math.min(1, temperature));
+    const resp = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: { 'x-api-key': apiKey, 'anthropic-version': '2023-06-01', 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (!resp.ok) {
+      const errorData = await resp.json().catch(() => null);
+      throw new Error(`Claude API error: ${resp.status} ${errorData?.error?.message || ''}`);
+    }
+    let content = '';
+    for await (const data of _sseData(resp)) {
+      let j; try { j = JSON.parse(data); } catch { continue; }
+      if (j.type === 'content_block_delta' && j.delta?.type === 'text_delta' && j.delta.text) {
+        content += j.delta.text;
+        try { onDelta && onDelta(j.delta.text); } catch { /* ignore */ }
+      } else if (j.type === 'error') {
+        throw new Error(`Claude stream error: ${j.error?.message || 'unknown'}`);
+      }
+    }
+    return { content, model: mdl };
+  }
+
+  async _streamGemini({ system, messages, temperature = 0.7, maxTokens = 1000, model, onDelta }) {
+    const apiKey = this.getApiKey('gemini');
+    if (!apiKey) throw new Error('Gemini API key not configured');
+    const mdl = model || process.env.AVA_SM_GEMINI || 'gemini-pro-latest';
+    const contents = (messages || []).filter(m => m.role !== 'system').map(msg => ({
+      role: msg.role === 'assistant' ? 'model' : 'user',
+      parts: [{ text: msg.content }]
+    }));
+    const body = {
+      contents,
+      systemInstruction: { parts: [{ text: system || getSystemPrompt() }] },
+      generationConfig: { temperature, maxOutputTokens: maxTokens }
+    };
+    const resp = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/${mdl}:streamGenerateContent?alt=sse&key=${apiKey}`,
+      { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }
+    );
+    if (!resp.ok) {
+      const errorData = await resp.json().catch(() => null);
+      throw new Error(`Gemini API error: ${resp.status} ${errorData?.error?.message || JSON.stringify(errorData)}`);
+    }
+    let content = '';
+    for await (const data of _sseData(resp)) {
+      let j; try { j = JSON.parse(data); } catch { continue; }
+      const parts = j.candidates?.[0]?.content?.parts || [];
+      for (const p of parts) {
+        if (typeof p.text === 'string' && p.text) {
+          content += p.text;
+          try { onDelta && onDelta(p.text); } catch { /* ignore */ }
+        }
+      }
+    }
+    return { content, model: mdl };
+  }
+
+  // Streaming text completion over the SAME canonical fallback chain / cooldowns / context
+  // budgeting as createCompletion. Semantics: a provider that fails BEFORE emitting anything
+  // falls through to the next provider; a provider that fails MID-STREAM does NOT fall through
+  // (the partial text has already been spoken — switching providers would repeat it), so the
+  // partial is returned with interrupted:true. Returns { text, content, provider, model,
+  // interrupted? } — same consumer shape as chat().
+  async streamText(options = {}, onDelta) {
+    try {
+      const fitted = contextBudget.fit({
+        system: options.system,
+        messages: options.messages,
+        completionTokens: options.maxTokens || 1000
+      });
+      if (fitted.trimmed) options = { ...options, system: fitted.system, messages: fitted.messages };
+    } catch (e) { logger.warn('[llm] stream context budgeting failed; sending unbudgeted', { error: e.message }); }
+
+    const env = process.env;
+    const SM = modelConfig.canonicalModels();
+    const DEFAULT_ORDER = ['claude', 'openai', 'gemini', 'deepseek', 'grok', 'groq', 'local'];
+    const errors = [];
+    const mdl = String(options.model || '');
+    let forced = null;
+    if (/^claude/i.test(mdl)) forced = 'claude';
+    else if (/^(gpt|o[0-9]|text-)/i.test(mdl)) forced = 'openai';
+    else if (/^gemini/i.test(mdl)) forced = 'gemini';
+    else if (/^deepseek/i.test(mdl)) forced = 'deepseek';
+    else if (/^grok/i.test(mdl)) forced = 'grok';
+    const providers = forced ? [forced, ...DEFAULT_ORDER.filter(p => p !== forced)] : DEFAULT_ORDER;
+    const _keyed = providers.filter(p => this.getApiKey(p));
+    const _warm = _keyed.filter(p => !_providerCoolingDown(p));
+    const _order = _warm.length ? _warm : _keyed;
+    const _cooldownMs = parseInt(process.env.AVA_PROVIDER_COOLDOWN_MS || '', 10) || 300000;
+
+    let emitted = false;
+    let partial = '';
+    const tap = (piece) => {
+      emitted = true;
+      partial += piece;
+      try { if (onDelta) onDelta(piece); } catch { /* consumer errors never kill the stream */ }
+    };
+
+    for (const provider of _order) {
+      const isForced = forced && provider === forced;
+      try {
+        let r = null;
+        switch (provider) {
+          case 'claude':
+            r = await this._streamClaude({ ...options, model: isForced ? options.model : SM.claude, onDelta: tap });
+            break;
+          case 'openai': {
+            const models = isForced && options.model ? [options.model] : SM.openai;
+            let lastErr;
+            for (const m of models) {
+              try {
+                r = await this._streamOpenAICompat({ baseURL: 'https://api.openai.com/v1', apiKey: this.getApiKey('openai'), model: m, system: options.system, messages: options.messages, temperature: options.temperature, maxTokens: options.maxTokens, onDelta: tap });
+                break;
+              } catch (e) { lastErr = e; if (emitted) throw e; }
+            }
+            if (!r) throw lastErr || new Error('openai failed');
+            break;
+          }
+          case 'gemini':
+            r = await this._streamGemini({ ...options, model: isForced ? options.model : SM.gemini, onDelta: tap });
+            break;
+          case 'deepseek':
+            r = await this._streamOpenAICompat({ baseURL: 'https://api.deepseek.com', apiKey: this.getApiKey('deepseek'), model: isForced ? options.model : SM.deepseek, system: options.system, messages: options.messages, temperature: options.temperature, maxTokens: options.maxTokens, onDelta: tap });
+            break;
+          case 'grok':
+            r = await this._streamOpenAICompat({ baseURL: 'https://api.x.ai/v1', apiKey: this.getApiKey('grok'), model: isForced ? options.model : SM.grok, system: options.system, messages: options.messages, temperature: options.temperature, maxTokens: options.maxTokens, onDelta: tap });
+            break;
+          case 'groq':
+            r = await this._streamOpenAICompat({ baseURL: 'https://api.groq.com/openai/v1', apiKey: this.getApiKey('groq'), model: 'llama-3.3-70b-versatile', system: options.system, messages: options.messages, temperature: options.temperature, maxTokens: options.maxTokens, onDelta: tap });
+            break;
+          case 'local': {
+            const base = (env.AVA_LOCAL_LLM_URL || 'http://localhost:1234/v1').replace(/\/$/, '');
+            let lm = env.AVA_LOCAL_LLM_MODEL || this._localModel || '';
+            if (!lm) { try { const mr = await fetch(base + '/models', { signal: AbortSignal.timeout(2500) }); const mj = await mr.json(); lm = (mj && mj.data && mj.data[0] && mj.data[0].id) || ''; this._localModel = lm; } catch { /* endpoint down */ } }
+            r = await this._streamOpenAICompat({ baseURL: base, apiKey: env.AVA_LOCAL_LLM_KEY || 'lm-studio', model: isForced ? options.model : (lm || 'local-model'), system: options.system, messages: options.messages, temperature: options.temperature, maxTokens: options.maxTokens, onDelta: tap });
+            break;
+          }
+        }
+        if (!r) continue;
+        if (!String(r.content || '').trim()) throw new Error('empty stream');
+        logger.info('[llm] streamed via ' + provider + (r.model ? `/${r.model}` : ''));
+        return { text: r.content, content: r.content, model: r.model, provider };
+      } catch (error) {
+        if (emitted) {
+          // Partial output has already been consumed (likely spoken). Don't switch providers —
+          // return the partial so the caller can finish the turn gracefully.
+          logger.warn('[llm] stream failed mid-flight; returning partial', { provider, error: error.message, chars: partial.length });
+          return { text: partial, content: partial, model: '', provider, interrupted: true };
+        }
+        if (_isQuotaError(error.message)) {
+          _providerCooldown[provider] = Date.now() + _cooldownMs;
+          logger.warn(`[llm] provider ${provider} quota/limit — cooling down ${Math.round(_cooldownMs / 1000)}s`, { error: error.message });
+        }
+        errors.push(`${provider}: ${error.message}`);
+        logger.warn(`Stream provider ${provider} failed, trying next...`, { error: error.message });
+        continue;
+      }
+    }
+    throw new Error(`All LLM providers failed (stream): ${errors.join('; ')}`);
   }
 
   // Self-modification reasoning entry point. Tier 1 #8: this no longer maintains its OWN
