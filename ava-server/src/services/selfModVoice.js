@@ -10,6 +10,7 @@ import selfRestart from './selfRestart.js';
 import { verifyFileSyntax } from '../utils/verifyFileSyntax.js';
 import selfModSandbox from './selfModSandbox.js';           // Tier 2 #13: worktree + test gate
 import { pushAnnouncement } from './announceQueue.js';      // spoken result of async approvals
+import conversationLogger from './conversationLogger.js';   // bare-affirm context check
 
 function isSelfSnapshotRequest(text = '') {
   const t = String(text || '').toLowerCase();
@@ -178,8 +179,16 @@ async function handleSelfModVoice(userText) {
     || /\bapply (it|that|this|the (change|proposal|patch|fix|edit))\b/.test(t)
     || /\bgo ahead and apply\b/.test(t) || /\bgreenlight\b/.test(t);
   const clearReject = /\breject(ed)?\b/.test(t) || /\b(decline|discard) (it|that|the (change|proposal))\b/.test(t);
-  // A bare affirmation — only treated as approval when exactly one change is pending.
-  const bareAffirm = /\b(yes|yep|yeah|do it|proceed|sounds good|please do|go for it)\b/.test(t);
+  // A bare affirmation — only treated as approval when exactly one change is pending, AND the
+  // utterance is essentially JUST the affirmation. A longer sentence that happens to contain
+  // "yes" is answering something ELSE: "yes use the most recent one and put it on the panel"
+  // (2026-07-03, a hologram request) matched the old \byes\b and silently approved a pending
+  // code change. Short affirmations that carry their own action/object ("yes open it") are
+  // also not approvals.
+  const _affWords = t.trim().split(/\s+/).filter(Boolean).length;
+  const bareAffirm = _affWords <= 5
+    && /\b(yes|yep|yeah|do it|proceed|sounds good|please do|go for it)\b/.test(t)
+    && !/\b(panel|hologram|holographic|model|scene|image|photo|picture|file|site|page|window|tab|open|show|put|use|search|find|build|load|play|generate)\b/.test(t);
 
   if (wantsCreateProposal && !wantsApprove && !wantsReject && !wantsUndo && !wantsReproposeFromRec) return null;
   const clearIntent = clearApprove || clearReject || ((wantsApprove || wantsReject) && hasObject);
@@ -191,9 +200,21 @@ async function handleSelfModVoice(userText) {
   const pending = (Array.isArray(raw) ? raw : []).filter(m => (m.status || 'pending') === 'pending');
   const base = (f) => String(f || '').split(/[\\/]/).pop();
 
-  // Bare "yes/do it" with no explicit verb: only act when exactly one change is pending; otherwise
-  // let the normal brain answer (so a stray "yes" doesn't approve something).
-  if (!clearIntent && bareAffirm && pending.length !== 1) return null;
+  // Bare "yes/do it" with no explicit verb: only act when exactly one change is pending AND her
+  // own LAST message was about that proposal (the heads-up / "want me to apply it?"). Without the
+  // context check, a "yes proceed" mid-conversation about something else approves real code.
+  if (!clearIntent && bareAffirm) {
+    if (pending.length !== 1) return null;
+    let _lastAssistant = '';
+    try {
+      const _recent = conversationLogger.getRecentHistoryAcrossDays(6) || [];
+      for (let i = _recent.length - 1; i >= 0; i--) {
+        const e = _recent[i];
+        if (e && (e.direction || e.role) === 'assistant') { _lastAssistant = String(e.content || ''); break; }
+      }
+    } catch { /* context optional */ }
+    if (!/\b(proposal|code change|self.?mod|pending change|approve|sandbox|change [0-9a-f]{6,8})\b/i.test(_lastAssistant)) return null;
+  }
 
   // Garbled STT can yield BOTH "approve" and "reject" in one utterance (this really happened:
   // "...say approved change X ... rejected or use the panel ... i just approved it"). Acting on the
