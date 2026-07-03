@@ -689,6 +689,26 @@ class ToolsService {
     const requestId = crypto.randomUUID();
     const startTime = Date.now();
 
+    // NATIVE-CALL ARG UNWRAP (2026-07-03): prompt guidance phrased as "call scene3d with
+    // args.models=[...]" leads the model to wrap native function-call parameters in a literal
+    // {"args": {...}} (sometimes a JSON STRING). Tools read parameters at the top level, so the
+    // accidental wrapper silently drops every parameter — scene3d built an EMPTY scene despite
+    // being called with the right model path; sys_ops shows the same {"args":"{\"action\":...}"}
+    // shape in the action history. Unwrap exactly that one shape; anything else passes through.
+    try {
+      if (args && typeof args === 'object' && !Array.isArray(args)) {
+        const _k = Object.keys(args);
+        if (_k.length === 1 && _k[0] === 'args') {
+          let _inner = args.args;
+          if (typeof _inner === 'string') { try { _inner = JSON.parse(_inner); } catch { /* keep */ } }
+          if (_inner && typeof _inner === 'object' && !Array.isArray(_inner)) {
+            logger.info('[tools] unwrapped nested args wrapper', { tool: name });
+            args = _inner;
+          }
+        }
+      }
+    } catch { /* keep original args */ }
+
     try {
       // Get tool info for risk level
       const tool = await this.getTool(name);
