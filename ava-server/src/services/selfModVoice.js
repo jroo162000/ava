@@ -140,7 +140,11 @@ async function handleSelfModVoice(userText) {
   // (which otherwise satisfy wantsApprove + hasObject and falsely approve a pending proposal).
   // Route it to the agent's creative tools (image_ops/scene3d/model3d_ops/web_builder) instead.
   // Fixes: "yes go ahead and build that 3D hologram for your UI" applying a code change.
-  const wantsCreativeBuild = /\b(build|create|make|draw|design|generate|render|model|turn (it|that|this))\b/.test(t)
+  // Verb set is deliberately broad (incl. the generic "do it / go ahead / finish that"): a request to
+  // ACT on a creative artifact is caught only when a creative OBJECT word is ALSO present, and the
+  // !mentionsMod gate below still protects genuine code-change approvals (which say change/proposal/fix).
+  // Fixes: "you can do the 3d holographic request, go ahead and do it" hitting the self-mod path.
+  const wantsCreativeBuild = /\b(build|create|make|draw|design|generate|render|model|turn (it|that|this)|do|go ahead|proceed with|handle|finish|complete|work on)\b/.test(t)
     && /\b(hologram|holographic|avatar|image|images|picture|portrait|photo|3 ?d|three.?d|scene|environment|model|website|web ?page|web ?site|\bui\b|interface|video|art|graphic|logo|render)\b/.test(t);
   if (wantsCreativeBuild && !mentionsMod) return null;
   const idMatch = userText.match(/\b([0-9a-f]{6,8})\b/);
@@ -190,6 +194,15 @@ async function handleSelfModVoice(userText) {
   // Bare "yes/do it" with no explicit verb: only act when exactly one change is pending; otherwise
   // let the normal brain answer (so a stray "yes" doesn't approve something).
   if (!clearIntent && bareAffirm && pending.length !== 1) return null;
+
+  // Garbled STT can yield BOTH "approve" and "reject" in one utterance (this really happened:
+  // "...say approved change X ... rejected or use the panel ... i just approved it"). Acting on the
+  // wrong one applies or drops real code, so never guess the direction — ask which they meant.
+  // Descriptive phrasings like "the rejected proposal" are handled by the recommendations branch
+  // below (they don't set both clear verbs), so this only trips on a true approve-vs-reject conflict.
+  if (clearApprove && clearReject && !wantsUndo && !wantsProof && !wantsRecommendations && !wantsReproposeFromRec) {
+    return 'I caught both "approve" and "reject" in that, and I do not want to guess and do the wrong thing to my code. Which did you mean — approve it, or reject it?';
+  }
 
   // RECOMMENDATIONS from a proposal she announced — surface the stored reason/diff she gave, or
   // re-propose from it. Checked BEFORE the approve/reject routing because "the REJECTED proposal"
@@ -324,7 +337,13 @@ async function handleSelfModVoice(userText) {
     let all = [];
     try { const la = await pythonWorker.selfMod({ action: 'list_all' }); all = (la && (la.all || (la.result && la.result.all))) || []; } catch {}
     let ref = idMatch ? all.find(m => m.id === idMatch[1] || m.id.startsWith(idMatch[1])) : null;
-    if (!ref) ref = all.filter(m => String(m.status || '') !== 'pending').sort((a, b) => new Date(b.created || 0) - new Date(a.created || 0))[0];
+    // Only narrate the most-recent NON-pending change for an actual status inquiry (proof, "did it
+    // apply", "my last/latest change") — NOT for a bare approve/reject/do-it, which would otherwise
+    // surface an unrelated old change's stale status (this misfired in response to a 3D-image ask).
+    const statusInquiry = wantsProof
+      || /\b(last|latest|recent|previous|that|the)\s+(change|one|edit|mod|modification|fix|proposal)\b/.test(t)
+      || /\b(did|does|was|is|has)\b[\s\S]{0,40}\b(apply|applied|land(ed)?|go(ne)? through|take(n)? effect)\b/.test(t);
+    if (!ref && statusInquiry) ref = all.filter(m => String(m.status || '') !== 'pending').sort((a, b) => new Date(b.created || 0) - new Date(a.created || 0))[0];
     if (ref) {
       const fn = base(ref.file);
       if (ref.status === 'applied') return `That change — ${fn}, id ${ref.id} — is already applied; I backed up the original when it went in. Restart me when you're ready and it takes effect. Nothing else is waiting.`;
