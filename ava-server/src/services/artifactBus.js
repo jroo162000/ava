@@ -16,6 +16,13 @@ function _emit() { try { emitVoiceEvent('panel', { cards: _cards, focusedId: _fo
 
 // type: 'news' | 'image' | 'video' | 'web' | 'mermaid' | 'markdown' | 'table' | 'note' | 'text'
 export function open({ type = 'markdown', title = '', content = '', meta = {} } = {}) {
+  // Dedup live previews (2026-07-03): the agentLoop preview_url auto-present hook AND the
+  // presenter can both open a 'web' card for the SAME URL in one turn — the panel showed twin
+  // "localhost:10580" cards. A second web card with identical content just focuses the first.
+  if (String(type) === 'web') {
+    const _ex = _cards.find((c) => c.type === 'web' && String(c.content) === String(typeof content === 'string' ? content : JSON.stringify(content)));
+    if (_ex) { _focusedId = _ex.id; _emit(); return _ex; }
+  }
   const id = 'c' + (++_seq) + Date.now().toString(36).slice(-3);
   const card = {
     id, type: String(type || 'markdown'), title: String(title || '').slice(0, 200),
