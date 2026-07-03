@@ -402,7 +402,7 @@ CURRENT DATE & TIME: ${nowStr} (timezone ${_tz}, UTC${_offStr}). Use this to res
 CURRENT STATE:
 - Step: ${state.step_count + 1} of ${state.step_limit}
 - Status: ${state.status}
-${state.last_result ? `- Last result: ${JSON.stringify(state.last_result).slice(0, 200)}` : ''}
+${state.last_result ? `- Last result: ${JSON.stringify(state.last_result).slice(0, 700)}` : ''}
 ${historyContext}
 ${errorContext}
 ${userResponseContext}
@@ -921,7 +921,10 @@ async function act(state, decision) {
         // confirmation is returned as 'deferred' so the model re-issues it as a normal single
         // tool_call (which passes through the full autonomy + confirmation gates). This gives the
         // read fan-out speed-up WITHOUT ever running an unconfirmed side effect in parallel.
-        const DESTRUCTIVE = /^(fs_|ps_exec|file_gen|app_control|web_|comm_|voice_|camera_)/;
+        // fs_find and fs_read are PURE READS — the blanket fs_ prefix wrongly deferred them, so a
+        // parallel [fs_find, fs_find] fan-out returned "deferred; deferred" and the model concluded
+        // the folder was EMPTY (2026-07-03 hologram chain: 3 .glb files present, reply said none).
+        const DESTRUCTIVE = /^(fs_(?!find\b|read\b)|ps_exec|file_gen|app_control|web_|comm_|voice_|camera_)/;
         const parResults = await Promise.all(calls.map(async (c) => {
           try {
             const t = await toolsService.getTool(c.tool);
