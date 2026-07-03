@@ -1030,13 +1030,19 @@ MACHINE-STATE RULE (absolute): if the question is about the CURRENT state of thi
       // (and the tool-path honesty guard then reports the real outcome). This makes "saying it" and
       // "doing it" the same event instead of an empty promise.
       const _userWantsAction = /\b(find|search|look\s*up|pull(\s*up)?|open|generate|create|make|build|run|do (it|that|this)|show|get|fetch|bring up|load|check|recall|remember|edit|write|send|add|update|delete|proceed)\b/i.test(userText);
-      const _narratedPromise = /\b(let me (just )?(search|find|look|pull|check|get|grab|fetch|dig|bring|see|load|open|generate|run|look up|look into)|i'?m (already )?(on it|on this|searching|looking|digging|pulling|getting|working|generating|loading)|searching (now|for|my|through)|looking (now|for|into|through)|digging (through|into)|pulling (that|it|up)|\bon it\b|hang on|one (sec|second|moment)|give me a (sec|second|moment|minute))\b/i.test(finalText);
+      // STRONG narration = an explicit lookup/do action she's announcing ("let me search/find/pull…",
+      // "searching for…", "digging through…"). This alone means she's promising to execute, even if
+      // THIS message is just a clarification/label with no verb (e.g. reply "searching for X now").
+      const _strongNarration = /\b(let me (just )?(search|find|look|pull|check|get|grab|fetch|dig|bring|see|load|open|generate|run|look up|look into)|searching (now|for|my|through)|looking (now|for|into|through)|digging (through|into)|pulling (that|it|up)|i'?m (already )?(searching|looking|digging|pulling|getting|generating|loading|on it|on this))\b/i.test(finalText);
+      // WEAK narration = vague filler ("on it", "hang on", "one sec") that only counts as a real
+      // action-promise when the user actually asked for an action (so "you can count on it" is safe).
+      const _weakNarration = /\b(\bon it\b|hang on|one (sec|second|moment)|give me a (sec|second|moment|minute)|i'?m (already )?working)\b/i.test(finalText);
       // Strip "3D"/"2D"/"3-d" tokens before the digit test — otherwise "3D model"/"3D Holoava"
       // reads as a number and wrongly marks a bare 3D promise as substantive (the exact case that
       // was failing). Real data numbers ("3.34 MB", "5 emails") survive the strip.
       const _ftSub = String(finalText || '').replace(/\b[0-9]\s?-?d\b/gi, ' ');
       const _replyHasSubstance = /[0-9]|\bhere('?s| is| are)\b|\bfound\b|\bshows?\b|\bthere (is|are)\b|:\s*\S|\n\s*[-*]|\b(couldn'?t|can'?t|cannot|unable|not able|no (tool|way|match|results?|photo|file))\b/i.test(_ftSub);
-      const _promiseEscalate = _narratedPromise && _userWantsAction && !_replyHasSubstance;
+      const _promiseEscalate = !_replyHasSubstance && (_strongNarration || (_weakNarration && _userWantsAction));
       if (/\bNEED_TOOLS\b/i.test(finalText) || _promiseEscalate) {
         // Escalate: do NOT return here — fall through to the agent loop below so she
         // actually performs the action / looks up the data.
