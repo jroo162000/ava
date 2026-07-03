@@ -898,9 +898,15 @@ async function act(state, decision) {
         try {
           const _pv = (result && (result.preview_url || (result.result && result.result.preview_url))) || '';
           if (_pv && /^https?:\/\//i.test(String(_pv))) {
-            const _ttl = (action.args && (action.args.title || action.args.name)) || (decision.tool === 'scene3d' ? '3D Scene' : 'Preview');
-            (await import('./artifactBus.js')).default.open({ type: 'web', title: String(_ttl), content: String(_pv) });
-            logger.info('[agent] auto-presented preview in panel', { tool: decision.tool, url: String(_pv).slice(0, 80) });
+            const _bus = (await import('./artifactBus.js')).default;
+            // Dedup: a repeated/cached tool result (idempotency cache) fired the hook twice and
+            // put two identical cards on the panel (2026-07-03). Same URL already up = skip.
+            const _dup = (_bus.state().cards || []).some(c => c && c.type === 'web' && String(c.content) === String(_pv));
+            if (!_dup) {
+              const _ttl = (action.args && (action.args.title || action.args.name)) || (decision.tool === 'scene3d' ? '3D Scene' : 'Preview');
+              _bus.open({ type: 'web', title: String(_ttl), content: String(_pv) });
+              logger.info('[agent] auto-presented preview in panel', { tool: decision.tool, url: String(_pv).slice(0, 80) });
+            }
           }
         } catch (e) { /* panel present is best-effort */ }
         try {
