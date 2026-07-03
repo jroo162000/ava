@@ -1022,10 +1022,21 @@ MACHINE-STATE RULE (absolute): if the question is about the CURRENT state of thi
       ], { temperature: 0.3, max_tokens: 2000 });
       let finalText = (llmResult.text || llmResult.content || '').trim();
 
-      if (/\bNEED_TOOLS\b/i.test(finalText)) {
+      // ESCALATE on the sentinel OR when the model NARRATES an action promise instead of emitting it.
+      // Jelani 2026-07-02: "she keeps saying she's doing something but really not doing it." If the
+      // user asked her to DO / FIND / SEARCH something and her reply is a bare promise ("let me
+      // search…", "I'm on it", "searching now", "let me pull that up") with no actual answer/data,
+      // treat it EXACTLY like NEED_TOOLS and fall through to the agent loop so she ACTUALLY executes
+      // (and the tool-path honesty guard then reports the real outcome). This makes "saying it" and
+      // "doing it" the same event instead of an empty promise.
+      const _userWantsAction = /\b(find|search|look\s*up|pull(\s*up)?|open|generate|create|make|build|run|do (it|that|this)|show|get|fetch|bring up|load|check|recall|remember|edit|write|send|add|update|delete|proceed)\b/i.test(userText);
+      const _narratedPromise = /\b(let me (just )?(search|find|look|pull|check|get|grab|fetch|dig|bring|see|load|open|generate|run|look up|look into)|i'?m (already )?(on it|on this|searching|looking|digging|pulling|getting|working|generating|loading)|searching (now|for|my|through)|looking (now|for|into|through)|digging (through|into)|pulling (that|it|up)|\bon it\b|hang on|one (sec|second|moment)|give me a (sec|second|moment|minute))\b/i.test(finalText);
+      const _replyHasSubstance = /[0-9]|\bhere('?s| is| are)\b|\bfound\b|\bshows?\b|\bthere (is|are)\b|:\s*\S|\n\s*[-*]|\b(couldn'?t|can'?t|cannot|unable|not able|no (tool|way|match|results?|photo|file))\b/i.test(finalText);
+      const _promiseEscalate = _narratedPromise && _userWantsAction && !_replyHasSubstance;
+      if (/\bNEED_TOOLS\b/i.test(finalText) || _promiseEscalate) {
         // Escalate: do NOT return here — fall through to the agent loop below so she
         // actually performs the action / looks up the data.
-        logger.info('[respond] conversational path escalating to tools', { text: userText.slice(0, 60) });
+        logger.info('[respond] conversational path escalating to tools', { promised: _promiseEscalate, text: userText.slice(0, 60) });
       } else {
         if (isStepStatusMessage(finalText)) {
           console.log(`[respond] Blocked step status (conv): ${finalText.slice(0, 60)}...`);
