@@ -96,6 +96,14 @@ export async function present(userText, replyText, { force = false, sessionId = 
     const m = raw.match(/\{[\s\S]*\}/); if (!m) return null;
     let plan; try { plan = JSON.parse(m[0]) } catch { return null }
     if (!plan || !plan.present || !Array.isArray(plan.cards) || !plan.cards.length) return null;
+    // A live localhost artifact IS the visual: when the reply carries a localhost preview URL
+    // (scene3d / web_builder result — already auto-presented as a web card), web-SEARCHED
+    // image/video cards for the same thing are look-alike stock media, not the user's artifact
+    // (2026-07-03: Meshy's website OG image landed on the panel as "3D Hologram Preview" next
+    // to the real scene). Keep markdown/table/mermaid cards; drop searched media for this turn.
+    const _hasLiveArtifact = /https?:\/\/(localhost|127\.0\.0\.1)/i.test(reply);
+    if (_hasLiveArtifact) plan.cards = plan.cards.filter((c) => !/^(image|photo|video)$/i.test(String((c && c.kind) || '')));
+    if (!plan.cards.length) return null;
     if (plan.layout === 'stack' || plan.layout === 'spread') artifactBus.setLayout(plan.layout);
     const built = [];
     for (const c of plan.cards.slice(0, 6)) { const card = await buildCard(c); if (card) built.push(artifactBus.open(card).id) }
