@@ -1058,7 +1058,16 @@ MACHINE-STATE RULE (absolute): if the question is about the CURRENT state of thi
         || /\b(the\s+(tab|window|site|page)\s+(is|should be)\s+(open|in front|up)|it'?s\s+(open|in front)|in front now|opening\s+(localhost|the|your|it)|i\s+see\s+the\s+(tab|window|site|page|browser))\b/i.test(finalText);
       const _promiseEscalate = (!_replyHasSubstance && (_strongNarration || (_weakNarration && _userWantsAction)))
         || _fabricatedAction;
-      if (/\bNEED_TOOLS\b/i.test(finalText) || _promiseEscalate) {
+      // FALSE CAPABILITY DENIAL: in talk-only mode she sometimes says "I can't" / "I don't have a
+      // tool" for something her AGENT tools CAN do (Jelani 2026-07-03: "open the 3d hologram" -> "I
+      // can't open a 3D holographic photo, I don't have a tool that displays 3D files"). The AGENT is
+      // the authority on what tools exist, so a bare can't / no-tool answer to an ACTION request
+      // escalates: the agent either does it (scene3d / open_item / etc.) or the tool-path honesty
+      // guard reports the REAL, verified limit. (Past-tense "I couldn't find X" is a tool RESULT, not
+      // this pre-tool denial, and is not matched.)
+      const _capabilityDenial = /\b(i can'?t|i cannot|i'?m (not able|unable)|i do(n'?t| not) have (a|the|any|any such )?\s*(tool|way|ability|means)|i don'?t have the ability|not able to (open|show|display|view|generate|create|make|build|run|find|search|pull|load|do)|no tool (that|to)|there'?s no tool|don'?t have a way to)\b/i.test(finalText);
+      const _shouldEscalate = /\bNEED_TOOLS\b/i.test(finalText) || _promiseEscalate || (_capabilityDenial && _userWantsAction);
+      if (_shouldEscalate) {
         // Escalate: do NOT return here — fall through to the agent loop below so she
         // actually performs the action / looks up the data.
         logger.info('[respond] conversational path escalating to tools', { promised: _promiseEscalate, text: userText.slice(0, 60) });
