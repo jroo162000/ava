@@ -82,6 +82,15 @@ function looksLikeToolRequest(text = '') {
     /\b(list|find|search for|locate|show me|name|count|how many|open|read|delete)\b[\s\S]{0,40}\b(files?|folders?|documents?)\b/.test(t) ||
     /\b(files?|folders?|documents?)\b[\s\S]{0,40}\b(begin|begins|start|starts|named|called|matching|that (start|begin))\b/.test(t) ||
     /\bhow many lines\b/.test(t) ||
+    // Visual / media / web-action requests (2026-07-03 log review): "show/open/pull up that 3d
+    // holographic photo", "show me my 3d hologram", "open the localhost site", "bring that tab to
+    // the front", "generate a 3d model from the photo". These were landing on the talk-only
+    // conversational path (the rules above only knew files/folders/documents), where the model
+    // narrates the action instead of doing it. Verb + visual/web object — general, not phrase-mapped.
+    /\b(open(ed| up)?|show( me)?|display|view|pull(ing)? up|bring (up|it|that|this|the \w+)|focus|launch|start|run|generate|create|make|build|rebuild|render|load|play)\b[\s\S]{0,60}\b(photos?|pictures?|images?|screenshots?|holograms?|holographics?|holo|3[\s-]?d\b|glb|models?|avatars?|scenes?|websites?|site|web ?pages?|page|url|localhost|local ?host|browser|tabs?|pop[- ]?ups?|panel|video|animation)\b/.test(t) ||
+    /\bopen( up)? \d{4,5}\b/.test(t) ||   // "open 19525" — a bare localhost port
+    /\b(front|forward|foreground)\b[\s\S]{0,30}\b(tab|window|browser|site|page)\b/.test(t) ||
+    /\b(tab|window|browser|site|page)\b[\s\S]{0,30}\b(front|forward|foreground)\b/.test(t) ||
     // self-diagnosis / capability control
     /\b(diagnose|diagnostic|self[- ]?diagnos|run (a |the )?diagnos|check (all )?(of )?(your )?(tools|capabilities|systems|functions)|test (all )?(your )?(tools|capabilities))\b/.test(t)
   );
@@ -1033,7 +1042,7 @@ MACHINE-STATE RULE (absolute): if the question is about the CURRENT state of thi
       // STRONG narration = an explicit lookup/do action she's announcing ("let me search/find/pull…",
       // "searching for…", "digging through…"). This alone means she's promising to execute, even if
       // THIS message is just a clarification/label with no verb (e.g. reply "searching for X now").
-      const _strongNarration = /\b(let me (just )?(search|find|look|pull|check|get|grab|fetch|dig|bring|see|load|open|generate|run|look up|look into)|searching (now|for|my|through)|looking (now|for|into|through)|digging (through|into)|pulling (that|it|up)|i'?m (already )?(searching|looking|digging|pulling|getting|generating|loading|on it|on this))\b/i.test(finalText);
+      const _strongNarration = /\b(let me (just )?(search|find|look|pull|check|get|grab|fetch|dig|bring|see|load|open|generate|run|build|launch|look up|look into)|searching (now|for|my|through)|looking (now|for|into|through)|digging (through|into)|pulling (that|it|up)|i'?m (already )?(searching|looking|digging|pulling|getting|generating|loading|building|creating|making|running|starting|launching|opening|checking|scanning|working on|on it|on this))\b/i.test(finalText);
       // WEAK narration = vague filler ("on it", "hang on", "one sec") that only counts as a real
       // action-promise when the user actually asked for an action (so "you can count on it" is safe).
       const _weakNarration = /\b(\bon it\b|hang on|one (sec|second|moment)|give me a (sec|second|moment|minute)|i'?m (already )?working)\b/i.test(finalText);
@@ -1056,8 +1065,27 @@ MACHINE-STATE RULE (absolute): if the question is about the CURRENT state of thi
         /\b(i'?ve|i'?m)\s+(open(ed|ing)?|focus(ed|ing)?|switch(ed|ing)?|brought|bringing|clos(ed|ing)|launch(ed|ing)|built|building|navigat(ed|ing)|click(ed|ing)|start(ed|ing)|pull(ed|ing)\s+up)\b[\s\S]{0,40}\b(tab|window|site|page|localhost|url|browser|scene|\bui\b|hologram|the file)\b/i.test(finalText)
         || /\bi\s+(opened|opening|focused|focusing|switched|switching|brought|launched|launching|built|building|navigated|clicked|started|starting)\b[\s\S]{0,40}\b(tab|window|site|page|localhost|url|browser|scene|\bui\b|hologram)\b/i.test(finalText)
         || /\b(the\s+(tab|window|site|page)\s+(is|should be)\s+(open|in front|up)|it'?s\s+(open|in front)|in front now|opening\s+(localhost|the|your|it)|i\s+see\s+the\s+(tab|window|site|page|browser))\b/i.test(finalText);
+      // TRAILING PROMISE (Jelani 2026-07-03, post-restart log review): a reply that ENDS by
+      // announcing an action she is about to take ("…Let me go ahead and do that now.",
+      // "Searching my memory for it now.", "Give me a couple minutes.", "I'll let you know when
+      // it's ready.") is an UNFULFILLED promise no matter how much recalled detail came before
+      // it. The exact miss: "I found the files — … Let me go ahead and do that now." sailed
+      // through because "found" counted as substance. In talk-only mode NOTHING runs after the
+      // reply, so a promising TAIL must escalate regardless of substance. A tail that asks the
+      // user a question ("…do you see it?", "Which one?") is a genuine handoff, not a promise.
+      const _sentences = String(finalText || '').trim().split(/(?<=[.!?…])\s+/).filter(s => s.trim());
+      let _tail = _sentences.length ? _sentences[_sentences.length - 1].trim() : '';
+      // Strip a leading acknowledgment ("Okay — ", "Got it — ") so the promise verb is at the front.
+      _tail = _tail.replace(/^(okay|ok|got it|alright|right|sure|yes|yeah|mm-?hmm|understood|no problem|of course|absolutely|perfect|great)[,!. —–-]*\s*/i, '');
+      const _tailPromise = !!_tail && !/\?\s*$/.test(_tail) && (
+        (/^[^a-z]*(let me(?! know\b)|i'?ll|i'?m (gonna|going to|about to)|lemme)\b/i.test(_tail)
+          && /\b(search|find|look|check|pull|open|build|generat|creat|mak\w*|run|load|get|grab|fetch|launch|start|scan|dig|fix|figure out|do (that|it|this)|go(ing)? ahead|let you know|report back|have (it|that|this))\b/i.test(_tail))
+        || /^[^a-z]*(searching|looking (for|into|through|at|up)|checking|running|building|generating|scanning|digging|working on|pulling|loading|starting|launching|opening|fetching|creating|making)\b/i.test(_tail)
+        || /\b(give me (a|one|two|a couple( of)?|a few) (sec|seconds?|moments?|min|minutes?)|one (sec|second|moment)|hang (on|tight)|be right back|i'?ll (let you know|report back|tell you) when|i'?ll have (it|that|this))\b/i.test(_tail)
+      );
       const _promiseEscalate = (!_replyHasSubstance && (_strongNarration || (_weakNarration && _userWantsAction)))
-        || _fabricatedAction;
+        || _fabricatedAction
+        || (_tailPromise && (_userWantsAction || _strongNarration));
       // FALSE CAPABILITY DENIAL: in talk-only mode she sometimes says "I can't" / "I don't have a
       // tool" for something her AGENT tools CAN do (Jelani 2026-07-03: "open the 3d hologram" -> "I
       // can't open a 3D holographic photo, I don't have a tool that displays 3D files"). The AGENT is
