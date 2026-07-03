@@ -1001,7 +1001,7 @@ async function respondHandler(req, res) {
       // needed, instead of a brittle keyword gate. In this chat-only mode she must
       // NEVER promise or fake an action — if it needs doing or looking up, she emits
       // a sentinel and we escalate to the agent loop.
-      const routingPrompt = `\n\nIMPORTANT: In this mode you can ONLY talk right now — you cannot directly run a tool this turn. If the user asks you to DO something (send/reply to an email, create/update/delete a calendar event, open/read/edit files, control the computer, send a message), OR asks about their CURRENT external data (their real calendar, inbox/emails, files, system status), OR asks you to RECALL or SEARCH something from PAST conversations that is NOT already in the recent turns shown above, do NOT guess, fake, promise, or say you can't — respond with EXACTLY this token and nothing else: NEED_TOOLS. That escalates to your tools, including memory_search over your saved memory and your FULL conversation history.
+      const routingPrompt = `\n\nIMPORTANT: In this mode you can ONLY talk right now — you cannot directly run a tool this turn. If the user asks you to DO something (send/reply to an email, create/update/delete a calendar event, open/read/edit files, control the computer, send a message), OR asks about their CURRENT external data (their real calendar, inbox/emails, files, system status), OR asks you to RECALL or SEARCH something from PAST conversations that is NOT already in the recent turns shown above, do NOT guess, fake, promise, or say you can't — respond with EXACTLY this token and nothing else: NEED_TOOLS. That escalates to your tools, including memory_search over your saved memory and your FULL conversation history. Because you have NOT run any tool this turn, you must NEVER claim you already DID an action or saw its result: do not say you opened / focused / switched / brought forward / launched / built / navigated to a tab, window, page, site, or localhost URL, and do not say you "see" a tab/window/page or that something "is opening" or "in front now." If that is what's needed, emit NEED_TOOLS instead of describing it as done — claiming you opened a tab you did not open is lying to the user.
 
 MACHINE-STATE RULE (absolute): if the question is about the CURRENT state of this computer or anything that changes moment to moment — clipboard contents, open windows, which app is in front, drives/storage, network/wifi, volume or mute, what's playing, processes, devices, the recycle bin, and anything similar — you may answer ONLY from data explicitly present in the context above (e.g. the live environment block). If the specific value is not literally there, emit NEED_TOOLS. NEVER invent a plausible reading. Saying "Let me check" and then stating a made-up number IS lying to the user; you have real tools — use them via NEED_TOOLS instead.\n\nYOU DO HAVE MEMORY. Facts about the user and your own notes are in the system prompt above, the recent turns are included as prior messages, and you can search your entire conversation history with memory_search. So NEVER tell the user you can't remember, don't have memory, or can't access past conversations — that is false. If asked whether you can access past conversations, the answer is YES. If a recall question can be answered from the recent turns above, answer it directly; otherwise emit NEED_TOOLS so you can search.`;
       const _sysFull = sysPrompt + capabilityPrompt + routingPrompt;
@@ -1042,7 +1042,22 @@ MACHINE-STATE RULE (absolute): if the question is about the CURRENT state of thi
       // was failing). Real data numbers ("3.34 MB", "5 emails") survive the strip.
       const _ftSub = String(finalText || '').replace(/\b[0-9]\s?-?d\b/gi, ' ');
       const _replyHasSubstance = /[0-9]|\bhere('?s| is| are)\b|\bfound\b|\bshows?\b|\bthere (is|are)\b|:\s*\S|\n\s*[-*]|\b(couldn'?t|can'?t|cannot|unable|not able|no (tool|way|match|results?|photo|file))\b/i.test(_ftSub);
-      const _promiseEscalate = !_replyHasSubstance && (_strongNarration || (_weakNarration && _userWantsAction));
+      // FABRICATED COMPLETION/OBSERVATION: she is talk-only this turn (no tool ran), so ANY claim she
+      // performed a device/browser/file action or "sees" live UI state is a fabrication — and it
+      // carries fake substance ("I see the tab is open"), so the substance gate above misses it.
+      // Jelani 2026-07-03: opening localhost:19525 she kept saying "I've opened/focused the tab",
+      // "I see the site opened", "it should be in front now" without running anything. Escalate so she
+      // ACTUALLY does it (or the tool-path honesty guard reports the real failure).
+      // Requires "I've/I'm + <action>" OR "I + <past/progressive action>" (so a question like
+      // "should I open the site?" — bare present — never matches), a tool-only object (no bare "it"),
+      // or a live-UI observation. Fires regardless of the current message because CLAIMING completion
+      // in talk-only mode is never legitimate.
+      const _fabricatedAction =
+        /\b(i'?ve|i'?m)\s+(open(ed|ing)?|focus(ed|ing)?|switch(ed|ing)?|brought|bringing|clos(ed|ing)|launch(ed|ing)|built|building|navigat(ed|ing)|click(ed|ing)|start(ed|ing)|pull(ed|ing)\s+up)\b[\s\S]{0,40}\b(tab|window|site|page|localhost|url|browser|scene|\bui\b|hologram|the file)\b/i.test(finalText)
+        || /\bi\s+(opened|opening|focused|focusing|switched|switching|brought|launched|launching|built|building|navigated|clicked|started|starting)\b[\s\S]{0,40}\b(tab|window|site|page|localhost|url|browser|scene|\bui\b|hologram)\b/i.test(finalText)
+        || /\b(the\s+(tab|window|site|page)\s+(is|should be)\s+(open|in front|up)|it'?s\s+(open|in front)|in front now|opening\s+(localhost|the|your|it)|i\s+see\s+the\s+(tab|window|site|page|browser))\b/i.test(finalText);
+      const _promiseEscalate = (!_replyHasSubstance && (_strongNarration || (_weakNarration && _userWantsAction)))
+        || _fabricatedAction;
       if (/\bNEED_TOOLS\b/i.test(finalText) || _promiseEscalate) {
         // Escalate: do NOT return here — fall through to the agent loop below so she
         // actually performs the action / looks up the data.
