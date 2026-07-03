@@ -83,6 +83,13 @@ export async function present(userText, replyText, { force = false, sessionId = 
   try {
     const reply = String(replyText || '').trim();
     if (!force && reply.length < 220) return null;
+    // Don't decorate a failure/incompletion: when the reply says the action did NOT happen
+    // ("I haven't opened it yet", "that part didn't happen", "couldn't"), illustrative media
+    // (a stock photo / random YouTube video) misrepresents the outcome — 2026-07-03 a
+    // "3D Hologram Preview" card showing an unrelated YouTube video landed on the panel while
+    // the hologram was never opened. Real artifacts still reach the panel via the tool-result
+    // preview_url auto-present hook in agentLoop.
+    if (!force && /\b(didn'?t happen|haven'?t\b|hasn'?t (been|happened)|not (yet|able)|couldn'?t|wasn'?t able|failed to|did not (run|happen|open))\b/i.test(reply)) return null;
     const usr = `User asked:\n${String(userText || '').slice(0, 800)}\n\nAVA answered:\n${reply.slice(0, 2500)}\n\n${force ? 'The user explicitly asked to SEE something, so present (present:true) with the cards that fit.' : 'Decide whether to present, and if so plan only the cards that genuinely help.'}`;
     const r = await llmService.chat([{ role: 'system', content: PLAN_SYS }, { role: 'user', content: usr }], { temperature: 0.3, max_tokens: 900 });
     const raw = String(r.text || r.content || '').trim();

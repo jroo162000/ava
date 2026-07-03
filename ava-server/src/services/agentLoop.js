@@ -180,7 +180,12 @@ const AgentStatus = {
 function isMultiStepGoal(goal) {
   const g = String(goal || '').toLowerCase();
   if (/\b(and then|then\b|after that|also\b|, and|and also)\b/.test(g)) return true;
-  const verbs = g.match(/\b(take|open|send|reply|create|make|find|search|read|write|save|delete|remove|cancel|update|change|move|copy|rename|turn|set|close|launch|show|play|record|capture|schedule|book|add|post|download|upload)\b/g) || [];
+  // 2026-07-03: "open the newest 3d hologram model ... AND PUT it on the panel" counted as
+  // single-action because "put" (and place/display/pull/bring/load/build/...) were missing, so
+  // the single-action brake stopped the loop after the fs listing and the second half of the
+  // goal never ran. Keep this list broad — the brake exists to stop UNREQUESTED follow-ups,
+  // not requested second actions.
+  const verbs = g.match(/\b(take|open|send|reply|create|make|find|search|read|write|save|delete|remove|cancel|update|change|move|copy|rename|turn|set|close|launch|show|play|record|capture|schedule|book|add|post|download|upload|put|place|display|pull|bring|load|build|generate|render|start|run|check|tell)\b/g) || [];
   return new Set(verbs).size > 1;
 }
 
