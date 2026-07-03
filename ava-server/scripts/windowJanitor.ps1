@@ -75,15 +75,22 @@ foreach ($row in [AvaJan]::List()) {
   # PseudoConsoleWindow, OpenConsole, WindowsTerminal) are never closed by the generic rules.
   $looksDefault  = ($title -eq '' -or $title -match '(?i)^(command prompt|c:\\|administrator:|windows\\system32)')
   $isClassicCmd  = (($cls -eq 'ConsoleWindowClass') -and ($name -eq 'cmd') -and $looksDefault)
+  # Win11 hosts a finished "run a .bat" shell as a ConPTY window whose OWNING process is cmd
+  # (name -eq 'cmd') with a blank/default title -- a running child renames the title, so a default
+  # title means the shell is idle/finished. Classic ConsoleWindowClass never appears on Win11, which
+  # is why the rule above closed nothing here. Only bare cmd is matched: WindowsTerminal-process
+  # windows (reparented, can host live tabs) and every custom-titled window (AVA Client/Voice/Server
+  # or any running task) are deliberately excluded, so this can't take the live UI down.
+  $isIdleCmd     = (($name -eq 'cmd') -and $isConsoleHost -and $looksDefault -and -not $isClassicCmd)
   # Stale-server cleanup fires only when the live server is a hidden node, so the visible
   # "AVA Server (5051)" console is genuinely a leftover -- it is the ONLY WT window ever closed.
   $isStaleServer = ($serverHiddenNode -and $isConsoleHost -and ($title -match 'AVA Server \(5051\)'))
   $why = ''
-  if ($isExplorer) { $why = 'explorer' } elseif ($isClassicCmd) { $why = 'classic-cmd' } elseif ($isStaleServer) { $why = 'stale-5051' }
+  if ($isExplorer) { $why = 'explorer' } elseif ($isClassicCmd) { $why = 'classic-cmd' } elseif ($isIdleCmd) { $why = 'idle-cmd' } elseif ($isStaleServer) { $why = 'stale-5051' }
   if ($isConsoleHost) { $census += ("  SEEN $name | $cls | '$title' | rule=" + ($(if($why){$why}else{'KEEP'}))) }
   if ($why) {
     $ageOk = $true
-    if ($isClassicCmd) { try { $ageOk = ((Get-Date) - $proc.StartTime).TotalSeconds -ge 30 } catch { $ageOk = $true } }
+    if ($isClassicCmd -or $isIdleCmd) { try { $ageOk = ((Get-Date) - $proc.StartTime).TotalSeconds -ge 30 } catch { $ageOk = $true } }
     if ($ageOk) {
       if (-not $DRYRUN) { [void][AvaJan]::PostMessage([IntPtr]$h, $WM_CLOSE, [IntPtr]::Zero, [IntPtr]::Zero) }
       $closed += ("$why :: $name/$cls :: '$title'")
