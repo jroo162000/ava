@@ -49,7 +49,7 @@ export function loadIdentity(force = false) {
 function _coreLines(force = false) {
   const id = loadIdentity(force);
   const trust = id.trust_system || {};
-  const name = id.name || 'AVA';
+  const name = id.name || 'Ava';
   const user = trust.user_name || 'the user';
   const namePron = id.name_pronunciation || 'AY-vuh (rhymes with the name Ava)';
   return [

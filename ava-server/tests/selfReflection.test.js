@@ -162,4 +162,20 @@ describe('selfReflection distillation (distillPrinciples)', () => {
     const rErr = await distillPrinciples({ chat: async () => { throw new Error('quota'); }, upsert: async () => {}, readAll: () => sixLines(), readState: () => ({ distilledFrom: 0 }), writeState: () => {} });
     expect(rErr.reason).toBe('llm_error');
   });
+
+  test('phase 4: prunes raw warnings with the keep budget after distilling, and reports the count', async () => {
+    let pruneKeep = null;
+    const r = await distillPrinciples({
+      chat: async () => ({ text: '["Confirm before acting on ambiguous requests.","Verify assumptions against real state."]' }),
+      upsert: async () => {},
+      readAll: () => sixLines(),
+      readState: () => ({ distilledFrom: 0 }),
+      writeState: () => {},
+      prune: async (keep) => { pruneKeep = keep; return { pruned: 4, kept: keep }; },
+      keepRawWarnings: 20,
+    });
+    expect(r.distilled).toBe(2);
+    expect(pruneKeep).toBe(20);   // prune called with the keep budget
+    expect(r.pruned).toBe(4);     // pruned count surfaced
+  });
 });

@@ -219,9 +219,11 @@ export async function distillPrinciples({
   readAll = () => { try { return fs.readFileSync(OUT, 'utf8'); } catch { return ''; } },
   readState = _readPrinciplesState,
   writeState = _writePrinciplesState,
+  prune = null,
   minReflections = DISTILL_MIN,
   newThreshold = DISTILL_NEW,
   maxPrinciples = MAX_PRINCIPLES,
+  keepRawWarnings = parseInt(process.env.AVA_REFLECTION_KEEP_WARNINGS || '25', 10) || 25,
 } = {}) {
   const reflections = _allReflections(readAll);
   if (reflections.length < minReflections) return { distilled: 0, reason: 'too_few', reflections: reflections.length };
@@ -262,7 +264,18 @@ export async function distillPrinciples({
     } catch { /* one bad write must not abort */ }
   }
   writeState({ principles, distilledFrom: reflections.length, ts: Date.now() });
-  return { distilled: stored, principles, fromReflections: reflections.length };
+
+  // Phase 4: now that these reflections are captured in the principles above, prune the oldest raw
+  // self-reflection WARNING memories down to a recent budget so the store stays lean (they're
+  // archived to the cold vault, never hard-deleted). Lazy-load memory.js; injectable for tests.
+  let pruned = 0;
+  try {
+    if (!prune) { const mem = (await import('./memory.js')).default; prune = (keep) => mem.pruneSelfReflectionWarnings(keep); }
+    const pr = await prune(keepRawWarnings);
+    pruned = (pr && pr.pruned) || 0;
+  } catch { /* prune is best-effort */ }
+
+  return { distilled: stored, principles, fromReflections: reflections.length, pruned };
 }
 
 /** Test-only: reset internal state. */

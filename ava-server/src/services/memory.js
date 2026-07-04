@@ -439,6 +439,40 @@ class MemoryService {
   }
 
   /**
+   * Phase-4 prune for the self-reflection loop: keep only the most recent `keep` raw self-reflection
+   * WARNING memories — their content is now captured in the higher-level CONSTRAINT principles, so the
+   * store stays lean over time. Archives the pruned ones to the on-device cold vault first (never a
+   * hard delete), and touches ONLY source==='self-reflection' WARNING items — never principles, user
+   * prefs, or anything else. Returns { pruned, kept }.
+   */
+  async pruneSelfReflectionWarnings(keep = 25, opts = {}) {
+    const k = Math.max(0, keep | 0);
+    const raws = this.memory
+      .filter(m => m && m.type === MemoryType.WARNING && m.source === 'self-reflection')
+      .sort((a, b) => (a.created_at || 0) - (b.created_at || 0)); // oldest first
+    if (raws.length <= k) return { pruned: 0, kept: raws.length };
+    const toPrune = raws.slice(0, raws.length - k);
+    const vaultDir = opts.vaultDir || process.env.AVA_COLD_STORAGE_DIR || path.join(os.homedir(), 'ava_cold_storage');
+    try {
+      fs.mkdirSync(vaultDir, { recursive: true });
+      const archivedAt = new Date().toISOString();
+      fs.appendFileSync(path.join(vaultDir, 'forgotten-memories.jsonl'),
+        toPrune.map(m => JSON.stringify({ ...m, archivedAt, prunedBy: 'self-reflection-distill' })).join('\n') + '\n');
+    } catch (e) {
+      logger.warn('[memory] self-reflection prune vault write failed; aborting (no data loss)', { error: e.message });
+      return { pruned: 0, error: e.message }; // never delete if the archive failed
+    }
+    const ids = new Set(toPrune.map(m => m.id));
+    this.memory = this.memory.filter(m => !ids.has(m.id));
+    try {
+      if (this.db) { const del = this.db.prepare('DELETE FROM mem WHERE id = ?'); for (const id of ids) del.run(id); }
+      else { fs.writeFileSync(VECTORS_PATH, this.memory.map(m => JSON.stringify(m)).join('\n') + (this.memory.length ? '\n' : '')); }
+    } catch (e) { logger.warn('[memory] self-reflection prune delete failed', { error: e.message }); }
+    logger.info('[memory] pruned raw self-reflection warnings (now captured in principles)', { pruned: toPrune.length, kept: k });
+    return { pruned: toPrune.length, kept: k };
+  }
+
+  /**
    * Basic semantic search
    */
   async search(query, k = 5) {
