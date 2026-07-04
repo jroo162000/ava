@@ -86,6 +86,12 @@ export function start() {
   const foldMs = parseInt(process.env.AVA_REFLECTION_FOLD_MS || String(30 * 60 * 1000), 10) || (30 * 60 * 1000);
   try { const t0 = setTimeout(() => { foldIntoMemory().catch(() => {}); }, 60 * 1000); if (t0.unref) t0.unref(); } catch { /* optional */ }
   try { const t1 = setInterval(() => { foldIntoMemory().catch(() => {}); }, foldMs); if (t1.unref) t1.unref(); } catch { /* optional */ }
+  // Phase 3: periodically distill the accumulated reflections into a few durable principles (LLM).
+  // Runs less often than the fold; both delays env-tunable. Gated internally so it no-ops cheaply.
+  const distillMs = parseInt(process.env.AVA_REFLECTION_DISTILL_MS || String(6 * 60 * 60 * 1000), 10) || (6 * 60 * 60 * 1000);
+  const distillDelay = parseInt(process.env.AVA_REFLECTION_DISTILL_DELAY_MS || String(3 * 60 * 1000), 10) || (3 * 60 * 1000);
+  try { const t2 = setTimeout(() => { distillPrinciples().catch(() => {}); }, distillDelay); if (t2.unref) t2.unref(); } catch { /* optional */ }
+  try { const t3 = setInterval(() => { distillPrinciples().catch(() => {}); }, distillMs); if (t3.unref) t3.unref(); } catch { /* optional */ }
   return true;
 }
 
@@ -167,6 +173,96 @@ export async function foldIntoMemory({
   }
   setCursor(nonEmpty.length);              // advance past everything we just read
   return { processed: nonEmpty.length - cursor, stored };
+}
+
+// ─── Phase 3: DISTILLATION — merge many raw reflections into a few durable principles ────────────
+// As reflections accumulate they get granular and repetitive. This periodically asks the LLM to
+// synthesize the raw reflections into <=5 higher-level operating principles, stored as high-priority
+// CONSTRAINT memories (so they rank above the raw warnings in retrieval) and mirrored to
+// logs/selfPrinciples.json. Only re-distills once enough NEW reflections have accumulated.
+
+const PRINCIPLES = path.join(__dirname, '..', '..', 'logs', 'selfPrinciples.json');
+const DISTILL_MIN = 6;   // need at least this many distinct reflections before generalizing
+const DISTILL_NEW = 4;   // re-distill once this many new reflections accumulate since last time
+const MAX_PRINCIPLES = 5;
+
+/** Pure: all distinct reflection strings across the jsonl. */
+export function _allReflections(readAll = () => { try { return fs.readFileSync(OUT, 'utf8'); } catch { return ''; } }) {
+  const lines = String(readAll() || '').split('\n').filter((l) => l.trim());
+  const seen = new Set();
+  const out = [];
+  for (const line of lines) {
+    let entry; try { entry = JSON.parse(line); } catch { continue; }
+    for (const r of (entry && Array.isArray(entry.reflections) ? entry.reflections : [])) {
+      const s = String(r || '').trim();
+      const k = s.toLowerCase();
+      if (s.length < 12 || seen.has(k)) continue;
+      seen.add(k);
+      out.push(s);
+    }
+  }
+  return out;
+}
+
+function _readPrinciplesState() { try { return JSON.parse(fs.readFileSync(PRINCIPLES, 'utf8')); } catch { return { principles: [], distilledFrom: 0 }; } }
+function _writePrinciplesState(st) { try { fs.mkdirSync(path.dirname(PRINCIPLES), { recursive: true }); fs.writeFileSync(PRINCIPLES, JSON.stringify(st, null, 2)); } catch { /* best-effort */ } }
+
+/**
+ * Distill raw reflections into <= maxPrinciples higher-level principles via the LLM, store them as
+ * high-priority CONSTRAINT memories, and mirror to logs/selfPrinciples.json. Gated (enough total +
+ * enough NEW since last distill) so it doesn't burn LLM calls. All deps injectable for tests.
+ * Returns { distilled, reason?, principles? }. Never throws.
+ */
+export async function distillPrinciples({
+  chat = null,
+  upsert = null,
+  readAll = () => { try { return fs.readFileSync(OUT, 'utf8'); } catch { return ''; } },
+  readState = _readPrinciplesState,
+  writeState = _writePrinciplesState,
+  minReflections = DISTILL_MIN,
+  newThreshold = DISTILL_NEW,
+  maxPrinciples = MAX_PRINCIPLES,
+} = {}) {
+  const reflections = _allReflections(readAll);
+  if (reflections.length < minReflections) return { distilled: 0, reason: 'too_few', reflections: reflections.length };
+  const state = readState() || { principles: [], distilledFrom: 0 };
+  if (reflections.length - (state.distilledFrom || 0) < newThreshold) return { distilled: 0, reason: 'no_new', reflections: reflections.length };
+
+  // Lazy-load the real LLM + memory only when actually distilling. Tests inject chat/upsert.
+  let memType = 'constraint';
+  if (!chat || !upsert) {
+    try {
+      const llm = (await import('./llm.js')).default;
+      const mh = await import('./memoryHub.js');
+      if (!chat) chat = (msgs, opts) => llm.chat(msgs, opts);
+      if (!upsert) upsert = mh.default.upsert;
+      memType = (mh.MemoryType && mh.MemoryType.CONSTRAINT) || 'constraint';
+    } catch { return { distilled: 0, reason: 'deps_unavailable' }; }
+  }
+
+  const sys = `You are distilling AVA's raw self-reflections (lessons from her OWN past mistakes) into a SMALL set of durable, higher-level operating PRINCIPLES. Merge overlapping or similar reflections into general rules; keep only what will genuinely improve future behavior; drop one-off, trivial, or incident-specific ones. Each principle: ONE short imperative sentence, generalized (not tied to a single event). Return ONLY a JSON array of at most ${maxPrinciples} strings, nothing else.`;
+  const usr = `RAW SELF-REFLECTIONS (${reflections.length}):\n${reflections.map((r, i) => `${i + 1}. ${r}`).join('\n')}`;
+
+  let text = '';
+  try {
+    const r = await chat([{ role: 'system', content: sys }, { role: 'user', content: usr }], { temperature: 0.2, max_tokens: 500 });
+    text = (r.text || r.content || '').trim();
+  } catch (e) { return { distilled: 0, reason: 'llm_error', error: e.message }; }
+
+  let principles = [];
+  try { const m = text.match(/\[[\s\S]*\]/); principles = m ? JSON.parse(m[0]) : []; } catch { principles = []; }
+  principles = (Array.isArray(principles) ? principles : []).map((p) => String(p || '').trim()).filter((p) => p.length >= 8).slice(0, maxPrinciples);
+  if (!principles.length) return { distilled: 0, reason: 'empty_result', reflections: reflections.length };
+
+  let stored = 0;
+  for (const p of principles) {
+    try {
+      await upsert({ text: p, type: memType, priority: 5, source: 'self-reflection-principle', tags: ['self-reflection', 'principle'], role: 'assistant' });
+      stored++;
+    } catch { /* one bad write must not abort */ }
+  }
+  writeState({ principles, distilledFrom: reflections.length, ts: Date.now() });
+  return { distilled: stored, principles, fromReflections: reflections.length };
 }
 
 /** Test-only: reset internal state. */

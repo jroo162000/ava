@@ -1,4 +1,4 @@
-import { extractReflections, _ingest, _reset, foldIntoMemory, _lessonsFromLines } from '../src/services/selfReflection.js';
+import { extractReflections, _ingest, _reset, foldIntoMemory, _lessonsFromLines, distillPrinciples, _allReflections } from '../src/services/selfReflection.js';
 
 describe('selfReflection', () => {
   beforeEach(() => _reset());
@@ -112,5 +112,54 @@ describe('selfReflection consumer (foldIntoMemory)', () => {
     let cursor = 0; const stored = [];
     await foldIntoMemory({ upsert: async (m) => stored.push(m), readAll: () => many, getCursor: () => cursor, setCursor: (n) => { cursor = n; }, maxPerRun: 3 });
     expect(stored.length).toBe(3);
+  });
+});
+
+describe('selfReflection distillation (distillPrinciples)', () => {
+  const sixLines = () => Array.from({ length: 6 }, (_, i) => JSON.stringify({ reflections: [`I was wrong about detail ${i} because I did not confirm.`] })).join('\n') + '\n';
+
+  test('_allReflections collects distinct reflections across lines', () => {
+    const jsonl = [
+      JSON.stringify({ reflections: ['I was wrong about A here.', 'I was wrong about A here.'] }),
+      JSON.stringify({ reflections: ['My mistake on B entirely.'] }),
+    ].join('\n');
+    expect(_allReflections(() => jsonl).length).toBe(2);
+  });
+
+  test('synthesizes principles into high-priority CONSTRAINT memories and persists state', async () => {
+    let state = { principles: [], distilledFrom: 0 };
+    const stored = [];
+    const chat = async () => ({ text: '["Confirm intent before acting on ambiguous requests.","Verify against real state, never assumptions."]' });
+    const r = await distillPrinciples({
+      chat,
+      upsert: async (m) => stored.push(m),
+      readAll: () => sixLines(),
+      readState: () => state,
+      writeState: (s) => { state = s; },
+    });
+    expect(r.distilled).toBe(2);
+    expect(stored.every((m) => m.type === 'constraint')).toBe(true);
+    expect(stored.every((m) => m.priority === 5)).toBe(true);
+    expect(stored.every((m) => m.source === 'self-reflection-principle')).toBe(true);
+    expect(state.distilledFrom).toBe(6);
+    expect(state.principles.length).toBe(2);
+  });
+
+  test('gates: too_few (below min) and no_new (nothing new since last distill)', async () => {
+    const chat = async () => ({ text: '[]' });
+    const few = JSON.stringify({ reflections: ['I was wrong once right here.'] });
+    const rFew = await distillPrinciples({ chat, upsert: async () => {}, readAll: () => few, readState: () => ({ distilledFrom: 0 }), writeState: () => {} });
+    expect(rFew.reason).toBe('too_few');
+    const rNoNew = await distillPrinciples({ chat, upsert: async () => {}, readAll: () => sixLines(), readState: () => ({ distilledFrom: 6 }), writeState: () => {} });
+    expect(rNoNew.reason).toBe('no_new');
+  });
+
+  test('caps at maxPrinciples and survives an LLM error', async () => {
+    const stored = [];
+    const chatMany = async () => ({ text: JSON.stringify(Array.from({ length: 9 }, (_, i) => `Principle number ${i} to do better here.`)) });
+    const rc = await distillPrinciples({ chat: chatMany, upsert: async (m) => stored.push(m), readAll: () => sixLines(), readState: () => ({ distilledFrom: 0 }), writeState: () => {}, maxPrinciples: 5 });
+    expect(rc.distilled).toBe(5);
+    const rErr = await distillPrinciples({ chat: async () => { throw new Error('quota'); }, upsert: async () => {}, readAll: () => sixLines(), readState: () => ({ distilledFrom: 0 }), writeState: () => {} });
+    expect(rErr.reason).toBe('llm_error');
   });
 });
