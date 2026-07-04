@@ -29,6 +29,7 @@ import workflowEngine from './services/workflowEngine.js';
 import proactiveAutonomy from './services/proactiveAutonomy.js';
 import autoEval from './services/autoEval.js';
 import windowJanitor from './services/windowJanitor.js';
+import selfReflection from './services/selfReflection.js';
 import environmentContext from './services/environmentContext.js';   // Tier 3 #18: vitals source
 import { emitVoiceEvent } from './services/voiceBus.js';             // Tier 3 #18: sys.stats broadcast
 
@@ -221,6 +222,14 @@ server.listen(PORT, HOST, () => {
     windowJanitor.start();
   } catch (e) {
     logger.warn('Failed to start window janitor', { error: e.message });
+  }
+
+  // Metacognitive loop: listen to assistant turns on the voice bus, distill self-reflective
+  // sentences, and log them to logs/selfReflections.jsonl (autonomous, read-only, best-effort).
+  try {
+    selfReflection.start();
+  } catch (e) {
+    logger.warn('Failed to start self-reflection', { error: e.message });
   }
 
   // Long-horizon workflows: resume any multi-stage workflow that was mid-run when we last stopped,
