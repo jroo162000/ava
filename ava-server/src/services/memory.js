@@ -203,7 +203,19 @@ class MemoryService {
         } catch (e) { /* Indexes exist */ }
         
         logger.info('SQLite memory storage initialized (Phase 5 schema)', { path: dbPath });
+        // One-time migration: if the SQLite store is empty but a JSONL store exists, import it so
+        // switching to SQLite never drops the existing memories. Idempotent (only runs when empty).
+        try {
+          const existing = this.db.prepare('SELECT COUNT(*) AS n FROM mem').get().n;
+          if (existing === 0 && fs.existsSync(VECTORS_PATH)) this._migrateJsonlToSqlite();
+        } catch (e) { logger.warn('[memory] JSONL->SQLite migration check failed', { error: e.message }); }
         await this.loadFromSQLite();
+        // Safety net: never run with an empty active store when JSONL data exists on disk (e.g. if
+        // migration failed). Fall back to the JSONL so no memories are silently dropped.
+        if (this.memory.length === 0 && fs.existsSync(VECTORS_PATH)) {
+          logger.warn('[memory] SQLite loaded 0 rows but JSONL exists — falling back to JSONL');
+          this.loadFromJSONL();
+        }
       } else {
         logger.info('SQLite not available, using JSONL storage');
         this.loadFromJSONL();
@@ -271,6 +283,47 @@ class MemoryService {
       }
     } catch (error) {
       logger.error('Failed to load from JSONL', { error: error.message });
+    }
+  }
+
+  // One-time bulk import of the JSONL store into SQLite, matching store()'s serialization exactly
+  // (tags/meta/vec JSON-stringified). Runs inside a transaction for speed. vectors.jsonl is KEPT as
+  // a frozen backup (SQLite becomes authoritative; the empty-table guard prevents re-migration).
+  _migrateJsonlToSqlite() {
+    try {
+      const lines = fs.readFileSync(VECTORS_PATH, 'utf8').split(/\r?\n/).filter(Boolean);
+      if (!lines.length) return 0;
+      const now = Date.now();
+      const insert = this.db.prepare(`
+        INSERT OR REPLACE INTO mem (id, text, type, priority, created_at, last_used_at, source, tags, role, rating, meta, vec)
+        VALUES (@id, @text, @type, @priority, @created_at, @last_used_at, @source, @tags, @role, @rating, @meta, @vec)
+      `);
+      const run = this.db.transaction((rows) => {
+        for (const line of rows) {
+          let it; try { it = JSON.parse(line); } catch { continue; }
+          insert.run({
+            id: it.id || `${now.toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
+            text: String(it.text || ''),
+            type: it.type || 'conversation',
+            priority: Math.min(5, Math.max(1, it.priority || 3)),
+            created_at: it.created_at || it.ts || now,
+            last_used_at: it.last_used_at ?? null,
+            source: it.source || 'system',
+            tags: JSON.stringify(Array.isArray(it.tags) ? it.tags : []),
+            role: it.role ?? null,
+            rating: it.rating || 0,
+            meta: JSON.stringify(it.meta || {}),
+            vec: JSON.stringify(it.vec ?? null),
+          });
+        }
+      });
+      run(lines);
+      const n = this.db.prepare('SELECT COUNT(*) AS n FROM mem').get().n;
+      logger.info('[memory] migrated JSONL -> SQLite (vectors.jsonl kept as backup)', { migrated: n });
+      return n;
+    } catch (e) {
+      logger.error('[memory] JSONL->SQLite migration failed', { error: e.message });
+      return 0;
     }
   }
 
