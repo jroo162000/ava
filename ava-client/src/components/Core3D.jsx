@@ -224,7 +224,7 @@ function AvatarScene({ stateRef, ampRef, onDegrade, onFail }) {
     // auto-degrade: sustained slow frames WHILE ACTIVE -> hand back to the CSS orb.
     // Idle frames arrive at an intentional 125ms cadence (paceRef 125) and must never
     // count as slow — that false positive silently killed the 3D core after ~11s idle.
-    if (paceRef.current === 33 && delta > 0.05 && delta < 2) {
+    if (paceRef.current === 33 && delta > 0.05 && delta < 2 && !document.hidden) {
       slowFrames.current += 1;
       if (slowFrames.current > 90) { onDegrade && onDegrade('slow frames'); return; }
     } else if (delta <= 0.05 || paceRef.current !== 33) {
@@ -343,7 +343,7 @@ function CoreScene({ stateRef, ampRef, onDegrade }) {
     // auto-degrade: sustained slow frames WHILE ACTIVE -> hand back to the CSS orb.
     // Idle frames arrive at an intentional 125ms cadence (paceRef 125) and must never
     // count as slow — that false positive silently killed the 3D core after ~11s idle.
-    if (paceRef.current === 33 && delta > 0.05 && delta < 2) {
+    if (paceRef.current === 33 && delta > 0.05 && delta < 2 && !document.hidden) {
       slowFrames.current += 1;
       if (slowFrames.current > 90) { onDegrade && onDegrade('slow frames'); return; }
     } else if (delta <= 0.05 || paceRef.current !== 33) {
