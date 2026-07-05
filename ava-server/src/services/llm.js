@@ -218,7 +218,7 @@ function buildSystemPrompt() {
     'ocr_ops': 'read text from images using OCR',
     'system_info': 'get system information, processes, resources',
     // General computer-use (mouse+screen)
-    'computer_use': 'general computer control via screenshots: focus windows, click on-screen text (OCR), wait for text, type, hotkeys, run multi-step sequences across apps and dialogs',
+    'computer_use': 'general computer control: focus windows, type, hotkeys, run multi-step sequences across apps/dialogs. click_text = click on-screen TEXT via OCR (reliable — use for a visible label/button/link caption). click_target (target=<plain-language description>) = click an element by DESCRIPTION via vision grounding (fallback when the target is NOT plain text, e.g. an icon; it returns found:false honestly if it cannot locate it). Also wait_text, dialog_solve.',
     'computer_use_control': 'voice control for on-screen automation: pause, resume, stop'
   };
   
