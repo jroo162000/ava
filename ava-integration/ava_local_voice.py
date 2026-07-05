@@ -227,6 +227,17 @@ def _clean_command_after_wake(text: str) -> str:
     return " ".join(words)
 
 
+# Single-token name variants. The "ANY" set may appear as any WHOLE token in the first
+# four words ("um ava play music"). The "FIRST" set are real English words that collide
+# with normal conversation ("I was ABLE to...", German "aber") — they only count as a
+# wake when they are the VERY FIRST token, which is where an STT mishear of "Ava, ..."
+# actually lands. 2026-07-05 (Jelani: "she picks up conversations without the wake
+# word"): the old code substring-matched these against the first-4-words string, so
+# "table"/"capable"/"relevant"/"alabama" all woke her mid-conversation.
+_WAKE_TOKENS_ANY = {"ava", "aba", "abel", "eva"}
+_WAKE_TOKENS_FIRST = {"able", "aber"}
+
+
 def _strip_wake(text: str) -> tuple[bool, str]:
     normalized = _normalize(text)
     if not normalized:
@@ -236,27 +247,23 @@ def _strip_wake(text: str) -> tuple[bool, str]:
     normalized = normalized.replace("a va", "ava")
     normalized = normalized.replace("a bar", "aber")
 
-    for phrase in sorted(WAKE_PHRASES, key=len, reverse=True):
-        phrase_norm = _normalize(phrase)
-        if normalized == phrase_norm:
-            return True, ""
-        if normalized.startswith(phrase_norm + " "):
-            return True, _clean_command_after_wake(normalized[len(phrase_norm):].strip())
+    tokens = normalized.split()
 
-    for phrase in sorted(SOFT_WAKE_PHRASES, key=len, reverse=True):
-        phrase_norm = _normalize(phrase)
-        if normalized == phrase_norm:
-            return True, ""
-        if normalized.startswith(phrase_norm + " "):
-            return True, _clean_command_after_wake(normalized[len(phrase_norm):].strip())
+    # Multi-word phrases ("hey ava", "ok ava", "hey eva", ...) — match as a consecutive
+    # TOKEN sequence starting anywhere in the first four tokens (never as a substring).
+    for phrase in sorted(WAKE_PHRASES + SOFT_WAKE_PHRASES, key=len, reverse=True):
+        pt = _normalize(phrase).split()
+        if len(pt) < 2:
+            continue
+        for i in range(0, min(4, max(0, len(tokens) - len(pt) + 1))):
+            if tokens[i:i + len(pt)] == pt:
+                return True, _clean_command_after_wake(" ".join(tokens[i + len(pt):]))
 
-    words = normalized.split()
-    first_window = " ".join(words[:4])
-    for phrase in sorted(WAKE_PHRASES, key=len, reverse=True):
-        phrase_norm = _normalize(phrase)
-        if phrase_norm in first_window:
-            remainder = _clean_command_after_wake(normalized.split(phrase_norm, 1)[1].strip())
-            return True, remainder
+    # Single-token name variants — WHOLE-token equality only.
+    for i, tok in enumerate(tokens[:4]):
+        if tok in _WAKE_TOKENS_ANY or (i == 0 and tok in _WAKE_TOKENS_FIRST):
+            return True, _clean_command_after_wake(" ".join(tokens[i + 1:]))
+
     return False, normalized
 
 
@@ -1907,13 +1914,23 @@ class LocalVoiceRunner:
         _log(f"followup_open_sec={seconds:.1f} reason={reason}")
 
     def _allow_followup_command(self, command: str) -> bool:
+        # Follow-up window (no wake word needed right after she answered) must only accept
+        # speech that is plausibly DIRECTED AT HER. The old gate used _should_allow_tools,
+        # which is true for everything except self-intro chit-chat — so one false wake
+        # chained forever: every overheard sentence became a "command", every answer
+        # re-opened the window (2026-07-05, Jelani: she rides along with conversations).
         if not command:
             return False
-        return bool(
-            _local_fact_reply(command)
-            or _is_conversational_command(command)
-            or _should_allow_tools(command)
-        )
+        if _local_fact_reply(command) or _is_conversational_command(command):
+            return True
+        toks = command.split()
+        if toks and toks[0] in COMMAND_VERBS:
+            return True                      # "open the...", "stop", "search for..."
+        if len(toks) <= 3:
+            return True                      # short direct replies: "yes", "no thanks", "that one"
+        if re.search(r"\b(ava|aiva)\b", command):
+            return True                      # addressed her by name mid-sentence
+        return False                         # long free-form speech with no command shape
 
     def _handle_transcript(self, transcript: str) -> None:
         self.last_transcript = transcript or ""
