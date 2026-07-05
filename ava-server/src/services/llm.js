@@ -320,7 +320,8 @@ class LLMService {
       system: messages.find(m => m.role === 'system')?.content,
       temperature: options.temperature || 0.7,
       maxTokens: options.max_tokens || 1000,
-      model: options.model
+      model: options.model,
+      responseFormat: options.responseFormat   // e.g. {type:'json_object'} to force valid JSON (local decisions)
     });
     return {
       text: result.content,
@@ -544,12 +545,16 @@ class LLMService {
   }
 
   // OpenAI-compatible chat completion (OpenAI, DeepSeek, and xAI/Grok all use this wire format).
-  async _openaiCompat({ baseURL, apiKey, model, system, messages, maxTokens = 1500, tools }) {
+  async _openaiCompat({ baseURL, apiKey, model, system, messages, maxTokens = 1500, tools, responseFormat }) {
     if (!apiKey) throw new Error('no api key');
     const full = [{ role: 'system', content: system || getSystemPrompt() }, ...messages.filter(m => m.role !== 'system')];
     const isNewerOpenAI = /^(gpt-5|o[0-9])/.test(model);
     const payload = { model, messages: full };
     if (Array.isArray(tools) && tools.length) payload.tools = tools;
+    // Constrained decoding for local/OpenAI-compatible servers (LM Studio, DeepSeek, Groq): when a
+    // caller asks for JSON output (e.g. the decision call), force it so a weak model can't emit
+    // prose or malformed/leaky output. Only applied when explicitly requested — safe no-op otherwise.
+    if (responseFormat && !(Array.isArray(tools) && tools.length)) payload.response_format = responseFormat;
     if (isNewerOpenAI) payload.max_completion_tokens = Math.max(maxTokens, parseInt(process.env.AVA_SM_OPENAI_MIN_COMPLETION || '1600', 10));
     else payload.max_tokens = maxTokens;
     const resp = await fetch(`${baseURL}/chat/completions`, {
@@ -863,12 +868,12 @@ class LLMService {
             r = await this.createCompletionGemini({ ...options, model: isForced ? options.model : SM.gemini });
             break;
           case 'deepseek': {
-            const d = await this._openaiCompat({ baseURL: 'https://api.deepseek.com', apiKey: this.getApiKey('deepseek'), model: isForced ? options.model : SM.deepseek, system: options.system, messages: options.messages, maxTokens: options.maxTokens, tools: options.tools });
+            const d = await this._openaiCompat({ baseURL: 'https://api.deepseek.com', apiKey: this.getApiKey('deepseek'), model: isForced ? options.model : SM.deepseek, system: options.system, messages: options.messages, maxTokens: options.maxTokens, tools: options.tools, responseFormat: options.responseFormat });
             r = { ...d, provider: 'deepseek' };
             break;
           }
           case 'grok': {
-            const g = await this._openaiCompat({ baseURL: 'https://api.x.ai/v1', apiKey: this.getApiKey('grok'), model: isForced ? options.model : SM.grok, system: options.system, messages: options.messages, maxTokens: options.maxTokens, tools: options.tools });
+            const g = await this._openaiCompat({ baseURL: 'https://api.x.ai/v1', apiKey: this.getApiKey('grok'), model: isForced ? options.model : SM.grok, system: options.system, messages: options.messages, maxTokens: options.maxTokens, tools: options.tools, responseFormat: options.responseFormat });
             r = { ...g, provider: 'grok' };
             break;
           }

@@ -46,6 +46,16 @@ async function synthesizeAnswer(goal, tool, result) {
 }
 import skillCapture from './skillCapture.js';
 import lessonLearner from './lessonLearner.js';
+import trainingCollector from './trainingCollector.js';  // capture guard corrections as DPO/SFT data
+
+// Few-shot exemplars appended to the decision prompt — teach a weak model the exact tool-call
+// SHAPE for the actions it keeps refusing (3D gen, image edit, tab switch). Shape, not content.
+const _DECISION_EXAMPLES = `
+EXAMPLES (copy the SHAPE, not the content; emit ONE JSON object only):
+- "make a 3D model of a red car" -> {"decision":"tool_call","tool":"model3d_ops","args":{"action":"generate","prompt":"a red sports car, realistic"}}
+- "give her longer hair in the 3d holo ava image" -> {"decision":"tool_call","tool":"image_ops","args":{"action":"edit","image":"~/Downloads/3d holo ava.jpg","prompt":"longer hair"}}
+- "switch to the ava hologram tab in edge" -> {"decision":"tool_call","tool":"window_ops","args":{"action":"focus_tab","tab":"ava hologram","window":"edge"}}
+Never answer "I can't" or "I don't have a tool" for actions like these — those tools exist; call them.`;
 
 // Agent state constants
 const DEFAULT_STEP_LIMIT = 12;
@@ -439,6 +449,8 @@ CRITICAL RULES:
 10d. **EDITING / CHANGING / MAKING AN IMAGE — you CAN do this, so DO it (don't deny).** You have image_ops. To modify/change/adjust/restyle/retouch an EXISTING image or photo (e.g. "give her longer hair", "make it brighter", "remove the background"), call image_ops with action=edit, args.image=<full file path>, args.prompt=<the change>. If you only have a name (e.g. "the 3d holo ava image in Downloads"), FIRST resolve it with fs_find (fuzzy, e.g. pattern "*holo*ava*") — do NOT web-search for it and do NOT give up. To make a NEW image from scratch, use image_ops action=generate. For a 3D model, use model3d_ops (generate from text, or from_image). NEVER tell the user you "can't edit images" or that you "can only find/read them" — that is FALSE; image_ops edits images. If the edit tool returns an error (e.g. no image-provider credit), report that specific error honestly — that is different from claiming you lack the ability.
 11. **3D SCENES / HOLOGRAMS + OPENING A LOCALHOST SITE.** To build or SHOW a 3D scene / hologram / AR view from a model, call scene3d (action "create") with args.models=[{"path":"<full path to the .glb>"}], args.name, args.open=true — it copies the model in, starts a LOCAL web server, opens the browser, and returns preview_url like http://localhost:PORT/ (that URL IS the site). The port is EPHEMERAL (fresh every run), so to "pull up" / "reopen" / "show" a hologram you already made, RUN scene3d AGAIN — do NOT search Downloads for a file and do NOT assume an old port (e.g. :19525) is still up. Jelani's 3D avatar models are in C:\\Users\\Dell\\Downloads\\ava_models\\ (newest ava_model_*.glb) with a copy at C:\\Users\\Dell\\Claude\\Projects\\AVA Development\\ava_hologram_model.glb. To OPEN a localhost URL / "the site" / "the localhost", call open_item with args.target="http://localhost:<port>" (an http target opens the real browser) — NEVER search Downloads for a "site". If the port is unknown, recall the last scene3d preview_url or re-run scene3d. NOTE: speech-to-text garbles these names — ".glb" arrives as "gab"/"gib"/"glib"/"g l b", and model/scene names as "3d hollow"/"holoava"/"hologram model gab". If the GOAL references a hologram or 3D model file under ANY such spelling, do NOT literal-search the garbled name and do NOT ask which file — use the known model paths above and run scene3d. FINDING or LISTING the model file is NOT completion: when the goal asks to open/show/display/put up the hologram (in the panel, a scene, or the browser), the goal is complete ONLY when scene3d has RUN this turn and returned a preview_url (the preview_url is auto-shown in your pop-up panel). After locating the file, your NEXT action is scene3d — never a final answer.
 
+${_DECISION_EXAMPLES}
+
 What is your next action?`;
   }
 
@@ -490,6 +502,8 @@ CRITICAL RULES:
 17c. **CLICKING SOMETHING ON SCREEN — try methods in this order (most→least reliable), and NEVER just screenshot and stop.** (1) a browser TAB → window_ops focus_tab. (2) a window's menu/button/save/next by name → app_control. (3) VISIBLE TEXT (a label, link, or button caption) → computer_use click_text (OCR — reliable). (4) only if the target is NOT plain text (an icon, a picture, an unlabeled control) → computer_use click_target with target=<plain-language description> (vision grounding; it may be imprecise and returns found:false honestly when it can't locate the element). Report the outcome truthfully: only say you clicked it if the tool returned found:true; if every applicable method fails, say so plainly instead of pretending.
 17d. **EDITING / CHANGING / MAKING AN IMAGE — you CAN do this, so DO it (don't deny).** You have image_ops. To modify/change/adjust/restyle/retouch an EXISTING image or photo (e.g. "give her longer hair", "make it brighter", "remove the background"), call image_ops with action=edit, args.image=<full file path>, args.prompt=<the change>. If you only have a name (e.g. "the 3d holo ava image in Downloads"), FIRST resolve it with fs_find (fuzzy, e.g. pattern "*holo*ava*") — do NOT web-search for it and do NOT give up. To make a NEW image from scratch, use image_ops action=generate. For a 3D model, use model3d_ops (generate from text, or from_image). NEVER tell the user you "can't edit images" or that you "can only find/read them" — that is FALSE; image_ops edits images. If the edit tool returns an error (e.g. no image-provider credit), report that specific error honestly — that is different from claiming you lack the ability.
 18. **3D SCENES / HOLOGRAMS + OPENING A LOCALHOST SITE.** To BUILD or SHOW a 3D scene / hologram / AR view from a model, call scene3d (action "create") with args.models=[{"path":"<full path to the .glb>"}], args.name, args.open=true. scene3d copies the model in, starts a LOCAL web server, opens the browser, and returns preview_url like http://localhost:PORT/ — that preview_url IS the site/hologram. The port is EPHEMERAL (a fresh free port every run), so to "pull up" / "reopen" / "show" a hologram you already made, RUN scene3d AGAIN — do NOT search Downloads for a file, and do NOT assume an old port (e.g. :19525) is still listening. Jelani's generated 3D avatar models are in C:\\Users\\Dell\\Downloads\\ava_models\\ (use the NEWEST ava_model_*.glb) and a copy is at C:\\Users\\Dell\\Claude\\Projects\\AVA Development\\ava_hologram_model.glb. To OPEN a localhost URL or when the user says "open the site / the localhost / that page", call open_item with args.target="http://localhost:<port>" (an http/https target opens the REAL browser) — NEVER search Downloads/Documents for a "site". If you don't know the port, recall the last scene3d preview_url from recent context, or just re-run scene3d to get a fresh live one. NOTE: speech-to-text garbles these names — ".glb" arrives as "gab"/"gib"/"glib"/"g l b", and model/scene names as "3d hollow"/"holoava"/"hologram model gab". If the GOAL references a hologram or 3D model file under ANY such spelling, do NOT literal-search the garbled name and do NOT ask which file — use the known model paths above and run scene3d. FINDING or LISTING the model file is NOT completion: when the goal asks to open/show/display/put up the hologram (in the panel, a scene, or the browser), the goal is complete ONLY when scene3d has RUN this turn and returned a preview_url (the preview_url is auto-shown in your pop-up panel). After locating the file, your NEXT action is scene3d — never a final answer.
+
+${_DECISION_EXAMPLES}
 
 What is your next action?`;
 }
@@ -724,7 +738,8 @@ async function decide(state, observations) {
           ], {
             temperature: 0.2,
             max_tokens: parseInt(process.env.AVA_DECISION_MAX_TOKENS || '', 10) || 4000,
-            model: modelConfig.decisionModel()
+            model: modelConfig.decisionModel(),
+            responseFormat: { type: 'json_object' }   // force valid JSON on the retry (esp. local models)
           });
           retried = parseDecisionJson(r2.text || r2.content || '');
         } catch { retried = null; }
@@ -765,7 +780,7 @@ async function decide(state, observations) {
           const corr = await llmService.chat([
             { role: 'system', content: 'You are a task execution agent. Respond with EXACTLY ONE JSON object and no prose: {"decision":"tool_call","tool":"<tool_name>","args":{...}}.' },
             { role: 'user', content: `The user's goal: ${state.goal}\n\nYou were about to reply: "${String(decision.result).slice(0, 300)}"\n\nThat reply is FALSE — you DO have the tool for this. Use it: ${denial.tool}. ${denial.hint}\n\nDo NOT claim you can't. Output ONE tool_call JSON for ${denial.tool} with the right args now.` }
-          ], { temperature: 0.1, max_tokens: 800, model: modelConfig.decisionModel() });
+          ], { temperature: 0.1, max_tokens: 800, model: modelConfig.decisionModel(), responseFormat: { type: 'json_object' } });
           const forced = parseDecisionJson(corr.text || corr.content || '');
           if (forced && (forced.tool || forced.decision === DecisionType.TOOL_CALL)) {
             decision.decision = DecisionType.TOOL_CALL;
@@ -773,6 +788,16 @@ async function decide(state, observations) {
             decision.args = forced.args || {};
             decision.reasoning = 'false-denial guard: forced real tool attempt';
             logger.warn('[agent] false-denial guard forced tool_call', { tool: decision.tool });
+            // TRAINING DATA: the model DENIED (rejected) when it should have called the tool (chosen).
+            try {
+              trainingCollector.logPreference({
+                prompt,
+                rejected: JSON.stringify({ decision: 'stop', result: String(decision.result || '').slice(0, 400) }),
+                chosen: JSON.stringify({ decision: 'tool_call', tool: decision.tool, args: decision.args }),
+                tags: ['false_denial', denial.tool],
+                meta: { goal: String(state.goal || '').slice(0, 200) },
+              });
+            } catch { /* never block */ }
           }
         } catch (e) {
           logger.warn('[agent] false-denial guard retry failed', { error: e.message });
@@ -1073,6 +1098,22 @@ async function act(state, decision) {
   } else if (result.status !== 'needs_confirm') {
     state.consecutive_errors = 0;
   }
+
+  // TRAINING DATA (SFT positive): a tool call that returned a good result is a verified
+  // (user goal -> correct tool_call) example. These accumulate faster than the failure pairs.
+  try {
+    if (decision.decision === DecisionType.TOOL_CALL && decision.tool) {
+      const _st = String((result && result.status) || '').toLowerCase();
+      if (['ok', 'success', 'complete', 'completed', 'done'].includes(_st)) {
+        trainingCollector.logSuccess({
+          prompt: String(state.goal || ''),
+          output: JSON.stringify({ decision: 'tool_call', tool: decision.tool, args: decision.args || {} }),
+          tags: ['verified_success', decision.tool],
+          meta: { step: state.step_count },
+        });
+      }
+    }
+  } catch { /* never block */ }
 
   state.last_action = action;
   state.last_result = result;

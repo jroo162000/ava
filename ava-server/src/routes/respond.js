@@ -21,6 +21,7 @@ import contextCompression from '../services/contextCompression.js';
 import memoryReviewer from '../services/memoryReviewer.js';
 import selfImprove from '../services/selfImprove.js';
 import { shapeSpokenReply, normalizeSpokenReplyBudget, normalizeMoltbookMentions, isStepStatusMessage } from '../services/speech.js';
+import trainingCollector from '../services/trainingCollector.js';  // capture conv-path corrections as DPO data
 import { isSelfSnapshotRequest, isManualProposalRequest, createSelfSnapshot, handleSelfModVoice } from '../services/selfModVoice.js';
 import { emitVoiceEvent } from '../services/voiceBus.js';  // Tier 2 #15: assistant.delta to the UI
 import { markDuplicateTurn, buildSelfStatus } from './api.js';
@@ -1133,6 +1134,21 @@ MACHINE-STATE RULE (absolute): if the question is about the CURRENT state of thi
         // Escalate: do NOT return here — fall through to the agent loop below so she
         // actually performs the action / looks up the data.
         logger.info('[respond] conversational path escalating to tools', { promised: _promiseEscalate, toolLeak: _toolLeak, text: userText.slice(0, 60) });
+        // TRAINING DATA: on the talk-only path the model produced a bad reply (leaked a raw tool
+        // call, made an empty promise, or falsely denied) when the RIGHT output was the NEED_TOOLS
+        // token. Log the pair so a local model can be trained to escalate cleanly.
+        if (!/\bNEED_TOOLS\b/i.test(finalText)) {
+          try {
+            const _tag = _toolLeak ? 'tool_leak' : (_capabilityDenial ? 'false_denial_conv' : 'empty_promise');
+            trainingCollector.logPreference({
+              prompt: `[conversational path] user: ${userText}`,
+              rejected: String(finalText).slice(0, 800),
+              chosen: 'NEED_TOOLS',
+              tags: [_tag],
+              meta: { path: 'conversational' },
+            });
+          } catch { /* never block */ }
+        }
       } else {
         if (isStepStatusMessage(finalText)) {
           console.log(`[respond] Blocked step status (conv): ${finalText.slice(0, 60)}...`);
