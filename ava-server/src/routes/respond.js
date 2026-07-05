@@ -364,6 +364,29 @@ async function _chatMaybeStream(req, messages, options = {}) {
   return llmService.chat(messages, options);
 }
 
+// TOOL-COMMAND LEAK GUARD (Jelani 2026-07-05): the model sometimes writes a raw tool call as
+// PROSE — "<model3d_ops><action>generate</action>…</model3d_ops>", "<scene3d>…</scene3d>",
+// {"decision":"tool_call",…} — instead of it being executed. That must NEVER reach the user.
+// Shared so both the conversational path (which escalates on it) and the agent final answer
+// (which scrubs it) use the same detection.
+const _TOOL_NAMES = 'model3d_ops|scene3d|image_ops|window_ops|computer_use|computer_use_control|open_item|browser_automation|app_control|vision_ops|screen_ops|mouse_ops|key_ops|voice_ops|calendar_ops|self_mod|sys_ops|net_ops|iot_ops|ps_exec|profile_ops|analysis_ops|web_search|web_scrape|web_builder|comm_ops|fs_ops|fs_read|fs_find|fs_write|memory_search|memory_system|audio_ops|camera_ops|remote_ops|security_ops|proactive_ops|learning_db';
+function _looksLikeToolCall(s) {
+  const x = String(s || '');
+  return new RegExp('<\\/?(?:' + _TOOL_NAMES + ')\\b', 'i').test(x)
+    || /<action>\s*[\w-]+\s*<\/action>/i.test(x)
+    || /<(?:tool|tool_call|function_call|args|arguments|invoke)\b/i.test(x)
+    || /"decision"\s*:\s*"tool_call"/i.test(x)
+    || /\{\s*"tool"\s*:\s*"/i.test(x);
+}
+function _stripToolSyntax(s) {
+  let x = String(s || '');
+  x = x.replace(new RegExp('<(' + _TOOL_NAMES + ')\\b[\\s\\S]*?(?:<\\/\\1>|$)', 'gi'), '');
+  // Remove {"decision":"tool_call"…} / {"tool":…} objects, tolerating one level of nested {} (args).
+  x = x.replace(/\{(?:[^{}]|\{[^{}]*\})*?"(?:decision|tool)"\s*:(?:[^{}]|\{[^{}]*\})*\}/gi, '');
+  x = x.replace(/<\/?(?:action|prompt|art_style|models?|url|position|environment|name|x|y|z|scale|rotation[Yy]|args|arguments|tool|tool_call|invoke|parameter)\b[^>]*>/gi, '');
+  return x.replace(/[ \t]{2,}/g, ' ').replace(/\n{3,}/g, '\n\n').trim();
+}
+
 // Realtime compatibility: route text/messages to Agent Loop with memory/tools
 router.post('/respond', respondHandler);
 
@@ -1094,11 +1117,15 @@ MACHINE-STATE RULE (absolute): if the question is about the CURRENT state of thi
       // guard reports the REAL, verified limit. (Past-tense "I couldn't find X" is a tool RESULT, not
       // this pre-tool denial, and is not matched.)
       const _capabilityDenial = /\b(i can'?t|i cannot|i'?m (not able|unable)|i do(n'?t| not) have (a|the|any|any such )?\s*(tool|way|ability|means)|i don'?t have the ability|not able to (open|show|display|view|generate|create|make|build|run|find|search|pull|load|do)|no tool (that|to)|there'?s no tool|don'?t have a way to)\b/i.test(finalText);
-      const _shouldEscalate = /\bNEED_TOOLS\b/i.test(finalText) || _promiseEscalate || (_capabilityDenial && _userWantsAction);
+      // TOOL-COMMAND LEAK (Jelani 2026-07-05): instead of emitting NEED_TOOLS, the model sometimes
+      // "does" an action by writing the raw tool call as PROSE. Treat it like NEED_TOOLS (escalate
+      // so the agent actually runs it) — helpers are module-level (_looksLikeToolCall/_stripToolSyntax).
+      const _toolLeak = _looksLikeToolCall(finalText);
+      const _shouldEscalate = /\bNEED_TOOLS\b/i.test(finalText) || _promiseEscalate || _toolLeak || (_capabilityDenial && _userWantsAction);
       if (_shouldEscalate) {
         // Escalate: do NOT return here — fall through to the agent loop below so she
         // actually performs the action / looks up the data.
-        logger.info('[respond] conversational path escalating to tools', { promised: _promiseEscalate, text: userText.slice(0, 60) });
+        logger.info('[respond] conversational path escalating to tools', { promised: _promiseEscalate, toolLeak: _toolLeak, text: userText.slice(0, 60) });
       } else {
         if (isStepStatusMessage(finalText)) {
           console.log(`[respond] Blocked step status (conv): ${finalText.slice(0, 60)}...`);
@@ -1106,7 +1133,8 @@ MACHINE-STATE RULE (absolute): if the question is about the CURRENT state of thi
         }
         // Split: DISPLAY keeps light Markdown for the UI mirror; SPOKEN is stripped + number-
         // normalized for TTS. The UI shows the formatted version; the runner speaks the plain one.
-        const _convDisplay = String(finalText || '').trim();
+        // Safety net: scrub any stray tool-call syntax so raw commands never reach the user.
+        const _convDisplay = _stripToolSyntax(String(finalText || '').trim());
         const _convSpoken = shapeSpokenReply(_convDisplay, req.body || {});
 
         try { conversationLogger.logAssistantMessage(_convDisplay, { sessionId, responseType: 'conversational' }); } catch {}
@@ -1157,7 +1185,7 @@ MACHINE-STATE RULE (absolute): if the question is about the CURRENT state of thi
     try { actionHistory.recordTurn(sessionId, state); } catch (e) { /* optional */ }
     // Compress older turns into the rolling lineage summary once the session has grown (best-effort).
     try { contextCompression.maybeCompress(sessionId).catch(() => {}); } catch (e) { /* optional */ }
-    let finalText = state.final_result || '';
+    let finalText = _stripToolSyntax(state.final_result || '');  // never let raw tool syntax leak
 
     // VOICE + HONESTY: ground the spoken reply in what the tools ACTUALLY returned, so
     // she never claims success on a failure (and answers naturally instead of "Done").
