@@ -1,0 +1,12 @@
+# Install on the Vast.ai GPU box (a PyTorch 2.3+ / CUDA 12.1 image). See README.md.
+# unsloth gives fast, low-VRAM QLoRA and one-line GGUF export.
+unsloth[cu121] @ git+https://github.com/unslothai/unsloth.git
+trl>=0.9.6
+peft>=0.11.1
+transformers>=4.43.0
+datasets>=2.20.0
+accelerate>=0.32.0
+bitsandbytes>=0.43.1
+# For the (optional) distillation backfill that generates the "chosen" side with a strong model:
+openai>=1.30.0
+anthropic>=0.30.0
