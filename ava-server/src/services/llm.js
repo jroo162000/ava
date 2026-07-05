@@ -178,7 +178,7 @@ function buildSystemPrompt() {
     'screen_ops': 'take screenshots, locate elements on screen, get pixel colors',
 
     // Computer Control
-    'window_ops': 'list, focus, minimize, maximize, move, resize windows',
+    'window_ops': 'list, focus, minimize, maximize, move, resize windows; focus_tab (tab=<name>, window=<browser e.g. "edge">) SWITCHES to a specific browser tab by title — self-verifying (found:true only when the active tab really is that tab). Use focus_tab to select/switch/go-to a browser tab instead of taking a screenshot',
     'mouse_ops': 'move mouse, click, double-click, right-click, drag, scroll',
     'key_ops': 'type text, press keys, keyboard shortcuts, hotkey combinations',
     'browser_automation': 'launch browser, navigate URLs, click elements, fill forms with Playwright',
