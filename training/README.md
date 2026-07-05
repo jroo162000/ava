@@ -4,7 +4,28 @@ Trains `qwen2.5-coder-7b-instruct` on the data AVA's guards collect, then gives 
 locally in LM Studio. Everything below runs on a **Vast.ai GPU box**; only the final GGUF comes home.
 
 Your setup: base = **qwen2.5-coder-7b-instruct**, run **locally in LM Studio**, GPU = **1× RTX 4090
-(24GB)**. Hostinger isn't needed for this (optional: use it only to stash dataset/model backups).
+(24GB)**, as a **standalone one-shot Vast job** (this is isolated from your router / inference brains —
+it never calls AVA and never touches Hostinger).
+
+---
+
+## Quick path — one-shot (recommended)
+1. Rent a fresh RTX 4090 on Vast (details in §0 below).
+2. From your PC, copy the kit + data up:
+   ```bash
+   scp -P <port> -r "ava/training" "ava-server/logs" <user>@<vast-ip>:/workspace/
+   ```
+3. On the box, run the whole pipeline with one command:
+   ```bash
+   cd /workspace/training && LOGS_DIR=/workspace/logs bash vast_oneshot.sh
+   ```
+   It installs deps → prepares data → SFT→DPO→GGUF → smoke-tests → writes `MANIFEST.json`.
+   (Add `OPENAI_API_KEY=... python distill_backfill.py --logs /workspace/logs` first if you want to
+   front-load the DPO data — see §3.)
+4. When it prints `DONE`, `scp` the `.gguf` home, then **destroy the instance**. Deploy in LM Studio (§7).
+   - Want it to stop itself when finished? run with `AUTO_STOP=1 VAST_API_KEY=... VAST_INSTANCE_ID=...`.
+
+The manual step-by-step below is the same thing unpacked, if you'd rather run each stage yourself.
 
 ---
 
