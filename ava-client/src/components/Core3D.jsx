@@ -1,6 +1,7 @@
 import React, { useRef, useMemo, useEffect, useState } from 'react';
 import { Canvas, useFrame, useThree } from '@react-three/fiber';
 import * as THREE from 'three';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Core3D — Tier 3 #17b: the holographic core, ported from ava-ui-3d's
@@ -14,6 +15,18 @@ import * as THREE from 'three';
 //     onDegrade() and the Stage falls back to the CSS orb for the session
 // Signals are REAL: `state` is the Stage's event-driven state machine and
 // `ampRef.current` is her live speech amplitude (tts.level rms, ~10Hz).
+//
+// 2026-07-03 — AVATAR CORE (Jelani): the persistent hologram is now HER —
+// ava_head.glb (the model Jelani provided) loaded as the Stage centerpiece,
+// with PROCEDURAL speech animation: the mouth/jaw region of the mesh deforms
+// with her real TTS amplitude (fast-attack / slow-release envelope + syllabic
+// flutter), state-driven head motion (idle sway, thinking tilt, speaking nods,
+// working tremor) and a state-colored fresnel rim. The GLB is a static mesh
+// (no rig / no blendshapes — eyes and lips are painted into the texture), so
+// this is amplitude lip-motion, NOT phoneme visemes, and there are no true
+// eyelid blinks. If the model fails to load or WebGL struggles, we fall back
+// to the original orb (CoreScene) and then the CSS orb, as before.
+// Live tuning: window.__avaMouth = { y, z, r, s } (geometry-local overrides).
 // ─────────────────────────────────────────────────────────────────────────────
 
 const STATE_COLORS = {
@@ -22,6 +35,8 @@ const STATE_COLORS = {
   speaking: ['#22d3ee', '#e0f2fe'],
   working: ['#fb923c', '#f59e0b'],
 };
+
+const AVATAR_URL = '/avatar/ava_head.glb';
 
 const CORE_VERT = `
   varying vec2 vUv;
@@ -80,8 +95,209 @@ const SHELL_VERT = `
   }
 `;
 
-function CoreScene({ stateRef, ampRef, onDegrade }) {
+// Shared demand-loop: ~30fps while active, ~8fps idle (perf budget).
+function useDemandLoop(stateRef, ampRef) {
   const { invalidate } = useThree();
+  useEffect(() => {
+    let alive = true;
+    let t;
+    const tick = () => {
+      if (!alive) return;
+      invalidate();
+      const s = stateRef.current;
+      const active = s === 'speaking' || s === 'working' || s === 'thinking' || (ampRef.current | 0) > 60;
+      t = setTimeout(tick, active ? 33 : 125);
+    };
+    tick();
+    return () => { alive = false; clearTimeout(t); };
+  }, [invalidate, stateRef, ampRef]);
+}
+
+// ── AVATAR SCENE — her head as the persistent hologram ──────────────────────
+function AvatarScene({ stateRef, ampRef, onDegrade, onFail }) {
+  const headGroup = useRef();     // state-driven head motion (rotation)
+  const bobRef = useRef();        // gentle whole-core bob
+  const ring1 = useRef();
+  const ring2 = useRef();
+  const pulseMesh = useRef();
+  const pulseMat = useRef();
+  const [model, setModel] = useState(null);
+  const jaw = useRef(0);          // smoothed speech envelope (0..1)
+  const intensity = useRef(0);
+  const slowFrames = useRef(0);
+  const colA = useMemo(() => new THREE.Color(), []);
+  const colB = useMemo(() => new THREE.Color(), []);
+  // uniforms shared with the injected jaw shader + rim shell
+  const uJaw = useMemo(() => ({ value: 0 }), []);
+  const uMouth = useMemo(() => ({ value: new THREE.Vector4(0, 0, 1, 0) }), []); // x: mouthY, y: mouthZ, z: radius, w: strength
+  const shellMaterial = useMemo(() => new THREE.ShaderMaterial({
+    uniforms: { color: { value: new THREE.Color('#0ea5e9') } },
+    vertexShader: SHELL_VERT, fragmentShader: SHELL_FRAG,
+    transparent: true, blending: THREE.AdditiveBlending, side: THREE.BackSide, depthWrite: false,
+  }), []);
+
+  useDemandLoop(stateRef, ampRef);
+
+  // Load + prepare the GLB once: center, scale, face the camera, inject the
+  // jaw deformation into the model's own material (texture stays intact).
+  useEffect(() => {
+    let dead = false;
+    const loader = new GLTFLoader();
+    loader.load(AVATAR_URL, (gltf) => {
+      if (dead) return;
+      try {
+        let mesh = null;
+        gltf.scene.traverse((o) => { if (!mesh && o.isMesh) mesh = o; });
+        if (!mesh) { onFail && onFail('no mesh in GLB'); return; }
+        mesh.geometry.computeBoundingBox();
+        const bb = mesh.geometry.boundingBox;
+        const size = new THREE.Vector3(); bb.getSize(size);
+        const center = new THREE.Vector3(); bb.getCenter(center);
+        const h = size.y || 1;
+        // Mouth region estimate (geometry-local): lower-front of the face.
+        // Tunable live via window.__avaMouth = {y,z,r,s} without a rebuild.
+        const ov = (typeof window !== 'undefined' && window.__avaMouth) || {};
+        uMouth.value.set(
+          ov.y !== undefined ? ov.y : bb.min.y + h * 0.32,
+          ov.z !== undefined ? ov.z : center.z + (size.z || 1) * 0.38,
+          ov.r !== undefined ? ov.r : h * 0.16,
+          ov.s !== undefined ? ov.s : h * 0.045
+        );
+        const mat = mesh.material;
+        mat.onBeforeCompile = (shader) => {
+          shader.uniforms.uJaw = uJaw;
+          shader.uniforms.uMouth = uMouth;
+          shader.vertexShader = `
+            uniform float uJaw;
+            uniform vec4 uMouth;
+          ` + shader.vertexShader.replace('#include <begin_vertex>', `
+            #include <begin_vertex>
+            // amplitude lip-motion: pull the mouth/jaw region down + slightly in
+            // while she speaks (mask is an ellipsoid around the mouth estimate,
+            // wider than tall, front-of-face only).
+            {
+              vec3 mrel = (position - vec3(0.0, uMouth.x, uMouth.y)) * vec3(1.0, 1.55, 1.15);
+              float mMask = 1.0 - smoothstep(uMouth.z * 0.35, uMouth.z, length(mrel));
+              transformed.y -= uJaw * mMask * uMouth.w;
+              transformed.z -= uJaw * mMask * uMouth.w * 0.3;
+            }
+          `);
+        };
+        mat.needsUpdate = true;
+        // Normalize presentation: center at origin, height ≈ 3.1 world units.
+        const s = 3.1 / h;
+        gltf.scene.position.set(-center.x * s, -center.y * s, -center.z * s);
+        gltf.scene.scale.setScalar(s);
+        // Rim shell: a slightly inflated clone of the head with the fresnel shader.
+        const shell = new THREE.Mesh(mesh.geometry, shellMaterial);
+        shell.position.copy(gltf.scene.position);
+        shell.scale.copy(gltf.scene.scale).multiplyScalar(1.015);
+        const holder = new THREE.Group();
+        holder.add(gltf.scene);
+        holder.add(shell);
+        setModel(holder);
+      } catch (e) {
+        console.warn('[Core3D] avatar prepare failed:', e);
+        onFail && onFail(e.message);
+      }
+    }, undefined, (err) => {
+      if (!dead) { console.warn('[Core3D] avatar load failed:', err); onFail && onFail(String(err && err.message || err)); }
+    });
+    return () => { dead = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useFrame((st, delta) => {
+    // auto-degrade: sustained slow frames -> hand back to the CSS orb
+    if (delta > 0.05 && delta < 2) {
+      slowFrames.current += 1;
+      if (slowFrames.current > 90) { onDegrade && onDegrade('slow frames'); return; }
+    } else if (delta <= 0.05) {
+      slowFrames.current = Math.max(0, slowFrames.current - 2);
+    }
+
+    const time = st.clock.getElapsedTime();
+    const s = stateRef.current || 'idle';
+    const amp = Math.min(((ampRef.current | 0)) / 7000, 1);
+    const target = s === 'speaking' ? Math.max(0.5, amp) : s === 'working' ? 0.55 : s === 'thinking' ? 0.7 : 0;
+    intensity.current = THREE.MathUtils.lerp(intensity.current, target, Math.min(delta * 5, 1));
+
+    // Speech envelope: fast attack, slower release — reads as natural mouth energy.
+    const rate = amp > jaw.current ? 18 : 6;
+    jaw.current = THREE.MathUtils.lerp(jaw.current, amp, Math.min(delta * rate, 1));
+    // Syllabic flutter so sustained loudness still articulates open/close cycles.
+    const flutter = 0.55 + 0.45 * Math.abs(Math.sin(time * 11.7) * Math.sin(time * 6.3));
+    uJaw.value = jaw.current * flutter;
+
+    // State-driven head motion (the "expressions" this rig-less mesh can honestly do):
+    // idle = slow sway; thinking = tilt + look slightly up; speaking = micro-nods
+    // with her voice; working = quick small tremor.
+    if (headGroup.current) {
+      const g = headGroup.current;
+      let rx = Math.sin(time * 0.35) * 0.02;
+      let ry = Math.sin(time * 0.45) * 0.07;
+      let rz = 0;
+      if (s === 'thinking') { rz = 0.09; rx -= 0.05; ry = Math.sin(time * 0.8) * 0.1; }
+      if (s === 'speaking') { rx += uJaw.value * 0.045 * Math.sin(time * 9.0); ry += Math.sin(time * 1.2) * 0.03; }
+      if (s === 'working') { ry += Math.sin(time * 14.0) * 0.008; }
+      g.rotation.x = THREE.MathUtils.lerp(g.rotation.x, rx, Math.min(delta * 6, 1));
+      g.rotation.y = THREE.MathUtils.lerp(g.rotation.y, ry, Math.min(delta * 6, 1));
+      g.rotation.z = THREE.MathUtils.lerp(g.rotation.z, rz, Math.min(delta * 4, 1));
+    }
+    if (bobRef.current) bobRef.current.position.y = Math.sin(time * (1 + intensity.current)) * 0.06;
+
+    const [a, b] = STATE_COLORS[s] || STATE_COLORS.idle;
+    colA.set(a); colB.set(b);
+    shellMaterial.uniforms.color.value.copy(colA).lerp(colB, 0.5);
+    const speedMult = 1.0 + intensity.current * 3.0;
+    if (ring1.current) {
+      ring1.current.rotation.x += delta * 0.5 * speedMult;
+      ring1.current.rotation.y += delta * 0.3 * speedMult;
+      ring1.current.material.opacity = 0.4 + intensity.current * 0.5;
+    }
+    if (ring2.current) {
+      ring2.current.rotation.y -= delta * 0.4 * speedMult;
+      ring2.current.rotation.z += delta * 0.6 * speedMult;
+    }
+    // expanding pulse ring while she is actually speaking (real amplitude)
+    if (pulseMesh.current && pulseMat.current) {
+      if (amp > 0.02) {
+        const scale = 1 + ((time * 2) % 1.5);
+        pulseMesh.current.scale.setScalar(scale);
+        pulseMat.current.opacity = Math.max(0, 1 - (scale - 1) / 1.5) * 0.3 * Math.max(amp, 0.4);
+      } else {
+        pulseMat.current.opacity = 0;
+      }
+    }
+  });
+
+  return (
+    <group ref={bobRef}>
+      {/* lights: the GLB uses a textured standard material and needs them */}
+      <hemisphereLight args={['#cfe8ff', '#1e1b4b', 1.15]} />
+      <directionalLight position={[1.5, 3, 4]} intensity={2.0} />
+      <pointLight position={[0, -2.5, 2]} intensity={0.5} color="#22d3ee" />
+      <mesh ref={pulseMesh}>
+        <sphereGeometry args={[1.7, 24, 24]} />
+        <meshBasicMaterial ref={pulseMat} color="#38bdf8" transparent opacity={0} side={THREE.BackSide} blending={THREE.AdditiveBlending} depthWrite={false} />
+      </mesh>
+      <group ref={headGroup}>
+        {model ? <primitive object={model} /> : null}
+      </group>
+      <mesh ref={ring1} rotation={[Math.PI / 2, 0, 0]} position={[0, -1.35, 0]}>
+        <torusGeometry args={[2.2, 0.02, 12, 64]} />
+        <meshBasicMaterial color="#0088ff" transparent opacity={0.5} blending={THREE.AdditiveBlending} depthWrite={false} />
+      </mesh>
+      <mesh ref={ring2} rotation={[Math.PI / 2.2, 0.2, 0]} position={[0, -1.5, 0]}>
+        <torusGeometry args={[2.6, 0.015, 12, 64]} />
+        <meshBasicMaterial color="#22d3ee" transparent opacity={0.35} blending={THREE.AdditiveBlending} depthWrite={false} />
+      </mesh>
+    </group>
+  );
+}
+
+// ── ORB SCENE — the original core, kept as the fallback ─────────────────────
+function CoreScene({ stateRef, ampRef, onDegrade }) {
   const groupRef = useRef();
   const ring1 = useRef();
   const ring2 = useRef();
@@ -104,20 +320,7 @@ function CoreScene({ stateRef, ampRef, onDegrade }) {
     transparent: true, blending: THREE.AdditiveBlending, side: THREE.FrontSide, depthWrite: false,
   }), []);
 
-  // Self-managed demand loop: ~30fps while active, ~8fps idle (perf budget).
-  useEffect(() => {
-    let alive = true;
-    let t;
-    const tick = () => {
-      if (!alive) return;
-      invalidate();
-      const s = stateRef.current;
-      const active = s === 'speaking' || s === 'working' || s === 'thinking' || (ampRef.current | 0) > 60;
-      t = setTimeout(tick, active ? 33 : 125);
-    };
-    tick();
-    return () => { alive = false; clearTimeout(t); };
-  }, [invalidate, stateRef, ampRef]);
+  useDemandLoop(stateRef, ampRef);
 
   useFrame((st, delta) => {
     // auto-degrade: sustained slow frames -> hand back to the CSS orb
@@ -197,6 +400,10 @@ function CoreScene({ stateRef, ampRef, onDegrade }) {
 
 export default function Core3D({ stateRef, ampRef, onDegrade }) {
   const [dead, setDead] = useState(false);
+  // Avatar-first: her GLB head is the persistent hologram. If the model can't
+  // load/prepare we fall back to the orb scene (same canvas), and the orb's
+  // degrade path still falls back to the CSS orb beyond that.
+  const [avatarOk, setAvatarOk] = useState(true);
   if (dead) return null;   // Stage renders the CSS orb when we bail
   return (
     <Canvas
@@ -210,7 +417,9 @@ export default function Core3D({ stateRef, ampRef, onDegrade }) {
       }}
       fallback={null}
     >
-      <CoreScene stateRef={stateRef} ampRef={ampRef} onDegrade={(why) => { setDead(true); onDegrade && onDegrade(why); }} />
+      {avatarOk
+        ? <AvatarScene stateRef={stateRef} ampRef={ampRef} onFail={() => setAvatarOk(false)} onDegrade={(why) => { setDead(true); onDegrade && onDegrade(why); }} />
+        : <CoreScene stateRef={stateRef} ampRef={ampRef} onDegrade={(why) => { setDead(true); onDegrade && onDegrade(why); }} />}
     </Canvas>
   );
 }
