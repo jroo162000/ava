@@ -154,6 +154,49 @@ class IdempotencyCache {
 // Global idempotency cache instance
 const idempotencyCache = new IdempotencyCache(60000); // 60 second TTL
 
+// cmp-use (Python) tools arrive with NO parameter schema, so the model can't see their
+// action vocabulary and guesses (e.g. window_ops -> "list"/"focus" instead of "focus_tab").
+// These overrides give the highest-value tools an explicit action enum so native function
+// calling actually discovers focus_tab / click_text / click_target.
+const PYTHON_TOOL_SCHEMAS = {
+  window_ops: {
+    type: 'object',
+    properties: {
+      action: {
+        type: 'string',
+        enum: ['focus_tab', 'switch_tab', 'select_tab', 'focus', 'active', 'list', 'close',
+               'minimize', 'maximize', 'restore', 'move', 'resize', 'get_foreground_info'],
+        description: 'focus_tab = switch to a browser TAB by its title (self-verifying; USE THIS to '
+          + 'select/switch/go-to a tab, e.g. "the ava hologram tab"). focus = bring a WINDOW to the '
+          + 'front by title. list = list open windows. active = title of the front window.'
+      },
+      tab: { type: 'string', description: 'For focus_tab: the tab name/substring to switch to, e.g. "ava hologram"' },
+      window: { type: 'string', description: 'For focus_tab: which browser to search, e.g. "edge" or "chrome"' },
+      title: { type: 'string', description: 'For focus/close/minimize/etc: the window or app title (partial, case-insensitive)' }
+    },
+    required: ['action']
+  },
+  computer_use: {
+    type: 'object',
+    properties: {
+      action: {
+        type: 'string',
+        enum: ['click_text', 'click_target', 'type', 'press_key', 'hotkey', 'focus_window',
+               'wait_text', 'dialog_solve', 'run_sequence', 'open_start'],
+        description: 'click_text = click on-screen TEXT via OCR (reliable; use for a visible label/button/link). '
+          + 'click_target = click an element by DESCRIPTION via vision (fallback when the target is NOT plain '
+          + 'text, e.g. an icon). type/press_key/hotkey = keyboard. focus_window = bring a window to front.'
+      },
+      text: { type: 'string', description: 'For click_text/type: the visible text to find+click, or text to type' },
+      target: { type: 'string', description: 'For click_target: a plain-language description of the element to click' },
+      key: { type: 'string', description: 'For press_key: a single key' },
+      keys: { type: 'array', items: { type: 'string' }, description: 'For hotkey: e.g. ["ctrl","s"]' },
+      title: { type: 'string', description: 'For focus_window: the window title' }
+    },
+    required: ['action']
+  }
+};
+
 class ToolsService {
   constructor() {
     this.cache = null;
@@ -403,6 +446,11 @@ class ToolsService {
     for (const tool of pythonTools) {
       if (tool.name === 'camera_ops') {
         tool.description = `${tool.description || 'Camera controls.'} Use for clear camera intents such as "turn on the camera", "open camera", "start webcam", "turn off the camera", or "stop webcam"; do not use ps_exec for these.`;
+      }
+      // Give high-value cmp-use tools an explicit action enum so the model can DISCOVER
+      // actions like focus_tab / click_text / click_target (they ship with no schema).
+      if (PYTHON_TOOL_SCHEMAS[tool.name] && (!tool.schema || !tool.schema.properties || !tool.schema.properties.action)) {
+        tool.schema = PYTHON_TOOL_SCHEMAS[tool.name];
       }
       toolMap.set(tool.name, tool);
     }
