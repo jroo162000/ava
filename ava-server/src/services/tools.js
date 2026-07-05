@@ -194,6 +194,35 @@ const PYTHON_TOOL_SCHEMAS = {
       title: { type: 'string', description: 'For focus_window: the window title' }
     },
     required: ['action']
+  },
+  image_ops: {
+    type: 'object',
+    properties: {
+      action: {
+        type: 'string',
+        enum: ['generate', 'edit'],
+        description: 'generate = a NEW image from args.prompt. edit = MODIFY an EXISTING image (args.image = path to the photo/screenshot, args.prompt = the change, e.g. "give her longer hair"). You CAN edit images — never say you cannot.'
+      },
+      prompt: { type: 'string', description: 'What to generate, or the change to make when editing' },
+      image: { type: 'string', description: 'For edit: full path to the existing image file to modify' },
+      provider: { type: 'string' },
+      size: { type: 'string' }
+    },
+    required: ['action']
+  },
+  model3d_ops: {
+    type: 'object',
+    properties: {
+      action: {
+        type: 'string',
+        enum: ['generate', 'from_image'],
+        description: 'generate = a 3D model (.glb) from args.prompt (text->3D). from_image = a 3D model from args.image (a photo/render path or URL, image->3D).'
+      },
+      prompt: { type: 'string', description: 'For generate: describe the 3D model' },
+      image: { type: 'string', description: 'For from_image: path or URL to the source image' },
+      art_style: { type: 'string', enum: ['realistic', 'sculpture', 'cartoon'] }
+    },
+    required: ['action']
   }
 };
 
@@ -593,7 +622,19 @@ class ToolsService {
             ];
           }
           roots = roots.map((r) => path.resolve(r)).filter((r) => r.startsWith(path.resolve(home)));
-          const needle = patternRaw.toLowerCase().replace(/\*/g, '');
+          // Fuzzy match: normalize separators/punctuation and match by TOKENS so a spoken/typed
+          // name like "3d holo ava" (or "the 3d holo ava image") still finds "3d holo ava.jpg".
+          const _norm = (s) => String(s).toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+          const _STOP = new Set(['image', 'images', 'file', 'files', 'photo', 'picture', 'pic', 'the',
+            'a', 'an', 'in', 'my', 'folder', 'downloads', 'named', 'called', 'document', 'doc', 'of', 'to']);
+          const needleNorm = _norm(patternRaw.replace(/\*/g, ' '));
+          const tokens = needleNorm.split(' ').filter((t) => t && !_STOP.has(t));
+          const _matchName = (name) => {
+            const nn = _norm(name);
+            if (needleNorm && nn.includes(needleNorm)) return true;           // contiguous match
+            if (tokens.length && tokens.every((t) => nn.includes(t))) return true; // all key tokens present
+            return false;
+          };
           const matches = [];
           const walk = (dir, depth) => {
             if (depth > 4 || matches.length >= 100) return;
@@ -602,7 +643,7 @@ class ToolsService {
             for (const e of entries) {
               const fp = path.join(dir, e.name);
               if (e.isDirectory()) walk(fp, depth + 1);
-              else if (e.name.toLowerCase().includes(needle)) matches.push(fp);
+              else if (_matchName(e.name)) matches.push(fp);
               if (matches.length >= 100) return;
             }
           };
