@@ -95,8 +95,12 @@ const SHELL_VERT = `
   }
 `;
 
-// Shared demand-loop: ~30fps while active, ~8fps idle (perf budget).
-function useDemandLoop(stateRef, ampRef) {
+// Shared demand-loop: ~30fps while active, ~8fps idle (perf budget). paceRef mirrors the
+// interval we ASKED for, so the slow-frame detector can tell "idle by design" from "GPU
+// struggling" — the old detector treated every intentional 125ms idle frame as slow and
+// self-degraded the 3D core to the CSS orb after ~11s of idle, every session. That was the
+// hidden reason the hologram "didn't stay on the UI".
+function useDemandLoop(stateRef, ampRef, paceRef) {
   const { invalidate } = useThree();
   useEffect(() => {
     let alive = true;
@@ -106,11 +110,12 @@ function useDemandLoop(stateRef, ampRef) {
       invalidate();
       const s = stateRef.current;
       const active = s === 'speaking' || s === 'working' || s === 'thinking' || (ampRef.current | 0) > 60;
+      if (paceRef) paceRef.current = active ? 33 : 125;
       t = setTimeout(tick, active ? 33 : 125);
     };
     tick();
     return () => { alive = false; clearTimeout(t); };
-  }, [invalidate, stateRef, ampRef]);
+  }, [invalidate, stateRef, ampRef, paceRef]);
 }
 
 // ── AVATAR SCENE — her head as the persistent hologram ──────────────────────
@@ -125,6 +130,7 @@ function AvatarScene({ stateRef, ampRef, onDegrade, onFail }) {
   const jaw = useRef(0);          // smoothed speech envelope (0..1)
   const intensity = useRef(0);
   const slowFrames = useRef(0);
+  const paceRef = useRef(125);    // what the demand loop asked for (33 active / 125 idle)
   const colA = useMemo(() => new THREE.Color(), []);
   const colB = useMemo(() => new THREE.Color(), []);
   // uniforms shared with the injected jaw shader + rim shell
@@ -136,7 +142,7 @@ function AvatarScene({ stateRef, ampRef, onDegrade, onFail }) {
     transparent: true, blending: THREE.AdditiveBlending, side: THREE.BackSide, depthWrite: false,
   }), []);
 
-  useDemandLoop(stateRef, ampRef);
+  useDemandLoop(stateRef, ampRef, paceRef);
 
   // Load + prepare the GLB once: center, scale, face the camera, inject the
   // jaw deformation into the model's own material (texture stays intact).
@@ -154,14 +160,15 @@ function AvatarScene({ stateRef, ampRef, onDegrade, onFail }) {
         const size = new THREE.Vector3(); bb.getSize(size);
         const center = new THREE.Vector3(); bb.getCenter(center);
         const h = size.y || 1;
-        // Mouth region estimate (geometry-local): lower-front of the face.
-        // Tunable live via window.__avaMouth = {y,z,r,s} without a rebuild.
+        // Mouth region estimate (geometry-local). The model is a BUST (head + shoulders/
+        // sweater), so the mouth sits ~62% up the full bounding box, not in the lower third
+        // (0.32h landed on her chest). Tunable live via window.__avaMouth = {y,z,r,s}.
         const ov = (typeof window !== 'undefined' && window.__avaMouth) || {};
         uMouth.value.set(
-          ov.y !== undefined ? ov.y : bb.min.y + h * 0.32,
+          ov.y !== undefined ? ov.y : bb.min.y + h * 0.62,
           ov.z !== undefined ? ov.z : center.z + (size.z || 1) * 0.38,
-          ov.r !== undefined ? ov.r : h * 0.16,
-          ov.s !== undefined ? ov.s : h * 0.045
+          ov.r !== undefined ? ov.r : h * 0.105,
+          ov.s !== undefined ? ov.s : h * 0.04
         );
         const mat = mesh.material;
         mat.onBeforeCompile = (shader) => {
@@ -195,24 +202,32 @@ function AvatarScene({ stateRef, ampRef, onDegrade, onFail }) {
         const holder = new THREE.Group();
         holder.add(gltf.scene);
         holder.add(shell);
+        try { window.__avaCore = { loaded: true, size: size.toArray(), center: center.toArray(), scale: s, matType: mat.type, mouth: uMouth.value.toArray() }; } catch { /* debug only */ }
         setModel(holder);
       } catch (e) {
         console.warn('[Core3D] avatar prepare failed:', e);
+        try { window.__avaCore = { error: 'prepare: ' + e.message }; } catch { /* debug only */ }
         onFail && onFail(e.message);
       }
     }, undefined, (err) => {
-      if (!dead) { console.warn('[Core3D] avatar load failed:', err); onFail && onFail(String(err && err.message || err)); }
+      if (!dead) {
+        console.warn('[Core3D] avatar load failed:', err);
+        try { window.__avaCore = { error: 'load: ' + String(err && err.message || err) }; } catch { /* debug only */ }
+        onFail && onFail(String(err && err.message || err));
+      }
     });
     return () => { dead = true; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   useFrame((st, delta) => {
-    // auto-degrade: sustained slow frames -> hand back to the CSS orb
-    if (delta > 0.05 && delta < 2) {
+    // auto-degrade: sustained slow frames WHILE ACTIVE -> hand back to the CSS orb.
+    // Idle frames arrive at an intentional 125ms cadence (paceRef 125) and must never
+    // count as slow — that false positive silently killed the 3D core after ~11s idle.
+    if (paceRef.current === 33 && delta > 0.05 && delta < 2) {
       slowFrames.current += 1;
       if (slowFrames.current > 90) { onDegrade && onDegrade('slow frames'); return; }
-    } else if (delta <= 0.05) {
+    } else if (delta <= 0.05 || paceRef.current !== 33) {
       slowFrames.current = Math.max(0, slowFrames.current - 2);
     }
 
@@ -228,6 +243,7 @@ function AvatarScene({ stateRef, ampRef, onDegrade, onFail }) {
     // Syllabic flutter so sustained loudness still articulates open/close cycles.
     const flutter = 0.55 + 0.45 * Math.abs(Math.sin(time * 11.7) * Math.sin(time * 6.3));
     uJaw.value = jaw.current * flutter;
+    try { window.__avaJaw = uJaw.value; window.__avaFrames = (window.__avaFrames || 0) + 1; window.__avaAmpSeen = ampRef.current | 0; } catch { /* debug only */ }
 
     // State-driven head motion (the "expressions" this rig-less mesh can honestly do):
     // idle = slow sway; thinking = tilt + look slightly up; speaking = micro-nods
@@ -306,6 +322,7 @@ function CoreScene({ stateRef, ampRef, onDegrade }) {
   const bobRef = useRef();
   const intensity = useRef(0);
   const slowFrames = useRef(0);
+  const paceRef = useRef(125);    // what the demand loop asked for (33 active / 125 idle)
   const colA = useMemo(() => new THREE.Color(), []);
   const colB = useMemo(() => new THREE.Color(), []);
 
@@ -320,14 +337,16 @@ function CoreScene({ stateRef, ampRef, onDegrade }) {
     transparent: true, blending: THREE.AdditiveBlending, side: THREE.FrontSide, depthWrite: false,
   }), []);
 
-  useDemandLoop(stateRef, ampRef);
+  useDemandLoop(stateRef, ampRef, paceRef);
 
   useFrame((st, delta) => {
-    // auto-degrade: sustained slow frames -> hand back to the CSS orb
-    if (delta > 0.05 && delta < 2) {
+    // auto-degrade: sustained slow frames WHILE ACTIVE -> hand back to the CSS orb.
+    // Idle frames arrive at an intentional 125ms cadence (paceRef 125) and must never
+    // count as slow — that false positive silently killed the 3D core after ~11s idle.
+    if (paceRef.current === 33 && delta > 0.05 && delta < 2) {
       slowFrames.current += 1;
       if (slowFrames.current > 90) { onDegrade && onDegrade('slow frames'); return; }
-    } else if (delta <= 0.05) {
+    } else if (delta <= 0.05 || paceRef.current !== 33) {
       slowFrames.current = Math.max(0, slowFrames.current - 2);
     }
 
