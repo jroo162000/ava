@@ -92,7 +92,14 @@ function looksLikeToolRequest(text = '') {
     /\b(front|forward|foreground)\b[\s\S]{0,30}\b(tab|window|browser|site|page)\b/.test(t) ||
     /\b(tab|window|browser|site|page)\b[\s\S]{0,30}\b(front|forward|foreground)\b/.test(t) ||
     // self-diagnosis / capability control
-    /\b(diagnose|diagnostic|self[- ]?diagnos|run (a |the )?diagnos|check (all )?(of )?(your )?(tools|capabilities|systems|functions)|test (all )?(your )?(tools|capabilities))\b/.test(t)
+    /\b(diagnose|diagnostic|self[- ]?diagnos|run (a |the )?diagnos|check (all )?(of )?(your )?(tools|capabilities|systems|functions)|test (all )?(your )?(tools|capabilities))\b/.test(t) ||
+    // Pronoun-reference ACTIONS (Jelani 2026-07-05): "open it", "redo it over again", "just open it
+    // for me", "do it again", "make a new one". They refer to a prior artifact and are clearly
+    // ACTIONS, but have no object noun, so they were slipping onto the talk-only conversational path
+    // — where the model then wrote the raw tool call as prose (leak). Route them to the AGENT, which
+    // actually runs tools via native function calling. This removes the leak at its source.
+    /\b(open|re-?do|run|generate|create|make|build|rebuild|render|edit|play|load|launch|start|do|try|save|download|switch|close|delete)\b\s+(it|that|this|one|them|those)\b/.test(t) ||
+    /\b(do (it|that|this) (again|over)|try (it|that)( again)?|one more time|over again|start over|redo it|do it again|(make|create|generate|build|render) (another|a new) one)\b/.test(t)
   );
 }
 
