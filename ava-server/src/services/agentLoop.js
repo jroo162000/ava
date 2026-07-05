@@ -586,6 +586,29 @@ function mapNativeDecision(state, resp) {
   return null;
 }
 
+// FALSE-CAPABILITY-DENIAL guard. The decision model sometimes tries to STOP by claiming it
+// "can't" / "doesn't have a tool" for something it DEMONSTRABLY has a tool for (3D generation,
+// image editing, tab switching, …). This detects that: denial phrasing + a topic that maps to a
+// tool that is actually present in this agent's toolset. Returns {tool, hint} or null. It is
+// general (topic→tool, never phrase→canned-reply) and only fires when the real tool exists.
+function _falseCapabilityDenial(text, state) {
+  const t = String(text || '').toLowerCase();
+  if (!t) return null;
+  const denies = /(i (can'?t|can ?not|am not able to|do ?n'?t have|'?m not able to)|no (tool|way|ability|function|means)|not able to|unable to|do ?n'?t have (a|the|any|the ability)|lack (a|the|any) (tool|way|ability))/.test(t);
+  if (!denies) return null;
+  const has = (name) => Array.isArray(state.toolset) && state.toolset.some((x) => x && x.name === name);
+  const rules = [
+    { re: /(3 ?d|three[ -]?d)[^.]*?(model|image|hologram|render|mesh|figure|avatar)|(model|render|mesh|hologram)[^.]*?(3 ?d|three[ -]?d)|generate[^.]*?3 ?d|3 ?d[^.]*?generat/,
+      tool: 'model3d_ops', hint: 'model3d_ops action=generate (args.prompt=<description>) makes a NEW 3D .glb model from text; action=from_image (args.image=<path>) makes one from a photo. Meshy credits are available.' },
+    { re: /(edit|change|modify|retouch|adjust|restyle|alter|fix)[^.]*?(image|photo|picture|pic|her|his|it)|(longer hair|shorter hair|brighter|remove the background|de-?age)/,
+      tool: 'image_ops', hint: 'image_ops action=edit (args.image=<full path>, args.prompt=<the change>) edits an existing image. Try it and report the real result.' },
+    { re: /(generate|create|make|draw|produce)[^.]*?(image|picture|art|drawing|illustration)/,
+      tool: 'image_ops', hint: 'image_ops action=generate (args.prompt=<description>) makes a new image.' },
+  ];
+  for (const r of rules) { if (r.re.test(t) && has(r.tool)) return { tool: r.tool, hint: r.hint }; }
+  return null;
+}
+
 /**
  * DECIDE: Call LLM to determine next action
  */
@@ -731,8 +754,34 @@ async function decide(state, observations) {
       }
     }
 
-    logger.info('[agent] Decision made', { 
-      type: decision.decision, 
+    // FALSE-DENIAL GUARD: if the model wants to STOP by denying a capability it actually HAS a
+    // tool for, push back ONCE and force a real tool call instead of letting the lie stand.
+    if (decision.decision === DecisionType.STOP && !state._denialRetried) {
+      const denial = _falseCapabilityDenial(decision.result, state);
+      if (denial) {
+        state._denialRetried = true;
+        logger.warn('[agent] false capability denial detected; forcing a real attempt', { tool: denial.tool });
+        try {
+          const corr = await llmService.chat([
+            { role: 'system', content: 'You are a task execution agent. Respond with EXACTLY ONE JSON object and no prose: {"decision":"tool_call","tool":"<tool_name>","args":{...}}.' },
+            { role: 'user', content: `The user's goal: ${state.goal}\n\nYou were about to reply: "${String(decision.result).slice(0, 300)}"\n\nThat reply is FALSE — you DO have the tool for this. Use it: ${denial.tool}. ${denial.hint}\n\nDo NOT claim you can't. Output ONE tool_call JSON for ${denial.tool} with the right args now.` }
+          ], { temperature: 0.1, max_tokens: 800, model: modelConfig.decisionModel() });
+          const forced = parseDecisionJson(corr.text || corr.content || '');
+          if (forced && (forced.tool || forced.decision === DecisionType.TOOL_CALL)) {
+            decision.decision = DecisionType.TOOL_CALL;
+            decision.tool = forced.tool || denial.tool;
+            decision.args = forced.args || {};
+            decision.reasoning = 'false-denial guard: forced real tool attempt';
+            logger.warn('[agent] false-denial guard forced tool_call', { tool: decision.tool });
+          }
+        } catch (e) {
+          logger.warn('[agent] false-denial guard retry failed', { error: e.message });
+        }
+      }
+    }
+
+    logger.info('[agent] Decision made', {
+      type: decision.decision,
       tool: decision.tool,
       reasoning: decision.reasoning?.slice(0, 100)
     });

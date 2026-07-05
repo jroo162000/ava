@@ -932,11 +932,14 @@ class ToolsService {
         // on their FIRST (cold) call — camera 'see' loads OpenCV + opens the device +
         // calls vision; browser launch starts Chrome; etc. 30s was too tight and produced
         // false "could not complete" timeouts.
+        // Slow GENERATIVE tools (cloud 3D jobs, image gen/edit, scene builds) need a much longer
+        // timeout than the default — Meshy 3D can take minutes, so 120s produced false timeouts.
+        const SLOW_TOOL_MS = { model3d_ops: 400000, image_ops: 240000, scene3d: 200000, web_builder: 200000 };
         response = await pythonWorker.sendCommand('execute_tool', {
           name,
           args,
           dry_run: dryRun
-        }, 120000);
+        }, SLOW_TOOL_MS[name] || 120000);
       }
 
       // Record successful execution + its result in the idempotency cache (not dry_run)
