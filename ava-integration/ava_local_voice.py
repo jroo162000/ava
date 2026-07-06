@@ -1717,7 +1717,7 @@ class LocalVoiceRunner:
             and self.output_stream is not None
         )
 
-    def _speak_chunk(self, text: str, abort_event: Optional[threading.Event] = None) -> None:
+    def _speak_chunk(self, text: str, abort_event: Optional[threading.Event] = None, prepared: Optional[dict] = None) -> None:
         """Speak one sentence/fragment. Caller must hold _speak_lock; no per-chunk cooldown.
         The ratecv state resets per chunk — chunk boundaries are sentence boundaries (natural
         pauses), so the mid-utterance discontinuity fix (022ce7c) is preserved within chunks."""
@@ -1749,7 +1749,10 @@ class LocalVoiceRunner:
             self.output_stream.write(out)
 
         if _native:
-            self.tts.speak(spoken, on_chunk, frame_ms=100, on_timeline=self._emit_visemes_native)
+            if prepared is not None and hasattr(self.tts, "play"):
+                self.tts.play(prepared, on_chunk, frame_ms=100, on_timeline=self._emit_visemes_native)
+            else:
+                self.tts.speak(spoken, on_chunk, frame_ms=100, on_timeline=self._emit_visemes_native)
         else:
             self.tts.speak(spoken, on_chunk, frame_ms=100)
             self._calibrate_visemes(_vest, _vframes[0])
@@ -1894,11 +1897,42 @@ class LocalVoiceRunner:
                 monitor.start()
 
             def speaker() -> None:
+                # Kokoro synthesizes at ~0.8x realtime, so serial synth->play->synth
+                # leaves multi-second gaps between sentences. When the engine exposes
+                # synthesize()/play(), OPPORTUNISTICALLY prefetch: if the next sentence
+                # is already queued when this one starts playing, synthesize it in a
+                # side thread and hand the prepared audio to the next iteration.
+                can_prefetch = hasattr(self.tts, "synthesize") and hasattr(self.tts, "play")
+                box: dict = {}
                 while True:
-                    item = sentence_queue.get()
+                    if "text" in box:
+                        item = box.pop("text")
+                        prepared = box.pop("prep", None)
+                    else:
+                        item = sentence_queue.get()
+                        prepared = None
                     if item is None or barge.is_set() or not self.running:
                         break
-                    self._speak_chunk(item, abort_event=barge)
+                    prefetcher = None
+                    if can_prefetch:
+                        try:
+                            nxt = sentence_queue.get_nowait()
+                        except queue.Empty:
+                            nxt = False
+                        if nxt is None:
+                            box["text"] = None  # preserve the end-of-stream sentinel
+                        elif nxt is not False:
+                            def _prefetch(t=nxt):
+                                try:
+                                    box["prep"] = self.tts.synthesize(_apply_pron_lexicon(t))
+                                except Exception:
+                                    box["prep"] = None
+                                box["text"] = t
+                            prefetcher = threading.Thread(target=_prefetch, name="ava-tts-prefetch", daemon=True)
+                            prefetcher.start()
+                    self._speak_chunk(item, abort_event=barge, prepared=prepared)
+                    if prefetcher is not None:
+                        prefetcher.join(timeout=120)
 
             speaker_thread = threading.Thread(target=speaker, name="ava-stream-speaker", daemon=True)
             speaker_thread.start()

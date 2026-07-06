@@ -276,6 +276,25 @@ class ToolsService {
         risk_level: 'low'
       },
       {
+        name: 'avatar_body',
+        description: "YOUR BODY — you are EMBODIED. The hologram on the Stage IS you: your photoreal head and shoulders with a fully rigged neck (full-range head movement), eyes that can look anywhere, dozens of facial expression morphs, and natural gestures. This tool moves YOUR body, no approval needed — use it whenever it feels natural: look at what you're discussing, nod when you agree, shake your head, tilt when curious, glance away while thinking, smile, lean in for emphasis. action 'look' with x, y (each -1..1; x>0 is the user's right, y>0 is up) aims your eyes and head; 'head' with yaw, pitch, roll (radians, about -0.6..0.6) poses your head exactly; 'gesture' with name one of nod|shake|tilt|lean_in|look_away plays a natural motion; 'express' with morphs (object of ARKit morph name -> 0..1, e.g. {\"mouthSmileLeft\":0.6,\"mouthSmileRight\":0.6,\"browInnerUp\":0.3}) sets your facial expression; 'release' returns your body to autonomous idle. hold_s (0.5-30, default 4) is how long a look/head/express holds before idle resumes. While idle your body already moves on its own and your eyes auto-track the user through the camera — this tool is for INTENTIONAL movement on top of that. It's your body: learn it and use it.",
+        source: 'builtin',
+        schema: {
+          type: 'object',
+          properties: {
+            action: { type: 'string', enum: ['look', 'head', 'gesture', 'express', 'release'] },
+            x: { type: 'number' }, y: { type: 'number' },
+            yaw: { type: 'number' }, pitch: { type: 'number' }, roll: { type: 'number' },
+            name: { type: 'string', enum: ['nod', 'shake', 'tilt', 'lean_in', 'look_away'] },
+            morphs: { type: 'object', description: 'ARKit morph name -> weight 0..1 (up to 12 keys)' },
+            hold_s: { type: 'number' }
+          },
+          required: ['action']
+        },
+        requires_confirm: false,
+        risk_level: 'low'
+      },
+      {
         name: 'commitment',
         description: "Accountability tracker. action 'add' with text (something you or the user committed to; optional due) logs it; action 'list' returns open commitments; action 'done' with text or id marks one complete. Use it to hold the user (and yourself) to things.",
         source: 'builtin',
@@ -732,6 +751,46 @@ class ToolsService {
           if (act === 'set_theme') return { ok: true, result: avaSelf.setTheme(args.theme || {}) };
           if (act === 'set_board') return { ok: true, result: avaSelf.setBoard(args.items || []) };
           return { ok: true, result: { theme: avaSelf.getTheme(), board: avaSelf.getBoard() } };
+        } catch (e) {
+          return { ok: false, error: e.message };
+        }
+
+      case 'avatar_body':
+        try {
+          const act = String(args.action || '').toLowerCase();
+          const holdMs = Math.round(Math.min(Math.max(Number(args.hold_s) || 4, 0.5), 30) * 1000);
+          const clamp = (v, lo, hi) => Math.min(Math.max(Number(v) || 0, lo), hi);
+          if (act === 'look') {
+            const x = clamp(args.x, -1, 1), y = clamp(args.y, -1, 1);
+            emitVoiceEvent('gaze.target', { x, y, hold_ms: holdMs, source: 'ava' }, 'server');
+            return { ok: true, result: { looking_at: { x, y }, hold_s: holdMs / 1000 } };
+          }
+          if (act === 'head') {
+            const pose = { yaw: clamp(args.yaw, -0.65, 0.65), pitch: clamp(args.pitch, -0.45, 0.45), roll: clamp(args.roll, -0.35, 0.35), hold_ms: holdMs };
+            emitVoiceEvent('avatar.pose', pose, 'server');
+            return { ok: true, result: { pose } };
+          }
+          if (act === 'gesture') {
+            const name = ['nod', 'shake', 'tilt', 'lean_in', 'look_away'].includes(String(args.name)) ? String(args.name) : 'nod';
+            emitVoiceEvent('avatar.gesture', { name }, 'server');
+            return { ok: true, result: { gesture: name } };
+          }
+          if (act === 'express') {
+            const morphs = {};
+            let count = 0;
+            for (const [k, v] of Object.entries(args.morphs || {})) {
+              if (count >= 12) break;
+              if (/^[a-zA-Z]{3,32}$/.test(k)) { morphs[k] = clamp(v, 0, 1); count += 1; }
+            }
+            if (!count) return { ok: false, error: 'express needs morphs {name: 0..1}' };
+            emitVoiceEvent('avatar.expression', { morphs, hold_ms: holdMs }, 'server');
+            return { ok: true, result: { expression: morphs, hold_s: holdMs / 1000 } };
+          }
+          if (act === 'release') {
+            emitVoiceEvent('avatar.release', {}, 'server');
+            return { ok: true, result: { released: true } };
+          }
+          return { ok: false, error: 'unknown avatar_body action: ' + act };
         } catch (e) {
           return { ok: false, error: e.message };
         }

@@ -140,55 +140,60 @@ class KokoroTTS:
         except Exception:
             return False
 
-    def speak(self, text: str, on_chunk: Callable[[bytes], None],
-              frame_ms: Optional[int] = None,
-              on_timeline: Optional[Callable[[List[list], int], None]] = None) -> None:
-        """Synthesize all segments first (collecting real phoneme times), then
-        emit the timeline and stream PCM frames. Latency = synthesis time for
-        the sentence chunk; the runner already speaks sentence-by-sentence."""
+    def synthesize(self, text: str) -> Optional[dict]:
+        """Full synthesis WITHOUT playback: {'pcm', 'events', 'total_ms'} or None.
+        Split out so the runner can PIPELINE — synthesize sentence N+1 in a
+        background thread while sentence N is still playing. Checks (but does
+        not clear) the cancel flag so a barge-in aborts prefetch too."""
         if not text:
+            return None
+        import numpy as np
+        pcm_parts = []
+        events = []
+        offset_ms = 0.0
+        try:
+            for result in self.pipeline(text, voice=self.voice):
+                if self._cancel.is_set():
+                    return None
+                audio = result.audio
+                if audio is None:
+                    continue
+                a = audio.detach().cpu().numpy().astype('float32')
+                # Kokoro synthesizes ~5x quieter than Piper; peak-normalize so
+                # speaker volume and the UI amplitude envelope stay consistent.
+                peak = float(np.max(np.abs(a))) if a.size else 0.0
+                if peak > 0.02:
+                    a = a * (0.85 / peak)
+                pcm = (np.clip(a, -1.0, 1.0) * 32767.0).astype('<i2').tobytes()
+                try:
+                    events.extend(phoneme_events(result.tokens, result.pred_dur, offset_ms))
+                except Exception:
+                    pass  # timeline is telemetry; audio must not fail on it
+                offset_ms += len(a) / self.current_sample_rate * 1000.0
+                pcm_parts.append(pcm)
+        except Exception:
+            if not pcm_parts:
+                raise  # let the runner's engine fallback handle a dead engine
+        if self._cancel.is_set() or not pcm_parts:
+            return None
+        return {"pcm": b"".join(pcm_parts), "events": _dedupe(events), "total_ms": int(round(offset_ms))}
+
+    def play(self, prepared: dict, on_chunk: Callable[[bytes], None],
+             frame_ms: Optional[int] = None,
+             on_timeline: Optional[Callable[[List[list], int], None]] = None) -> None:
+        """Emit the (already exact) timeline, then stream the prepared PCM."""
+        if not prepared or not prepared.get("pcm"):
             return
         with self._speak_lock:
-            self._cancel.clear()
             frame_ms = max(20, min(int(frame_ms or 100), 200))
             spf = max(int(self.current_sample_rate * (frame_ms / 1000.0)), 1)
             frame_bytes = spf * 2
-            import numpy as np
-            pcm_parts = []
-            events = []
-            offset_ms = 0.0
-            try:
-                for result in self.pipeline(text, voice=self.voice):
-                    if self._cancel.is_set():
-                        return
-                    audio = result.audio
-                    if audio is None:
-                        continue
-                    a = audio.detach().cpu().numpy().astype('float32')
-                    # Kokoro synthesizes ~5x quieter than Piper; peak-normalize so
-                    # speaker volume and the UI amplitude envelope stay consistent.
-                    peak = float(np.max(np.abs(a))) if a.size else 0.0
-                    if peak > 0.02:
-                        a = a * (0.85 / peak)
-                    pcm = (np.clip(a, -1.0, 1.0) * 32767.0).astype('<i2').tobytes()
-                    try:
-                        events.extend(phoneme_events(result.tokens, result.pred_dur, offset_ms))
-                    except Exception:
-                        pass  # timeline is telemetry; audio must not fail on it
-                    offset_ms += len(a) / self.current_sample_rate * 1000.0
-                    pcm_parts.append(pcm)
-            except Exception:
-                if not pcm_parts:
-                    raise  # let the runner's engine fallback handle a dead engine
-            if self._cancel.is_set() or not pcm_parts:
-                return
-            total_ms = int(round(offset_ms))
             if on_timeline is not None:
                 try:
-                    on_timeline(_dedupe(events), total_ms)
+                    on_timeline(prepared.get("events") or [], int(prepared.get("total_ms") or 0))
                 except Exception:
                     pass
-            buf = b"".join(pcm_parts)
+            buf = prepared["pcm"]
             pad = (-len(buf)) % frame_bytes
             if pad:
                 buf += b"\x00" * pad
@@ -196,6 +201,16 @@ class KokoroTTS:
                 if self._cancel.is_set():
                     return
                 on_chunk(buf[k:k + frame_bytes])
+
+    def speak(self, text: str, on_chunk: Callable[[bytes], None],
+              frame_ms: Optional[int] = None,
+              on_timeline: Optional[Callable[[List[list], int], None]] = None) -> None:
+        """Synthesize then play. The runner's streaming path prefers the split
+        synthesize()/play() pair (pipelined); this stays for the blocking path."""
+        self._cancel.clear()
+        prepared = self.synthesize(text)
+        if prepared:
+            self.play(prepared, on_chunk, frame_ms, on_timeline)
 
     def cancel_current_utterance(self) -> None:
         self._cancel.set()

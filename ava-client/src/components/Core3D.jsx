@@ -167,10 +167,12 @@ function useDemandLoop(stateRef, ampRef, paceRef) {
 }
 
 // ── AVATAR SCENE — her head as the persistent hologram ──────────────────────
-function AvatarScene({ stateRef, ampRef, visemeRef, gazeRef, onDegrade, onFail }) {
+function AvatarScene({ stateRef, ampRef, visemeRef, gazeRef, poseRef, gestureRef, exprRef, onDegrade, onFail }) {
   const headGroup = useRef();
   const bobRef = useRef();
   const headBone = useRef(null);         // neck joint in ava_head_rig2.glb
+  const torsoBone = useRef(null);        // root joint (lean_in gesture)
+  const exprUsed = useRef(new Set());    // morphs her expressions have touched (for clean decay)
   const ampPeak = useRef(6000);          // adaptive loudness reference (Piper is hot, Kokoro is natural)
   const pulseMesh = useRef();
   const pulseMat = useRef();
@@ -246,8 +248,14 @@ function AvatarScene({ stateRef, ampRef, visemeRef, gazeRef, onDegrade, onFail }
             mat.needsUpdate = true;
           }
           let hbFound = null;
-          gltf.scene.traverse((o) => { if (o.isBone && o.name === 'Head') hbFound = o; });
+          let tbFound = null;
+          gltf.scene.traverse((o) => {
+            if (!o.isBone) return;
+            if (o.name === 'Head') hbFound = o;
+            if (o.name === 'Torso') tbFound = o;
+          });
           headBone.current = hbFound;
+          torsoBone.current = tbFound;
           const s = 3.1 / h;
           gltf.scene.position.set(-center.x * s, -center.y * s, -center.z * s);
           gltf.scene.scale.setScalar(s);
@@ -385,7 +393,7 @@ function AvatarScene({ stateRef, ampRef, visemeRef, gazeRef, onDegrade, onFail }
       if (dict.eyeBlinkRight !== undefined) inf[dict.eyeBlinkRight] = blinkV;
       // Gaze -> eyes (eyes lead fully; the head bone follows at ~60% above).
       const gzE = gazeRef ? gazeRef.current : null;
-      const gzFresh = gzE && (performance.now() - gzE.at) < 3000;
+      const gzFresh = gzE && (performance.now() - gzE.at) < (gzE.hold || 3000);
       const gx = gzFresh ? Math.max(-1, Math.min(1, gzE.x)) : 0;
       const gy = gzFresh ? Math.max(-1, Math.min(1, gzE.y)) : 0;
       set('eyeLookOutRight', Math.max(gx, 0)); set('eyeLookInLeft', Math.max(gx, 0));
@@ -395,17 +403,61 @@ function AvatarScene({ stateRef, ampRef, visemeRef, gazeRef, onDegrade, onFail }
       // State expressions; untouched keys decay to 0.
       const expr = STATE_EXPR[s] || STATE_EXPR.idle;
       for (let i = 0; i < EXPR_KEYS.length; i++) set(EXPR_KEYS[i], expr[EXPR_KEYS[i]] || 0);
+      // Intentional expression from avatar_body — HER deliberate face, wins over
+      // state expressions. Mouth keys yield to live visemes while she speaks;
+      // everything her expressions ever touched decays cleanly back to 0.
+      const ex = exprRef ? exprRef.current : null;
+      const exOn = ex && performance.now() < ex.until;
+      if (exOn) {
+        for (const k3 in ex.morphs) {
+          if (dict[k3] !== undefined) exprUsed.current.add(k3);
+        }
+      }
+      if (exprUsed.current.size) {
+        let residue = false;
+        exprUsed.current.forEach((k3) => {
+          if (vshape && MOUTH_KEYS.indexOf(k3) >= 0) return;
+          const v = exOn && ex.morphs[k3] !== undefined ? Math.max(0, Math.min(1, +ex.morphs[k3] || 0)) : 0;
+          set(k3, v);
+          const i3 = dict[k3];
+          if (i3 !== undefined && inf[i3] > 0.01) residue = true;
+        });
+        if (!exOn && !residue) exprUsed.current.clear();
+      }
       try { window.__avaMorphs = { jaw: inf[dict.jawOpen], blink: blinkV, mode: s, viseme: vshape ? vt.name : null, chunk: vt ? vt.chunk : 0 }; } catch { /* debug */ }
     }
 
     // Head. Full range through the neck bone when the rig has one; gentle
     // whole-group sway as fallback. NO voice-coupled jitter in either path.
     const gz = gazeRef ? gazeRef.current : null;
-    const gzOn = gz && (performance.now() - gz.at) < 3000;
+    const gzOn = gz && (performance.now() - gz.at) < ((gz && gz.hold) || 3000);
+    const pv = poseRef ? poseRef.current : null;
+    const poseOn = pv && performance.now() < pv.until;
+    // One-shot gestures (nod/shake/tilt/lean_in/look_away) overlay whatever
+    // the base target is — hers via avatar_body, ~1.5s, eased in and out.
+    let gy = 0, gp = 0, gr = 0, lean = 0;
+    const gst = gestureRef ? gestureRef.current : null;
+    if (gst) {
+      const gt = (performance.now() - gst.t0) / 1000;
+      if (gt > 1.6) {
+        gestureRef.current = null;
+      } else {
+        const env = Math.sin(Math.min(gt / 1.5, 1) * Math.PI);
+        if (gst.name === 'nod') gp += Math.sin(gt * 2 * Math.PI / 0.7) * 0.12 * env;
+        else if (gst.name === 'shake') gy += Math.sin(gt * 2 * Math.PI / 0.8) * 0.16 * env;
+        else if (gst.name === 'tilt') gr += 0.18 * env;
+        else if (gst.name === 'look_away') { gy += 0.42 * env; gp += 0.06 * env; }
+        else if (gst.name === 'lean_in') { gp -= 0.08 * env; lean = 0.07 * env; }
+      }
+    }
+    const tb = torsoBone.current;
+    if (tb) tb.rotation.x = THREE.MathUtils.lerp(tb.rotation.x, lean, Math.min(delta * 4, 1));
     const hb = headBone.current;
     if (hb) {
       let ty, tp, tr = 0;
-      if (gzOn) {
+      if (poseOn) {
+        ty = pv.yaw; tp = pv.pitch; tr = pv.roll;
+      } else if (gzOn) {
         ty = Math.max(-1, Math.min(1, gz.x)) * 0.55;
         tp = Math.max(-1, Math.min(1, -gz.y)) * 0.35;
       } else {
@@ -414,11 +466,12 @@ function AvatarScene({ stateRef, ampRef, visemeRef, gazeRef, onDegrade, onFail }
         if (s === 'thinking') { tr = 0.12; tp -= 0.10; ty = Math.sin(time * 0.3) * 0.18; }
         if (s === 'speaking') { tp += Math.sin(time * 0.6) * 0.05; }
       }
-      const hk = Math.min(delta * (gzOn ? 7 : 2.2), 1);
+      ty += gy; tp += gp; tr += gr;
+      const hk = Math.min(delta * ((poseOn || gzOn || gst) ? 7 : 2.2), 1);
       hb.rotation.y = THREE.MathUtils.lerp(hb.rotation.y, ty, hk);
       hb.rotation.x = THREE.MathUtils.lerp(hb.rotation.x, tp, hk);
       hb.rotation.z = THREE.MathUtils.lerp(hb.rotation.z, tr, Math.min(delta * 2, 1));
-      try { window.__avaHead = { yaw: +hb.rotation.y.toFixed(3), pitch: +hb.rotation.x.toFixed(3), roll: +hb.rotation.z.toFixed(3), gaze: gzOn ? [gz.x, gz.y] : null }; } catch { /* debug */ }
+      try { window.__avaHead = { yaw: +hb.rotation.y.toFixed(3), pitch: +hb.rotation.x.toFixed(3), roll: +hb.rotation.z.toFixed(3), gaze: gzOn ? [gz.x, gz.y] : null, mode: poseOn ? 'pose' : (gzOn ? 'gaze' : 'idle'), gesture: gst ? gst.name : null }; } catch { /* debug */ }
     } else if (headGroup.current) {
       const g = headGroup.current;
       const rx = Math.sin(time * 0.35) * 0.02;
@@ -560,7 +613,7 @@ function CoreScene({ stateRef, ampRef, onDegrade }) {
   );
 }
 
-export default function Core3D({ stateRef, ampRef, visemeRef, gazeRef, onDegrade }) {
+export default function Core3D({ stateRef, ampRef, visemeRef, gazeRef, poseRef, gestureRef, exprRef, onDegrade }) {
   const [dead, setDead] = useState(false);
   const [avatarOk, setAvatarOk] = useState(true);
   if (dead) return null;   // Stage renders the CSS orb when we bail
@@ -577,7 +630,7 @@ export default function Core3D({ stateRef, ampRef, visemeRef, gazeRef, onDegrade
       fallback={null}
     >
       {avatarOk
-        ? <AvatarScene stateRef={stateRef} ampRef={ampRef} visemeRef={visemeRef} gazeRef={gazeRef} onFail={() => setAvatarOk(false)} onDegrade={(why) => { setDead(true); onDegrade && onDegrade(why); }} />
+        ? <AvatarScene stateRef={stateRef} ampRef={ampRef} visemeRef={visemeRef} gazeRef={gazeRef} poseRef={poseRef} gestureRef={gestureRef} exprRef={exprRef} onFail={() => setAvatarOk(false)} onDegrade={(why) => { setDead(true); onDegrade && onDegrade(why); }} />
         : <CoreScene stateRef={stateRef} ampRef={ampRef} onDegrade={(why) => { setDead(true); onDegrade && onDegrade(why); }} />}
     </Canvas>
   );

@@ -223,7 +223,10 @@ export default function Stage() {
   const ampDecay = useRef(null);
   const ampRef = useRef(0);                          // #17b: ref mirror for the 3D core (no re-render churn)
   const visemeRef = useRef(null);                    // phoneme-class viseme timeline for the core's mouth
-  const gazeRef = useRef(null);                      // {x,y,at} gaze target: eyes lead, head follows
+  const gazeRef = useRef(null);                      // {x,y,at,hold} gaze target: eyes lead, head follows
+  const poseRef = useRef(null);                      // explicit head pose from avatar_body (her own tool)
+  const gestureRef = useRef(null);                   // one-shot gesture {name,t0}
+  const exprRef = useRef(null);                      // intentional expression {morphs,until}
   useEffect(() => {
     // Manual/local gaze feed: window.__avaGaze(x, y) from any script or console.
     window.__avaGaze = (x, y) => { gazeRef.current = { x: +x || 0, y: +y || 0, at: performance.now() }; };
@@ -296,11 +299,35 @@ export default function Stage() {
           else if (d.state === 'working.end') core.onWorking(false);
           break;
         case 'gaze.target': {
-          // Eye/head tracking feed (Jelani's tracker posts x,y in [-1,1]).
+          // Eye/head tracking feed: the camera tracker (~8Hz) or her own
+          // avatar_body 'look'. hold_ms controls how long before idle resumes.
           const gd = ev.data || {};
           if (Number.isFinite(+gd.x) && Number.isFinite(+gd.y)) {
-            gazeRef.current = { x: +gd.x, y: +gd.y, at: performance.now() };
+            gazeRef.current = { x: +gd.x, y: +gd.y, at: performance.now(), hold: (gd.hold_ms | 0) || 3000 };
           }
+          break;
+        }
+        case 'avatar.pose': {
+          const pd = ev.data || {};
+          poseRef.current = {
+            yaw: +pd.yaw || 0, pitch: +pd.pitch || 0, roll: +pd.roll || 0,
+            until: performance.now() + ((pd.hold_ms | 0) || 4000),
+          };
+          break;
+        }
+        case 'avatar.gesture': {
+          gestureRef.current = { name: String((ev.data || {}).name || 'nod'), t0: performance.now() };
+          break;
+        }
+        case 'avatar.expression': {
+          const xd = ev.data || {};
+          if (xd.morphs && typeof xd.morphs === 'object') {
+            exprRef.current = { morphs: xd.morphs, until: performance.now() + ((xd.hold_ms | 0) || 5000) };
+          }
+          break;
+        }
+        case 'avatar.release': {
+          poseRef.current = null; gestureRef.current = null; exprRef.current = null; gazeRef.current = null;
           break;
         }
         case 'tts.visemes': {
@@ -571,7 +598,7 @@ export default function Stage() {
         {degraded3d ? cssCore : (
           <div className={`st-core3d ${attention ? 'attention' : ''}`}>
             <Suspense fallback={cssCore}>
-              <Core3D stateRef={stateRef} ampRef={ampRef} visemeRef={visemeRef} gazeRef={gazeRef} onDegrade={(why) => { console.warn('[stage] 3D core degraded:', why); setDegraded3d(true); }} />
+              <Core3D stateRef={stateRef} ampRef={ampRef} visemeRef={visemeRef} gazeRef={gazeRef} poseRef={poseRef} gestureRef={gestureRef} exprRef={exprRef} onDegrade={(why) => { console.warn('[stage] 3D core degraded:', why); setDegraded3d(true); }} />
             </Suspense>
           </div>
         )}
