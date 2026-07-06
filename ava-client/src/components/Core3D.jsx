@@ -9,9 +9,12 @@ import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 // ARKit blendshapes (morph targets) added by the local deformation-transfer
 // pipeline in tools/blendshape-rig. When morphs are present the mouth, blinks
 // and expressions are driven through them:
-//   - jawOpen + mouth-shape morphs from her real tts.level amplitude
-//     (fast-attack / slow-release envelope + syllabic flutter + slow LFO shape
-//     mixing — amplitude visemes, not phoneme visemes: no phoneme stream yet)
+//   - mouth from a phoneme-class VISEME TIMELINE (tts.visemes from the voice
+//     runner, grapheme->viseme estimate calibrated to real audio length; see
+//     ava-integration/voice/visemes.py) anchored to the first audible frame,
+//     with the tts.level amplitude envelope gating intensity — silence closes
+//     the mouth even when the estimate drifts. No timeline -> falls back to
+//     the old amplitude-LFO shape mix (AVA_PHONEME_VISEMES=0 reverts).
 //   - autonomous eye blinks (eyeBlinkLeft/Right)
 //   - state expressions via brow/eye/mouth morphs (thinking, working, speaking)
 // Fallback chain: rigged GLB → plain ava_head.glb with the old PROCEDURAL jaw
@@ -42,6 +45,39 @@ const EXPR_KEYS = [
   'browInnerUp', 'browDownLeft', 'browDownRight',
   'eyeLookUpLeft', 'eyeLookUpRight', 'eyeSquintLeft', 'eyeSquintRight',
   'mouthPressLeft', 'mouthPressRight', 'mouthSmileLeft', 'mouthSmileRight',
+];
+
+// ── Viseme alphabet + morph recipes ─────────────────────────────────────────
+// Index-paired with ava-integration/voice/visemes.py VISEMES — keep in sync.
+const VISEME_NAMES = ['sil', 'PP', 'FF', 'TH', 'DD', 'KK', 'CH', 'SS', 'RR', 'AA', 'E', 'IH', 'OH', 'OU'];
+const VISEME_SHAPES = [
+  {},                                                                        // sil
+  { mouthClose: 0.85, mouthPressLeft: 0.45, mouthPressRight: 0.45 },         // PP  p/b/m
+  { mouthRollLower: 0.6, jawOpen: 0.08 },                                    // FF  f/v
+  { jawOpen: 0.15, mouthFunnel: 0.2 },                                       // TH
+  { jawOpen: 0.14, mouthShrugUpper: 0.15 },                                  // DD  d/t/n/l
+  { jawOpen: 0.16 },                                                         // KK  k/g
+  { mouthFunnel: 0.5, jawOpen: 0.12 },                                       // CH  ch/sh/j
+  { jawOpen: 0.06, mouthStretchLeft: 0.35, mouthStretchRight: 0.35 },        // SS  s/z
+  { mouthFunnel: 0.3, jawOpen: 0.1 },                                        // RR  r
+  { jawOpen: 0.6 },                                                          // AA
+  { jawOpen: 0.35, mouthStretchLeft: 0.25, mouthStretchRight: 0.25 },        // E
+  { jawOpen: 0.18, mouthStretchLeft: 0.3, mouthStretchRight: 0.3 },          // IH  ee/i
+  { jawOpen: 0.45, mouthFunnel: 0.55 },                                      // OH
+  { jawOpen: 0.15, mouthPucker: 0.75 },                                      // OU  oo/w
+];
+// Union of every mouth morph either driver branch touches — all are written
+// every frame so switching branches (or visemes) decays cleanly, never sticks.
+const MOUTH_KEYS = [
+  'jawOpen', 'mouthFunnel', 'mouthPucker', 'mouthClose',
+  'mouthPressLeft', 'mouthPressRight', 'mouthRollLower', 'mouthShrugUpper',
+  'mouthStretchLeft', 'mouthStretchRight',
+  'mouthLowerDownLeft', 'mouthLowerDownRight', 'mouthUpperUpLeft', 'mouthUpperUpRight',
+];
+// Keys only the viseme branch uses; the LFO fallback zeroes them explicitly.
+const VISEME_ONLY_KEYS = [
+  'mouthClose', 'mouthPressLeft', 'mouthPressRight', 'mouthRollLower',
+  'mouthShrugUpper', 'mouthStretchLeft', 'mouthStretchRight',
 ];
 
 const STATE_EXPR = {
@@ -129,7 +165,7 @@ function useDemandLoop(stateRef, ampRef, paceRef) {
 }
 
 // ── AVATAR SCENE — her head as the persistent hologram ──────────────────────
-function AvatarScene({ stateRef, ampRef, onDegrade, onFail }) {
+function AvatarScene({ stateRef, ampRef, visemeRef, onDegrade, onFail }) {
   const headGroup = useRef();
   const bobRef = useRef();
   const ring1 = useRef();
@@ -271,18 +307,44 @@ function AvatarScene({ stateRef, ampRef, onDegrade, onFail }) {
         const i = dict[name];
         if (i !== undefined) inf[i] += (v - inf[i]) * k;
       };
-      // Mouth: amplitude drives jawOpen; a slow drifting LFO mixes the shape
-      // between open (jaw), rounded (funnel/pucker) and lip-parted so speech
-      // reads as articulation, not a flapping jaw. No phoneme stream yet.
+      // Mouth. Preferred: the phoneme-class viseme timeline (tts.visemes,
+      // clock anchored in Stage.jsx to the first audible tts.level frame).
+      // The amplitude envelope GATES intensity, so silence closes the mouth
+      // even when the estimated timing drifts. No live timeline -> the old
+      // amplitude-LFO articulation mix.
       const jawV = uJaw.value;
-      const shapeMix = 0.5 + 0.5 * Math.sin(time * 1.7 + Math.sin(time * 0.9) * 2.0);
-      set('jawOpen', jawV * 0.8);
-      set('mouthFunnel', jawV * 0.45 * shapeMix);
-      set('mouthPucker', jawV * 0.22 * (1 - shapeMix));
-      set('mouthLowerDownLeft', jawV * 0.3);
-      set('mouthLowerDownRight', jawV * 0.3);
-      set('mouthUpperUpLeft', jawV * 0.18);
-      set('mouthUpperUpRight', jawV * 0.18);
+      const vt = visemeRef ? visemeRef.current : null;
+      let vshape = null;
+      if (vt && vt.started) {
+        const tMs = performance.now() - vt.started;
+        if (tMs <= (vt.est | 0) + 600) {
+          const ev = vt.v;
+          let cur = 0;
+          while (cur + 1 < ev.length && ev[cur + 1][0] <= tMs) cur++;
+          vshape = VISEME_SHAPES[ev[cur][1]] || null;
+          vt.name = VISEME_NAMES[ev[cur][1]] || '?';
+        } else if (jawV < 0.02) {
+          visemeRef.current = null;    // exhausted and mouth settled — release
+        }
+      }
+      if (vshape) {
+        // Floor keeps consonant closures visible between amplitude peaks;
+        // jawV tracks the real envelope so pauses still shut the mouth.
+        const gain = Math.min(0.35 + jawV * 1.1, 1);
+        for (let i = 0; i < MOUTH_KEYS.length; i++) {
+          set(MOUTH_KEYS[i], (vshape[MOUTH_KEYS[i]] || 0) * gain);
+        }
+      } else {
+        const shapeMix = 0.5 + 0.5 * Math.sin(time * 1.7 + Math.sin(time * 0.9) * 2.0);
+        set('jawOpen', jawV * 0.8);
+        set('mouthFunnel', jawV * 0.45 * shapeMix);
+        set('mouthPucker', jawV * 0.22 * (1 - shapeMix));
+        set('mouthLowerDownLeft', jawV * 0.3);
+        set('mouthLowerDownRight', jawV * 0.3);
+        set('mouthUpperUpLeft', jawV * 0.18);
+        set('mouthUpperUpRight', jawV * 0.18);
+        for (let i = 0; i < VISEME_ONLY_KEYS.length; i++) set(VISEME_ONLY_KEYS[i], 0);
+      }
       // Autonomous blinks (instant, not smoothed — real blinks are fast).
       const b = blink.current;
       if (b.at < 0 && time >= b.next) b.at = time;
@@ -297,7 +359,7 @@ function AvatarScene({ stateRef, ampRef, onDegrade, onFail }) {
       // State expressions; untouched keys decay to 0.
       const expr = STATE_EXPR[s] || STATE_EXPR.idle;
       for (let i = 0; i < EXPR_KEYS.length; i++) set(EXPR_KEYS[i], expr[EXPR_KEYS[i]] || 0);
-      try { window.__avaMorphs = { jaw: inf[dict.jawOpen], blink: blinkV, mode: s }; } catch { /* debug */ }
+      try { window.__avaMorphs = { jaw: inf[dict.jawOpen], blink: blinkV, mode: s, viseme: vshape ? vt.name : null, chunk: vt ? vt.chunk : 0 }; } catch { /* debug */ }
     }
 
     if (headGroup.current) {
@@ -462,7 +524,7 @@ function CoreScene({ stateRef, ampRef, onDegrade }) {
   );
 }
 
-export default function Core3D({ stateRef, ampRef, onDegrade }) {
+export default function Core3D({ stateRef, ampRef, visemeRef, onDegrade }) {
   const [dead, setDead] = useState(false);
   const [avatarOk, setAvatarOk] = useState(true);
   if (dead) return null;   // Stage renders the CSS orb when we bail
@@ -479,7 +541,7 @@ export default function Core3D({ stateRef, ampRef, onDegrade }) {
       fallback={null}
     >
       {avatarOk
-        ? <AvatarScene stateRef={stateRef} ampRef={ampRef} onFail={() => setAvatarOk(false)} onDegrade={(why) => { setDead(true); onDegrade && onDegrade(why); }} />
+        ? <AvatarScene stateRef={stateRef} ampRef={ampRef} visemeRef={visemeRef} onFail={() => setAvatarOk(false)} onDegrade={(why) => { setDead(true); onDegrade && onDegrade(why); }} />
         : <CoreScene stateRef={stateRef} ampRef={ampRef} onDegrade={(why) => { setDead(true); onDegrade && onDegrade(why); }} />}
     </Canvas>
   );

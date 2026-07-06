@@ -40,6 +40,7 @@ import pyaudio
 from faster_whisper import WhisperModel
 
 from voice.tts.piper_bin import PiperBinTTS
+from voice.visemes import viseme_timeline, calibrate, DEFAULT_MS_PER_UNIT
 
 try:
     from vosk import Model as VoskModel, KaldiRecognizer, SetLogLevel
@@ -664,6 +665,8 @@ class LocalVoiceRunner:
         self._speak_lock = threading.RLock()
         self._announce_thread: Optional[threading.Thread] = None
         self._event_sender: Optional[_EventSender] = None  # lazy; tts.level telemetry (#17)
+        self._viseme_rate: float = DEFAULT_MS_PER_UNIT  # ms-per-unit, EMA-calibrated per chunk
+        self._viseme_chunk: int = 0                     # timeline ids for client pairing
         self._playback_rms = 0  # live rms of what SHE is playing right now (barge bleed reference, #20)
 
     def close(self) -> None:
@@ -1589,6 +1592,37 @@ class LocalVoiceRunner:
         except Exception:
             pass
 
+    def _visemes_enabled(self) -> bool:
+        """Phoneme-class viseme timelines for the UI core. Revert with AVA_PHONEME_VISEMES=0."""
+        return os.environ.get("AVA_PHONEME_VISEMES", "1").strip().lower() not in {"0", "false", "no", "off"}
+
+    def _emit_visemes(self, spoken: str) -> tuple:
+        """Estimate a viseme timeline for `spoken` and push it to the UI (tts.visemes).
+        The client anchors it to the first audible tts.level frame; amplitude still
+        gates mouth intensity, so estimate drift degrades gracefully. Returns
+        (chunk_id, est_ms) for post-hoc calibration, (0, 0) when disabled/empty."""
+        if not self._visemes_enabled():
+            return 0, 0
+        try:
+            events, est_ms = viseme_timeline(spoken, self._viseme_rate)
+            if est_ms <= 0 or len(events) < 2:
+                return 0, 0
+            self._viseme_chunk += 1
+            if self._event_sender is None:
+                self._event_sender = _EventSender(self.config)
+            self._event_sender.push("tts.visemes", {"chunk": self._viseme_chunk, "est_ms": est_ms, "v": events})
+            return self._viseme_chunk, est_ms
+        except Exception:
+            return 0, 0
+
+    def _calibrate_visemes(self, est_ms: int, frames: int, frame_ms: int = 100) -> None:
+        """EMA-tune ms-per-unit from the chunk's REAL audio length (frames x frame_ms)."""
+        if est_ms > 0 and frames > 0:
+            try:
+                self._viseme_rate = calibrate(self._viseme_rate, est_ms, frames * frame_ms)
+            except Exception:
+                pass
+
     def _speak(self, text: str) -> None:
         self.last_spoken_text = text or ""
         if not text or self.tts is None:
@@ -1605,10 +1639,13 @@ class LocalVoiceRunner:
             # frame boundary here, injecting a discontinuity ~10x/sec that sounds choppy. The
             # state list resets per utterance (each _speak call), so utterances stay independent.
             rs_state = [None]
+            _vchunk, _vest = self._emit_visemes(spoken)
+            _vframes = [0]
 
             def on_chunk(pcm: bytes) -> None:
                 if not pcm:
                     return
+                _vframes[0] += 1
                 self._emit_tts_level(audioop.rms(pcm, SAMPLE_WIDTH))
                 if self.output_stream is None:
                     return
@@ -1619,6 +1656,7 @@ class LocalVoiceRunner:
                 self.output_stream.write(out)
 
             self.tts.speak(spoken, on_chunk, frame_ms=100)
+            self._calibrate_visemes(_vest, _vframes[0])
             self._emit_tts_level(0)  # settle the core immediately at utterance end
             _log("state=COOLDOWN")
             time.sleep(0.35)
@@ -1657,12 +1695,15 @@ class LocalVoiceRunner:
         source_rate = int(getattr(self.tts, "current_sample_rate", playback_rate) or playback_rate)
         _log(f"state=SPEAKING chunk={spoken[:80]!r}")
         rs_state = [None]
+        _vchunk, _vest = self._emit_visemes(spoken)
+        _vframes = [0]
 
         def on_chunk(pcm: bytes) -> None:
             if not pcm or self.output_stream is None:
                 return
             if abort_event is not None and abort_event.is_set():
                 return
+            _vframes[0] += 1
             self._emit_tts_level(audioop.rms(pcm, SAMPLE_WIDTH))
             if source_rate == playback_rate:
                 out = pcm
@@ -1673,6 +1714,7 @@ class LocalVoiceRunner:
             self.output_stream.write(out)
 
         self.tts.speak(spoken, on_chunk, frame_ms=100)
+        self._calibrate_visemes(_vest, _vframes[0])
         self._emit_tts_level(0)  # settle the core between sentence chunks / at end
 
     def _barge_monitor(

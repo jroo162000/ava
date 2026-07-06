@@ -222,6 +222,7 @@ export default function Stage() {
   const [amp, setAmp] = useState(0);                 // #17: live speech amplitude (rms)
   const ampDecay = useRef(null);
   const ampRef = useRef(0);                          // #17b: ref mirror for the 3D core (no re-render churn)
+  const visemeRef = useRef(null);                    // phoneme-class viseme timeline for the core's mouth
   const stateRef = useRef('idle');
   const [degraded3d, setDegraded3d] = useState(false); // #17b: auto-degrade -> CSS orb
   const [vitals, setVitals] = useState(null);        // #18: sys.stats machine vitals
@@ -288,11 +289,21 @@ export default function Stage() {
           if (d.state === 'working.start') core.onWorking(true, d.goal);
           else if (d.state === 'working.end') core.onWorking(false);
           break;
+        case 'tts.visemes': {
+          // Timeline for the NEXT audible chunk; clock starts on first audible tts.level.
+          const d = ev.data || {};
+          if (Array.isArray(d.v) && d.v.length > 1) {
+            visemeRef.current = { v: d.v, est: d.est_ms | 0, chunk: d.chunk | 0, started: 0 };
+          }
+          break;
+        }
         case 'tts.level': {
           // #17: real amplitude from the voice runner — the core pulses to HER voice.
           const rms = (d && d.rms) | 0;
           setAmp(rms);
           ampRef.current = rms;
+          const vt = visemeRef.current;
+          if (vt && !vt.started && rms > 250) vt.started = performance.now();
           core.onAudio(rms);
           clearTimeout(ampDecay.current);
           ampDecay.current = setTimeout(() => { setAmp(0); ampRef.current = 0; }, 450);  // no frames -> settle
@@ -546,7 +557,7 @@ export default function Stage() {
         {degraded3d ? cssCore : (
           <div className={`st-core3d ${attention ? 'attention' : ''}`}>
             <Suspense fallback={cssCore}>
-              <Core3D stateRef={stateRef} ampRef={ampRef} onDegrade={(why) => { console.warn('[stage] 3D core degraded:', why); setDegraded3d(true); }} />
+              <Core3D stateRef={stateRef} ampRef={ampRef} visemeRef={visemeRef} onDegrade={(why) => { console.warn('[stage] 3D core degraded:', why); setDegraded3d(true); }} />
             </Suspense>
           </div>
         )}
