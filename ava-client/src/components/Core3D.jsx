@@ -456,10 +456,14 @@ function AvatarScene({ stateRef, ampRef, visemeRef, gazeRef, poseRef, gestureRef
       // breath is body-life, not a decision — every living body has it.
       const tv = torsoRef ? torsoRef.current : null;
       const tOn = tv && performance.now() < tv.until;
-      const breath = Math.sin(time * 0.85) * 0.012;
+      // Visible body life: breath + a slow weight-shift sway. (First cut was
+      // 0.012 rad — sub-pixel at Stage size; "the torso is still frozen".)
+      const breath = Math.sin(time * 0.85) * 0.02;
+      const sway = Math.sin(time * 0.09) * 0.06 + Math.sin(time * 0.031) * 0.03;
+      const shoulder = Math.sin(time * 0.13 + 0.8) * 0.018;
       const tx = (tOn ? tv.pitch : 0) + lean + breath;
-      const tyw = tOn ? tv.yaw : 0;
-      const trl = tOn ? tv.roll : Math.sin(time * 0.23) * 0.008;
+      const tyw = (tOn ? tv.yaw : sway);
+      const trl = tOn ? tv.roll : shoulder;
       const tk = Math.min(delta * (tOn ? 4 : 1.5), 1);
       tb.rotation.x = THREE.MathUtils.lerp(tb.rotation.x, tx, tk);
       tb.rotation.y = THREE.MathUtils.lerp(tb.rotation.y, tyw, tk);
@@ -484,7 +488,7 @@ function AvatarScene({ stateRef, ampRef, visemeRef, gazeRef, poseRef, gestureRef
       hb.rotation.y = THREE.MathUtils.lerp(hb.rotation.y, ty, hk);
       hb.rotation.x = THREE.MathUtils.lerp(hb.rotation.x, tp, hk);
       hb.rotation.z = THREE.MathUtils.lerp(hb.rotation.z, tr, Math.min(delta * 2, 1));
-      try { window.__avaHead = { yaw: +hb.rotation.y.toFixed(3), pitch: +hb.rotation.x.toFixed(3), roll: +hb.rotation.z.toFixed(3), gaze: gzOn ? [gz.x, gz.y] : null, mode: poseOn ? 'pose' : (gzOn ? 'gaze' : 'idle'), gesture: gst ? gst.name : null }; } catch { /* debug */ }
+      try { window.__avaHead = { yaw: +hb.rotation.y.toFixed(3), pitch: +hb.rotation.x.toFixed(3), roll: +hb.rotation.z.toFixed(3), gaze: gzOn ? [gz.x, gz.y] : null, mode: poseOn ? 'pose' : (gzOn ? 'gaze' : 'idle'), gesture: gst ? gst.name : null, torso: tb ? { yaw: +tb.rotation.y.toFixed(3), pitch: +tb.rotation.x.toFixed(3), own: !!tOn } : 'BONE NOT FOUND' }; } catch { /* debug */ }
     } else if (headGroup.current) {
       const g = headGroup.current;
       const rx = Math.sin(time * 0.35) * 0.02;
