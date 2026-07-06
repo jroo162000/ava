@@ -249,13 +249,24 @@ function AvatarScene({ stateRef, ampRef, visemeRef, gazeRef, poseRef, gestureRef
           }
           let hbFound = null;
           let tbFound = null;
+          const boneNames = [];
+          let skinnedInfo = null;
           gltf.scene.traverse((o) => {
+            if (o.isSkinnedMesh && !skinnedInfo) {
+              skinnedInfo = {
+                skinned: true,
+                skeletonBones: (o.skeleton && o.skeleton.bones || []).map((b) => b.name),
+                hasSkinAttrs: !!(o.geometry.attributes.skinIndex && o.geometry.attributes.skinWeight),
+              };
+            }
             if (!o.isBone) return;
+            boneNames.push(o.name);
             if (o.name === 'Head') hbFound = o;
             if (o.name === 'Torso') tbFound = o;
           });
           headBone.current = hbFound;
           torsoBone.current = tbFound;
+          try { window.__avaBones = { bones: boneNames, head: !!hbFound, torso: !!tbFound, mesh: skinnedInfo || { skinned: false } }; } catch { /* debug */ }
           const s = 3.1 / h;
           gltf.scene.position.set(-center.x * s, -center.y * s, -center.z * s);
           gltf.scene.scale.setScalar(s);
