@@ -165,6 +165,11 @@ class KokoroTTS:
                     if audio is None:
                         continue
                     a = audio.detach().cpu().numpy().astype('float32')
+                    # Kokoro synthesizes ~5x quieter than Piper; peak-normalize so
+                    # speaker volume and the UI amplitude envelope stay consistent.
+                    peak = float(np.max(np.abs(a))) if a.size else 0.0
+                    if peak > 0.02:
+                        a = a * (0.85 / peak)
                     pcm = (np.clip(a, -1.0, 1.0) * 32767.0).astype('<i2').tobytes()
                     try:
                         events.extend(phoneme_events(result.tokens, result.pred_dur, offset_ms))
