@@ -21,6 +21,11 @@ import { emitVoiceEvent } from './voiceBus.js';
 import logger from '../utils/logger.js';
 
 const TAG_RE = /<move>([\s\S]*?)<\/move>/g;
+// Single-asterisk roleplay emotes: *tilts head*, *lets a slow smile spread...*
+// (never **bold**). She emotes this way NATURALLY — so instead of fighting the
+// habit, we treat emotes as movement intent: strip them from her words and
+// hand the description to a tiny LLM that translates it into <move> directives.
+const EMOTE_RE = /(^|[^*])\*([^*\n]{2,240}?)\*(?!\*)/g;
 const GESTURES = new Set(['nod', 'shake', 'tilt', 'lean_in', 'look_away']);
 const clamp = (v, lo, hi) => Math.min(Math.max(Number(v) || 0, lo), hi);
 
@@ -75,17 +80,43 @@ export function applyDirective(d) {
   return did;
 }
 
-/** Remove complete <move> tags. execute=true also runs them (once per reply). */
+/** Translate a natural-language self-action ("tilts head, smiling") into
+ *  <move> directives via one tiny LLM call, then execute them. Fire-and-forget:
+ *  failures mean no movement, never broken text. */
+async function interpretEmotes(emotes) {
+  try {
+    const llm = (await import('./llm.js')).default;
+    const r = await llm.chat([
+      { role: 'system', content: 'Translate the described body action of a 3D avatar (head, eyes, torso, facial expression) into 1-4 movement directives. Available: <move>{"look":[x,y]}</move> (x,y -1..1), <move>{"head":{"yaw":n,"pitch":n,"roll":n},"hold":s}</move> (radians, max 0.6), <move>{"gesture":"nod|shake|tilt|lean_in|look_away"}</move>, <move>{"body":{"lean":n,"bend":n,"turn":n},"hold":s}</move> (torso, max 0.15/0.15/0.3), <move>{"express":{"<ARKitMorphName>":0..1},"hold":s}</move> (e.g. mouthSmileLeft, mouthSmileRight, browInnerUp, eyeSquintLeft, cheekSquintLeft, eyeWideLeft). Reply with ONLY the directives, nothing else.' },
+      { role: 'user', content: emotes.join('. ') },
+    ], { max_tokens: 200, temperature: 0.4 });
+    const text = (r && (r.text || r.content)) || '';
+    if (text.includes('<move>')) extract(text, true);
+  } catch { /* movement is best-effort; her words were already cleaned */ }
+}
+
+/** Remove complete <move> tags AND *emote* spans. execute=true runs the tags
+ *  and asynchronously interprets the emotes (once per reply). */
 export function extract(text, execute) {
-  const s = String(text || '');
-  if (s.indexOf('<move>') < 0) return s;
-  return s.replace(TAG_RE, (m, json) => {
-    if (execute) {
-      try { applyDirective(JSON.parse(json)); }
-      catch (e) { logger.debug('[avatarBody] bad directive dropped', { error: e.message }); }
-    }
-    return ' ';
-  }).replace(/[ \t]{2,}/g, ' ');
+  let s = String(text || '');
+  if (s.indexOf('<move>') >= 0) {
+    s = s.replace(TAG_RE, (m, json) => {
+      if (execute) {
+        try { applyDirective(JSON.parse(json)); }
+        catch (e) { logger.debug('[avatarBody] bad directive dropped', { error: e.message }); }
+      }
+      return ' ';
+    });
+  }
+  if (s.indexOf('*') >= 0) {
+    const emotes = [];
+    s = s.replace(EMOTE_RE, (m, pre, action) => {
+      emotes.push(action.trim());
+      return pre + ' ';
+    });
+    if (execute && emotes.length) interpretEmotes(emotes);
+  }
+  return s.replace(/[ \t]{2,}/g, ' ');
 }
 
 export const strip = (text) => extract(text, false);
@@ -110,6 +141,12 @@ export function safeLength(s) {
   if (lastLt >= 0) {
     const tail = str.slice(lastLt);
     if (tail.length < 7 && ('<move>'.startsWith(tail) || '</move>'.startsWith(tail))) return lastLt;
+  }
+  // unpaired single-asterisk emote still streaming in: hold from its start
+  const lastStar = str.lastIndexOf('*');
+  if (lastStar >= 0 && str[lastStar - 1] !== '*' && str[lastStar + 1] !== '*') {
+    const openCount = (str.match(/(^|[^*])\*(?!\*)/g) || []).length;
+    if (openCount % 2 === 1 && str.length - lastStar < 240) return Math.max(0, lastStar - 1);
   }
   return str.length;
 }
