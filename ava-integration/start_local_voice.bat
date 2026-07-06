@@ -10,8 +10,11 @@ set "AVA_TTS_CHUNKING=0"
 set "AVA_TTS_SEGMENTING=0"
 REM Tier 3 #20: mirror runner logs to logs\local_voice.log for VAD/barge tuning
 set "AVA_LOCAL_VOICE_LOG=1"
-REM Kokoro voice (Jelani picked Bella). AVA_TTS_KOKORO=0 would revert to Piper.
-set "AVA_KOKORO_VOICE=af_bella"
+REM Voice identity = VELLA (ElevenLabs instant clone primary, local Piper
+REM ava_vella.onnx fine-tune offline) - Kokoro is OFF because it cannot load
+REM the Vella voice (fixed voicepacks). Set AVA_TTS_KOKORO=1 to trade voice
+REM identity for exact phoneme timing again.
+set "AVA_TTS_KOKORO=0"
 
 echo ================================================================================
 echo AVA LOCAL VOICE - MINIMAL HALF-DUPLEX RUNNER

@@ -29,6 +29,7 @@ import workflowEngine from './services/workflowEngine.js';
 import proactiveAutonomy from './services/proactiveAutonomy.js';
 import autoEval from './services/autoEval.js';
 import windowJanitor from './services/windowJanitor.js';
+import embodimentDriver from './services/embodimentDriver.js';
 import selfReflection from './services/selfReflection.js';
 import environmentContext from './services/environmentContext.js';   // Tier 3 #18: vitals source
 import { emitVoiceEvent } from './services/voiceBus.js';             // Tier 3 #18: sys.stats broadcast
@@ -220,6 +221,7 @@ server.listen(PORT, HOST, () => {
   // the clock (skips the focused window + freshly-opened consoles). Scoped to just those two.
   try {
     windowJanitor.start();
+    embodimentDriver.start();
   } catch (e) {
     logger.warn('Failed to start window janitor', { error: e.message });
   }
