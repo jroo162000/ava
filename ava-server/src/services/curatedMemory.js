@@ -8,6 +8,10 @@ import path from 'path';
 import os from 'os';
 import logger from '../utils/logger.js';
 
+// Lazy JSONL path — uses internal _memory array + appendFileSync for durable addEntry/getRecent
+const _memory = []; // in-memory entries for fast recent retrieval
+const _JSONL_PATH_CACHE = { value: null };
+
 const USER_CAP = 1500;    // chars
 const MEMORY_CAP = 2000;  // chars
 
@@ -204,6 +208,50 @@ export function getTopicEngagement(topic) {
   return Math.min(1, totalWeighted / totalMax);
 }
 
+// ── Lazy JSONL path ──────────────────────────────────────────────────────
+function _getJSONLPath() {
+  if (!_JSONL_PATH_CACHE.value) {
+    _JSONL_PATH_CACHE.value = path.join(integrationDir(), 'curated_memory.jsonl');
+  }
+  return _JSONL_PATH_CACHE.value;
+}
+
+/**
+ * Add an entry to curated memory: pushes to in-memory array and appends to JSONL for durability.
+ * @param {object} entry - Must have at least a `text` field. Optional `ts`, `source`, `type`.
+ * @returns {{ ok: boolean, error?: string, id?: number }}
+ */
+export function addEntry(entry) {
+  if (!entry || typeof entry !== 'object' || !entry.text) {
+    return { ok: false, error: 'entry must be an object with a text property' };
+  }
+  const id = _memory.length + 1;
+  const enriched = {
+    id,
+    ts: entry.ts || new Date().toISOString(),
+    text: entry.text,
+    source: entry.source || 'curatedMemory',
+    type: entry.type || 'observation'
+  };
+  _memory.push(enriched);
+  try {
+    const line = JSON.stringify(enriched) + '\n';
+    fs.appendFileSync(_getJSONLPath(), line, 'utf8');
+    return { ok: true, id };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+}
+
+/**
+ * Get the most recent `n` entries from the in-memory array.
+ * @param {number} [n=10] - Number of recent entries to retrieve.
+ * @returns {Array} Array of entry objects, newest first.
+ */
+export function getRecent(n = 10) {
+  return _memory.slice(-n).reverse();
+}
+
 // Helper to query facts from user memory by prefix match
 function queryFacts(target, prefix) {
   ensureSeed();
@@ -215,4 +263,4 @@ function queryFacts(target, prefix) {
   } catch { return []; }
 }
 
-export default { buildMemoryBlock, appendFact, reload, storeEngagementSignal, getTopicEngagement, paths: { userPath, memoryPath } };
+export default { buildMemoryBlock, appendFact, reload, storeEngagementSignal, getTopicEngagement, addEntry, getRecent, paths: { userPath, memoryPath } };

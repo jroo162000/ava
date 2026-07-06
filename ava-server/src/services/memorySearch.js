@@ -96,6 +96,44 @@ export function search(query, limit = 8) {
   }
 
   results.sort((a, b) => (b.score - a.score) || String(b.date).localeCompare(String(a.date)));
+    // 2b) semantic re-ranking — pure JS TF-IDF-like scoring on result texts
+  if (ql.length >= 3) {
+    const queryTerms = terms(query);
+    const queryWords = ql.split(/\s+/).filter(w => w.length > 0);
+    if (queryTerms.length > 0) {
+      // Build per-document term frequency maps
+      const docTfs = results.map(r => {
+        const words = r.text.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
+        const tf = {};
+        const total = words.length || 1;
+        for (const w of words) {
+          if (!STOP.has(w) && w.length >= 3) tf[w] = (tf[w] || 0) + 1;
+        }
+        // Normalize by document length
+        for (const key in tf) tf[key] /= total;
+        return { orig: r, tf };
+      });
+      // Compute IDF for each query term across all results
+      const n = docTfs.length;
+      const idf = {};
+      for (const qt of queryTerms) {
+        let df = 0;
+        for (const d of docTfs) if (d.tf[qt] > 0) df++;
+        idf[qt] = df > 0 ? Math.log(n / df) + 1 : 0;
+      }
+      // Score each document: sum(tf * idf) for each query term + bonus for exact phrase presence
+      for (const d of docTfs) {
+        let score = 0;
+        for (const qt of queryTerms) score += (d.tf[qt] || 0) * idf[qt];
+        // Bonus for exact query phrase match
+        if (ql && d.orig.text.toLowerCase().includes(ql)) score += 1.5;
+        d.orig.score = Math.round((d.orig.score || 0) + score * 100) / 100;
+      }
+      // Re-sort by new score descending
+      results.sort((a, b) => (b.score - a.score) || String(b.date).localeCompare(String(a.date)));
+    }
+  }
+
   // Deduplicate by normalized text — keep first (highest-scored) occurrence
   const seen = new Set();
   const deduped = [];

@@ -170,4 +170,57 @@ async function consolidateIfNeeded() {
   }
 }
 
-export default { reviewAndUpdate, ingestMistakeLessons, ingestProposalTests, reviewMistakeLessons, isLessonKnown };
+export function reviewRecentConversation() {
+  const limit = 5;
+  let entries = [];
+  try {
+    entries = conversationLogger.getRecentHistoryAcrossDays(limit) || [];
+  } catch {
+    try {
+      const day = new Date().toISOString().slice(0, 10);
+      const logPath = `conversations/${day}.jsonl`;
+      if (fs.existsSync(logPath)) {
+        const lines = fs.readFileSync(logPath, 'utf8').trim().split('\n').filter(Boolean);
+        entries = lines.slice(-limit).map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+      }
+    } catch {}
+  }
+  if (!entries.length) return { sentinel: 'stub', reason: 'no conversation data' };
+
+  const topicCounts = {};
+  let userTurns = 0, assistantTurns = 0;
+  for (const e of entries) {
+    const role = (e.direction || e.role || 'unknown').toLowerCase();
+    if (role === 'user') userTurns++;
+    else if (role === 'assistant') assistantTurns++;
+    const text = (e.content || '').toLowerCase();
+    const words = text.match(/\w{4,}/g) || [];
+    for (const w of words) {
+      topicCounts[w] = (topicCounts[w] || 0) + 1;
+    }
+  }
+
+  const topTopics = Object.entries(topicCounts)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 8)
+    .map(([word, count]) => `${word}(${count})`)
+    .join(', ');
+
+  const summary = {
+    totalTurns: entries.length,
+    userTurns,
+    assistantTurns,
+    topTopics: topTopics || '(none)',
+    reviewedAt: new Date().toISOString()
+  };
+
+  const reviewDir = 'reviews';
+  if (!fs.existsSync(reviewDir)) fs.mkdirSync(reviewDir, { recursive: true });
+  const reviewPath = `${reviewDir}/conversation_review.jsonl`;
+  fs.appendFileSync(reviewPath, JSON.stringify(summary) + '\n', 'utf8');
+
+  logger?.info?.('[memoryReviewer] reviewed recent conversation', summary);
+  return summary;
+}
+
+export default { reviewAndUpdate, ingestMistakeLessons, ingestProposalTests, reviewMistakeLessons, isLessonKnown, reviewRecentConversation };

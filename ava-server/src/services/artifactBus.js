@@ -4,6 +4,7 @@
 // she talks, moves them in real time, and closes them when done. The UI polls /panel/state and
 // mirrors this exactly. She is made aware of the panel via block() so she narrates to what's shown.
 import { emitVoiceEvent } from './voiceBus.js';
+import crypto from 'crypto';
 import logger from '../utils/logger.js';
 
 const MAX = 12;
@@ -11,6 +12,7 @@ let _cards = [];
 let _focusedId = null;
 let _layout = 'spread'; // 'spread' (all visible, highlight the referenced one) | 'stack' (fanned)
 let _seq = 0;
+const _artifactCache = new Map(); // artifactId -> { artifactId, url, type, title, ts, meta }
 
 function _emit() { try { emitVoiceEvent('panel', { cards: _cards, focusedId: _focusedId, layout: _layout }, 'server'); } catch { /* best-effort */ } }
 
@@ -22,6 +24,35 @@ export function open({ type = 'markdown', title = '', content = '', meta = {} } 
   if (String(type) === 'web') {
     const _ex = _cards.find((c) => c.type === 'web' && String(c.content) === String(typeof content === 'string' ? content : JSON.stringify(content)));
     if (_ex) { _focusedId = _ex.id; _emit(); return _ex; }
+  }
+  // artifact dedup: compute hash from content+type for tool-like artifacts (image, model, file)
+  const artifactTypes = ['image', 'model', 'file'];
+  if (artifactTypes.includes(String(type))) {
+    const hash = crypto.createHash('sha256').update(String(content)).digest('hex');
+    const artifactId = hash.slice(0, 16);
+    if (_artifactCache.has(artifactId)) {
+      const existing = _artifactCache.get(artifactId);
+      _focusedId = existing.id;
+      _emit();
+      logger.info('[panel] artifact dedup', { artifactId, type, cards: _cards.length });
+      return existing;
+    }
+    const id = 'c' + (++_seq) + Date.now().toString(36).slice(-3);
+    const artifactEntry = { artifactId, url: typeof content === 'string' ? content : JSON.stringify(content), type: String(type), title: String(title || '').slice(0, 200), ts: Date.now(), meta: (meta && typeof meta === 'object') ? meta : {} };
+    _artifactCache.set(artifactId, artifactEntry);
+    // Emit a structured 'artifact' event for downstream consumers
+    try { emitVoiceEvent('artifact', { ...artifactEntry, cardId: id }, 'server'); } catch { /* best-effort */ }
+    const card = {
+      id, type: String(type || 'markdown'), title: String(title || '').slice(0, 200),
+      content: typeof content === 'string' ? content : JSON.stringify(content),
+      meta: (meta && typeof meta === 'object') ? meta : {}, ts: Date.now()
+    };
+    _cards.push(card);
+    if (_cards.length > MAX) _cards = _cards.slice(-MAX);
+    _focusedId = id;
+    _emit();
+    logger.info('[panel] artifact open', { type: card.type, title: card.title.slice(0, 60), artifactId, cards: _cards.length, layout: _layout });
+    return card;
   }
   const id = 'c' + (++_seq) + Date.now().toString(36).slice(-3);
   const card = {
@@ -42,7 +73,7 @@ export function close(id) {
   if (_cards.length !== n) { if (_focusedId === id) _focusedId = _cards.length ? _cards[_cards.length - 1].id : null; _emit(); return true; }
   return false;
 }
-export function clear() { _cards = []; _focusedId = null; _emit(); }
+export function clear() { _cards = []; _focusedId = null; _artifactCache.clear(); _emit(); }
 export function setLayout(mode) { _layout = (mode === 'stack') ? 'stack' : 'spread'; _emit(); return _layout; }
 // Move a card to a normalized position (x,y in 0..1 of the panel area) for real-time arranging.
 export function move(id, x, y) {

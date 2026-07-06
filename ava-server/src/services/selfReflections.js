@@ -107,4 +107,29 @@ export function markShared(keys) {
   } catch (e) { logger.warn('[self-reflect] markShared failed', { error: e.message }); }
 }
 
-export default { captureFrom, actionable, recent, forShare, markShared };
+const _dedupKey = (text) => String(text || '').replace(/\s+/g, ' ').trim().slice(0, 80);
+
+export function aggregateReflections(limit = 3) {
+  try {
+    const all = load();
+    const seen = new Set();
+    const unique = all.filter(r => {
+      const key = _dedupKey(r.text);
+      if (seen.has(key) || !key) return false;
+      seen.add(key);
+      return true;
+    });
+    const recentEntries = unique.slice(-limit);
+    const formatted = recentEntries.map(r => `[${r.source}] ${r.text}`);
+    return formatted.length ? formatted.join('\n') : '';
+  } catch (e) {
+    logger.warn('[self-reflect] aggregateReflections failed', { error: e.message });
+    return '';
+  }
+}
+
+export function getRecentReflections(count = 3) {
+  return load().slice(-count).reverse().map(r => ({ key: r.key, text: r.text, source: r.source, actionable: r.actionable, at: r.at }));
+}
+
+export default { captureFrom, actionable, recent, forShare, markShared, aggregateReflections, getRecentReflections };

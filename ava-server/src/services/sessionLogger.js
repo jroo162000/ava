@@ -219,6 +219,12 @@ class SessionLogger {
     }
   }
 
+  // Read last n conversation turns from the current session
+  getRecentTurns(n = 10) {
+    if (!this.currentSession || !this.currentSession.conversations.length) return [];
+    return this.currentSession.conversations.slice(-n);
+  }
+
   // Get all available session IDs
   getAllSessions() {
     try {

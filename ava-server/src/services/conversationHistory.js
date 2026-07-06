@@ -148,4 +148,42 @@ export function pruneBefore(timestamp) {
   return removedCount;
 }
 
-export default { readRecentTurns, availableDates, windowForQuery, formatTurns, getConversationSince, pruneBefore };
+// In-memory buffer: the last N complete assistant+user turn objects kept by conversationLogger.
+// Exposed here so other modules can read recent context without re-parsing JSONL files.
+const _snapshotBuffer = [];
+const BUFFER_MAX = 200;
+
+export function pushToBuffer(entry) {
+  // entry: { role: 'user'|'assistant', content: string, timestamp?: string }
+  _snapshotBuffer.push(entry);
+  if (_snapshotBuffer.length > BUFFER_MAX) _snapshotBuffer.splice(0, _snapshotBuffer.length - BUFFER_MAX);
+}
+
+export function getConversationSnapshot(turns = 10) {
+  // Returns a shallow copy of the last 'turns' complete entry objects.
+  // Each entry: { role, content, timestamp }
+  const n = Math.min(turns, _snapshotBuffer.length);
+  return _snapshotBuffer.slice(-n);
+}
+
+/**
+ * getRecentConversation(count = 10)
+ * Reads the last `count` user-assistant turn pairs from the JSONL log files.
+ * Returns an array of { role: 'user'|'assistant', content: string, timestamp: string }.
+ * Falls back to the in-memory buffer if JSONL files are unavailable or empty.
+ */
+export function getRecentConversation(count = 10) {
+  const allTurns = readRecentTurns(14);       // last 14 days
+  const pairs = [];
+  for (const t of allTurns) {
+    const role = t.who === 'AVA' ? 'assistant' : 'user';
+    pairs.push({ role, content: t.content, timestamp: `${t.date}T${t.time}:00` });
+  }
+  if (pairs.length >= count) return pairs.slice(-count);
+  // fallback: use in-memory snapshot buffer if JSONL gave fewer than requested
+  const snapshot = getConversationSnapshot(count);
+  if (snapshot.length > pairs.length) return snapshot.slice(-count);
+  return pairs;
+}
+
+export default { readRecentTurns, availableDates, windowForQuery, formatTurns, getConversationSince, pruneBefore, pushToBuffer, getConversationSnapshot, getRecentConversation };

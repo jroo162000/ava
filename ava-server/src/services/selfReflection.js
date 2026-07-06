@@ -50,6 +50,11 @@ function _appendFile(entry) {
   } catch { /* never break on telemetry */ }
 }
 
+/** Write an entry to the selfReflections.jsonl file (creates parent dir if needed). */
+export function _appendReflection(entry) {
+  _appendFile(entry);
+}
+
 /**
  * Ingest ONE assistant turn: buffer it (last MAX_TURNS), distill reflections, and persist only when
  * a NEW reflection set appears (no duplicate spam). Returns the persisted entry or null.
@@ -81,11 +86,14 @@ export function start() {
       _ingest(event.data && event.data.text);
     } catch { /* resilient — telemetry must never crash the bus */ }
   });
-  // Phase 2: periodically fold new reflections into durable memory (closes the loop). Timers are
-  // unref'd so they never keep the process alive; interval is env-tunable (AVA_REFLECTION_FOLD_MS).
+  // Phase 2: periodically gather evidence from conversation history + fold reflections into durable
+  // memory. The gather step feeds back into the fold; both are idempotent and run best-effort.
   const foldMs = parseInt(process.env.AVA_REFLECTION_FOLD_MS || String(30 * 60 * 1000), 10) || (30 * 60 * 1000);
+  const gatherMs = parseInt(process.env.AVA_GATHER_EVIDENCE_MS || String(5 * 60 * 1000), 10) || (5 * 60 * 1000);
+  try { const tg = setTimeout(() => { _gatherEvidence().catch(() => {}); }, 30 * 1000); if (tg.unref) tg.unref(); } catch { /* optional */ }
   try { const t0 = setTimeout(() => { foldIntoMemory().catch(() => {}); }, 60 * 1000); if (t0.unref) t0.unref(); } catch { /* optional */ }
   try { const t1 = setInterval(() => { foldIntoMemory().catch(() => {}); }, foldMs); if (t1.unref) t1.unref(); } catch { /* optional */ }
+  try { const t2 = setInterval(() => { _gatherEvidence().catch(() => {}); }, gatherMs); if (t2.unref) t2.unref(); } catch { /* optional */ }
   // Phase 3: periodically distill the accumulated reflections into a few durable principles (LLM).
   // Runs less often than the fold; both delays env-tunable. Gated internally so it no-ops cheaply.
   const distillMs = parseInt(process.env.AVA_REFLECTION_DISTILL_MS || String(6 * 60 * 60 * 1000), 10) || (6 * 60 * 60 * 1000);
@@ -103,13 +111,38 @@ export function recent(n = 20) {
   } catch { return []; }
 }
 
-// ─── Phase 2: the CONSUMER — fold reflections into durable memory ────────────────────────────────
-// Capture alone isn't self-improving; this reads NEW reflections (past a persisted line cursor),
-// distills distinct lessons, and upserts them as durable WARNING-type memories. memoryHub.search()
-// then injects them back into future prompts, so past mistakes actually shape later replies.
+// ─── Phase 2: CONSUMER + _gatherEvidence — fold reflections + detect user friction ──────────────
+// _gatherEvidence reads conversationLogger's internal .history array (the last 10 turns), extracts
+// user corrections/complaints via keyword patterns, and stores them as WARNING memories. This makes
+// self-reflection genuinely reactive to user friction, not just passive introspection.
+// Imports conversationLogger directly (not EventEmitter) to access its .history property.
 
 function _readCursor() { try { return parseInt(String(fs.readFileSync(CURSOR, 'utf8')).trim(), 10) || 0; } catch { return 0; } }
 function _writeCursor(n) { try { fs.mkdirSync(path.dirname(CURSOR), { recursive: true }); fs.writeFileSync(CURSOR, String(n)); } catch { /* best-effort */ } }
+
+// ─── shared references loaded lazily ────────────────────────────────────────────────────────────
+// Cache conversationLogger and curatedMemory once so _gatherEvidence reuses them. Loaded on first
+// call (not at import time) to keep the module side-effect-free at bootstrap.
+let _convLogger = null;
+let _curated = null;
+let _loading = false;
+
+async function _ensureLazyDeps() {
+  if (_convLogger && _curated) return;
+  if (_loading) { while (_loading) await new Promise(r => setTimeout(r, 10)); return; }
+  _loading = true;
+  try {
+    const [conv, cur] = await Promise.all([
+      import('./conversationLogger.js'),
+      import('./curatedMemory.js'),
+    ]);
+    _convLogger = conv.default;
+    _curated = cur.default;
+  } catch { /* will retry on next call */ } finally { _loading = false; }
+}
+
+/** User-friction keywords — when the user says these AVA needs to learn. */
+const FRICTION_PATTERNS = [/\b(stop|wrong|incorrect|no|fix|bad|terrible|awful|horrible|nonsense|rubbish|useless)\b/i];
 
 /** Pure: given the raw jsonl lines and a start cursor, return { lessons, total } (distinct, trimmed). */
 export function _lessonsFromLines(lines, cursor = 0) {
@@ -128,6 +161,57 @@ export function _lessonsFromLines(lines, cursor = 0) {
     }
   }
   return { lessons, total: all.length };
+}
+
+/**
+ * _gatherEvidence: read the last 10 entries from conversationLogger's internal .history array,
+ * extract any recent user corrections or complaints via keyword patterns, and store the findings
+ * in curatedMemory via its proven .store(key, value) and .list() methods. Returns { stored, found }
+ * or { stored: 0, error: '...' }. Never throws; writes are best-effort.
+ */
+export async function _gatherEvidence() {
+  await _ensureLazyDeps();
+  if (!_convLogger || !_curated) return { stored: 0, error: 'deps_unavailable' };
+  const history = _convLogger.history;
+  if (!Array.isArray(history) || history.length === 0) return { stored: 0, found: 0 };
+  // take last 10 entries (or all if fewer)
+  const slice = history.slice(-10);
+  const found = [];
+  for (const entry of slice) {
+    const text = (entry && (entry.text || entry.content || entry.message || '')) || '';
+    for (const pat of FRICTION_PATTERNS) {
+      const m = text.match(pat);
+      if (m) {
+        let userText = text;
+        // try to isolate the user utterance if entry has role
+        if (entry.role === 'user' || entry.role === 'human') userText = text;
+        found.push({
+          ts: entry.ts || Date.now(),
+          role: entry.role || 'user',
+          snippet: userText.substring(0, 200),
+          matched: m[0],
+        });
+        break;
+      }
+    }
+  }
+  if (found.length === 0) return { stored: 0, found: 0 };
+  let stored = 0;
+  for (const f of found) {
+    try {
+      await _curated.store(`friction:${Date.now()}:${Math.random().toString(36).slice(2, 8)}`, {
+        text: `User friction detected: "${f.matched}" in: ${f.snippet}`,
+        type: 'warning',
+        priority: 3,
+        source: 'self-reflection.gatherEvidence',
+        tags: ['friction', 'user-feedback', 'self-reflection'],
+        role: 'assistant',
+        ts: f.ts,
+      });
+      stored++;
+    } catch { /* skip one failure */ }
+  }
+  return { stored, found: found.length };
 }
 
 /**
@@ -282,4 +366,54 @@ export async function distillPrinciples({
 export function _reset() { _state.buffer.length = 0; _state.lastKey = ''; _started = false; }
 
 export const _internal = { OUT, MAX_TURNS, MAX_REFLECTIONS, state: _state };
-export default { start, recent, extractReflections };
+// ─── Phase 4: reflect() — scheduled introspection reading last 20 log entries ────────────
+// This replaces the old stub by reading sessionLogger.logPath, summarizing with an LLM call, and
+// persisting the reflection. All deps are injectable for tests.
+
+/**
+ * Read the last 20 lines from sessionLogger.logPath, summarize them via the provided chat
+ * function (defaults to llm.chat), and write a reflection entry to selfReflections.jsonl.
+ * Returns { ts, summary, source } or null if no data.
+ */
+export async function reflect({
+  logPath = null,
+  chat = null,
+  writer = _appendFile,
+  n = 20,
+} = {}) {
+  // Resolve logPath: use provided, or lazy-load sessionLogger and use its logPath
+  if (!logPath) {
+    try {
+      const mod = await import('./sessionLogger.js');
+      logPath = mod.default.logPath;
+    } catch { return null; }
+  }
+  // Read last n non-empty lines
+  let lines = [];
+  try {
+    const raw = fs.readFileSync(logPath, 'utf8');
+    lines = raw.trim().split('\n').filter(Boolean);
+  } catch { return null; }
+  if (lines.length === 0) return null;
+  const slice = lines.slice(-n);
+  // Lazy-load LLM chat function if not injected
+  if (!chat) {
+    try {
+      const llm = (await import('./llm.js')).default;
+      chat = (msgs, opts) => llm.chat(msgs, opts);
+    } catch { return null; }
+  }
+  const sys = 'You are a self-reflection summarizer. Read the following recent session log entries and produce ONE concise sentence that captures a key behavioral observation, lesson, or pattern relevant to AVA\'s performance. Return ONLY the sentence, no additional text.';
+  const usr = `Recent session log entries (last ${n}):\n${slice.map((l, i) => `${i + 1}. ${l}`).join('\n')}`;
+  let text = '';
+  try {
+    const r = await chat([{ role: 'system', content: sys }, { role: 'user', content: usr }], { temperature: 0.3, max_tokens: 120 });
+    text = (r.text || r.content || '').trim();
+  } catch { return null; }
+  if (!text || text.length < 8) return null;
+  const entry = { ts: Date.now(), source: 'reflect()', summary: text };
+  try { writer(entry); } catch { /* best-effort */ }
+  return entry;
+}
+
+export default { start, recent, extractReflections, _gatherEvidence, reflect };
