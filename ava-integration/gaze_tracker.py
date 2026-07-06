@@ -28,7 +28,9 @@ import urllib.request
 SERVER = os.environ.get("AVA_SERVER_URL", "http://127.0.0.1:5051").rstrip("/")
 LOCK_PORT = 5077
 POST_HZ = 8.0
-HOLD_MS = 1500
+HOLD_MS = 3500          # bridge brief detection dropouts instead of releasing to idle
+COAST_S = 2.5           # keep posting the last position this long after losing the face
+BASELINE_TAU = 120.0    # seconds: her 'center' auto-calibrates to where you usually are
 
 
 def _api_token() -> str:
@@ -75,12 +77,14 @@ def main() -> int:
     cam_idx = int(os.environ.get("AVA_GAZE_CAM", "0") or 0)
     mirror = os.environ.get("AVA_GAZE_MIRROR", "1").strip().lower() not in {"0", "false", "no", "off"}
     cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+    profile = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_profileface.xml")
     if cascade.empty():
         print("gaze-tracker: haar cascade missing")
         return 1
 
     cap = None
     ema_x = ema_y = None
+    base_x = base_y = None
     last_face = 0.0
     interval = 1.0 / POST_HZ
     fails = 0
@@ -109,15 +113,32 @@ def main() -> int:
             fails = 0
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             small = cv2.resize(gray, (320, 240))
-            faces = cascade.detectMultiScale(small, scaleFactor=1.15, minNeighbors=5, minSize=(40, 40))
+            faces = cascade.detectMultiScale(small, scaleFactor=1.12, minNeighbors=4, minSize=(28, 28))
+            if not len(faces) and not profile.empty():
+                # frontal missed (head turned): try profile, then mirrored profile
+                faces = profile.detectMultiScale(small, scaleFactor=1.15, minNeighbors=4, minSize=(28, 28))
+                if not len(faces):
+                    flipped = cv2.flip(small, 1)
+                    ff = profile.detectMultiScale(flipped, scaleFactor=1.15, minNeighbors=4, minSize=(28, 28))
+                    if len(ff):
+                        faces = [(320 - x - w, y, w, h) for (x, y, w, h) in ff]
             if len(faces):
                 x, y, w, h = max(faces, key=lambda f: f[2] * f[3])
                 cx = (x + w / 2.0) / 320.0
                 cy = (y + h / 2.0) / 240.0
                 gx = (0.5 - cx) * 2.0 if mirror else (cx - 0.5) * 2.0
                 gy = (0.5 - cy) * 2.0
-                gx = max(-1.0, min(1.0, gx * 1.4))   # widen: faces rarely reach the frame edge
-                gy = max(-1.0, min(1.0, gy * 1.4))
+                # Auto-calibrating center: cameras rarely sit dead-on, so her "front"
+                # is the slow average of where the face actually is; she reacts to
+                # DEVIATION from that. (Jelani stood dead center and read -0.41 raw.)
+                if base_x is None:
+                    base_x, base_y = gx, gy
+                else:
+                    k = min(1.0, interval / BASELINE_TAU)
+                    base_x += (gx - base_x) * k
+                    base_y += (gy - base_y) * k
+                gx = max(-1.0, min(1.0, (gx - base_x) * 2.0))
+                gy = max(-1.0, min(1.0, (gy - base_y) * 1.6))
                 ema_x = gx if ema_x is None else ema_x * 0.6 + gx * 0.4
                 ema_y = gy if ema_y is None else ema_y * 0.6 + gy * 0.4
                 last_face = time.time()
@@ -130,8 +151,19 @@ def main() -> int:
                     }])
                 except Exception:
                     pass  # server restarting; keep tracking
-            elif time.time() - last_face > 2.0:
-                ema_x = ema_y = None       # face gone: stop posting, she returns to idle
+            elif ema_x is not None and time.time() - last_face <= COAST_S:
+                # brief dropout (head turned / blur): coast on the last position
+                try:
+                    _post([{
+                        "type": "gaze.target",
+                        "data": {"x": round(ema_x, 3), "y": round(ema_y, 3), "hold_ms": HOLD_MS, "source": "camera"},
+                        "timestamp": time.time(),
+                        "source": "gaze-tracker",
+                    }])
+                except Exception:
+                    pass
+            elif time.time() - last_face > COAST_S:
+                ema_x = ema_y = None       # face truly gone: stop posting, she returns to idle
         except KeyboardInterrupt:
             return 0
         except Exception:
