@@ -266,7 +266,7 @@ function AvatarScene({ stateRef, ampRef, visemeRef, gazeRef, poseRef, gestureRef
           });
           headBone.current = hbFound;
           torsoBone.current = tbFound;
-          try { window.__avaBones = { bones: boneNames, head: !!hbFound, torso: !!tbFound, mesh: skinnedInfo || { skinned: false } }; } catch { /* debug */ }
+          try { window.__avaBones = { bones: boneNames, head: !!hbFound, torso: !!tbFound, mesh: skinnedInfo || { skinned: false } }; window.__avaTorsoBone = tbFound; window.__avaHeadBone = hbFound; } catch { /* debug */ }
           const s = 3.1 / h;
           gltf.scene.position.set(-center.x * s, -center.y * s, -center.z * s);
           gltf.scene.scale.setScalar(s);
