@@ -4,20 +4,26 @@ import * as THREE from 'three';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Core3D — AVA's persistent holographic head. Her GLB avatar (ava_head.glb,
-// generated from Jelani's photo via model3d_ops/Meshy) is loaded as the Stage
-// centerpiece with PROCEDURAL voice-driven animation:
-//   - the mouth/jaw region of the mesh deforms with her real tts.level amplitude
-//     (fast-attack / slow-release envelope + syllabic flutter) — amplitude lip
-//     MOTION, not phoneme visemes (the mesh has no rig / no blendshapes)
-//   - state-driven head motion (idle sway, thinking tilt, speaking nods, working
-//     tremor) + a state-colored fresnel rim + a speaking pulse ring
+// Core3D — AVA's persistent holographic head.
+// Primary avatar: ava_head_rigged.glb — her photo-derived Meshy head with 51
+// ARKit blendshapes (morph targets) added by the local deformation-transfer
+// pipeline in tools/blendshape-rig. When morphs are present the mouth, blinks
+// and expressions are driven through them:
+//   - jawOpen + mouth-shape morphs from her real tts.level amplitude
+//     (fast-attack / slow-release envelope + syllabic flutter + slow LFO shape
+//     mixing — amplitude visemes, not phoneme visemes: no phoneme stream yet)
+//   - autonomous eye blinks (eyeBlinkLeft/Right)
+//   - state expressions via brow/eye/mouth morphs (thinking, working, speaking)
+// Fallback chain: rigged GLB → plain ava_head.glb with the old PROCEDURAL jaw
+// mask (onBeforeCompile ellipsoid deform) → orb scene → CSS orb.
+// State-driven head motion (idle sway, thinking tilt, speaking nods, working
+// tremor) + state-colored fresnel rim + speaking pulse apply in both modes.
 // Perf budget: frameloop="demand" (self-invalidate ~30fps active / ~8fps idle),
-// DPR clamped [1,1.5], antialias off. Auto-degrade to the orb scene, then the
-// CSS orb, on sustained slow ACTIVE frames or a lost WebGL context. Idle frames
-// and hidden-tab throttling never count as slow (that false positive used to
-// kill the core after ~11s every session).
-// Live mouth tuning: window.__avaMouth = { y, z, r, s } (geometry-local).
+// DPR clamped [1,1.5], antialias off. Auto-degrade only on sustained slow
+// ACTIVE frames; idle frames and hidden-tab throttling never count as slow
+// (that false positive used to kill the core after ~11s every session).
+// Live mouth tuning (procedural mode): window.__avaMouth = { y, z, r, s }.
+// Debug: window.__avaCore, __avaJaw, __avaFrames, __avaAmpSeen, __avaMorphs.
 // ─────────────────────────────────────────────────────────────────────────────
 
 const STATE_COLORS = {
@@ -27,7 +33,23 @@ const STATE_COLORS = {
   working: ['#fb923c', '#f59e0b'],
 };
 
-const AVATAR_URL = '/avatar/ava_head.glb';
+// Tried in order; first that loads wins.
+const AVATAR_URLS = ['/avatar/ava_head_rigged.glb', '/avatar/ava_head.glb'];
+
+// Every expression morph the state machine touches — anything not set by the
+// current state decays back to 0 so states never leave residue on her face.
+const EXPR_KEYS = [
+  'browInnerUp', 'browDownLeft', 'browDownRight',
+  'eyeLookUpLeft', 'eyeLookUpRight', 'eyeSquintLeft', 'eyeSquintRight',
+  'mouthPressLeft', 'mouthPressRight', 'mouthSmileLeft', 'mouthSmileRight',
+];
+
+const STATE_EXPR = {
+  thinking: { browInnerUp: 0.4, eyeLookUpLeft: 0.35, eyeLookUpRight: 0.35, mouthPressLeft: 0.25, mouthPressRight: 0.25 },
+  working: { browDownLeft: 0.3, browDownRight: 0.3, eyeSquintLeft: 0.18, eyeSquintRight: 0.18 },
+  speaking: { mouthSmileLeft: 0.12, mouthSmileRight: 0.12, browInnerUp: 0.08 },
+  idle: { mouthSmileLeft: 0.06, mouthSmileRight: 0.06 },
+};
 
 const CORE_VERT = `
   varying vec2 vUv;
@@ -115,6 +137,8 @@ function AvatarScene({ stateRef, ampRef, onDegrade, onFail }) {
   const pulseMesh = useRef();
   const pulseMat = useRef();
   const [model, setModel] = useState(null);
+  const morph = useRef(null);            // { inf, dict } when the GLB has ARKit morphs
+  const blink = useRef({ next: 3, at: -1 });
   const jaw = useRef(0);
   const intensity = useRef(0);
   const slowFrames = useRef(0);
@@ -134,67 +158,85 @@ function AvatarScene({ stateRef, ampRef, onDegrade, onFail }) {
   useEffect(() => {
     let dead = false;
     const loader = new GLTFLoader();
-    loader.load(AVATAR_URL, (gltf) => {
+    const tryLoad = (i) => {
       if (dead) return;
-      try {
-        let mesh = null;
-        gltf.scene.traverse((o) => { if (!mesh && o.isMesh) mesh = o; });
-        if (!mesh) { onFail && onFail('no mesh in GLB'); return; }
-        mesh.geometry.computeBoundingBox();
-        const bb = mesh.geometry.boundingBox;
-        const size = new THREE.Vector3(); bb.getSize(size);
-        const center = new THREE.Vector3(); bb.getCenter(center);
-        const h = size.y || 1;
-        // Mouth region (geometry-local). Model is a bust, so the mouth sits high
-        // in the bbox. Tunable live via window.__avaMouth = {y,z,r,s}.
-        const ov = (typeof window !== 'undefined' && window.__avaMouth) || {};
-        uMouth.value.set(
-          ov.y !== undefined ? ov.y : bb.min.y + h * 0.62,
-          ov.z !== undefined ? ov.z : center.z + (size.z || 1) * 0.38,
-          ov.r !== undefined ? ov.r : h * 0.105,
-          ov.s !== undefined ? ov.s : h * 0.04
-        );
-        const mat = mesh.material;
-        mat.onBeforeCompile = (shader) => {
-          shader.uniforms.uJaw = uJaw;
-          shader.uniforms.uMouth = uMouth;
-          shader.vertexShader = `
-            uniform float uJaw;
-            uniform vec4 uMouth;
-          ` + shader.vertexShader.replace('#include <begin_vertex>', `
-            #include <begin_vertex>
-            {
-              vec3 mrel = (position - vec3(0.0, uMouth.x, uMouth.y)) * vec3(1.0, 1.55, 1.15);
-              float mMask = 1.0 - smoothstep(uMouth.z * 0.35, uMouth.z, length(mrel));
-              transformed.y -= uJaw * mMask * uMouth.w;
-              transformed.z -= uJaw * mMask * uMouth.w * 0.3;
-            }
-          `);
-        };
-        mat.needsUpdate = true;
-        const s = 3.1 / h;
-        gltf.scene.position.set(-center.x * s, -center.y * s, -center.z * s);
-        gltf.scene.scale.setScalar(s);
-        const shell = new THREE.Mesh(mesh.geometry, shellMaterial);
-        shell.position.copy(gltf.scene.position);
-        shell.scale.copy(gltf.scene.scale).multiplyScalar(1.015);
-        const holder = new THREE.Group();
-        holder.add(gltf.scene);
-        holder.add(shell);
-        try { window.__avaCore = { loaded: true, size: size.toArray(), scale: s, mouth: uMouth.value.toArray() }; } catch { /* debug */ }
-        setModel(holder);
-      } catch (e) {
-        console.warn('[Core3D] avatar prepare failed:', e);
-        try { window.__avaCore = { error: 'prepare: ' + e.message }; } catch { /* debug */ }
-        onFail && onFail(e.message);
-      }
-    }, undefined, (err) => {
-      if (!dead) {
-        console.warn('[Core3D] avatar load failed:', err);
-        try { window.__avaCore = { error: 'load: ' + String(err && err.message || err) }; } catch { /* debug */ }
-        onFail && onFail(String(err && err.message || err));
-      }
-    });
+      if (i >= AVATAR_URLS.length) { onFail && onFail('all avatar URLs failed'); return; }
+      loader.load(AVATAR_URLS[i], (gltf) => {
+        if (dead) return;
+        try {
+          let mesh = null;
+          gltf.scene.traverse((o) => { if (!mesh && o.isMesh) mesh = o; });
+          if (!mesh) { onFail && onFail('no mesh in GLB'); return; }
+          mesh.geometry.computeBoundingBox();
+          const bb = mesh.geometry.boundingBox;
+          const size = new THREE.Vector3(); bb.getSize(size);
+          const center = new THREE.Vector3(); bb.getCenter(center);
+          const h = size.y || 1;
+          const dict = mesh.morphTargetDictionary;
+          const hasMorphs = !!(dict && dict.jawOpen !== undefined && mesh.morphTargetInfluences);
+          if (hasMorphs) {
+            // ARKit blendshape mode — the morph driver in useFrame does the work.
+            morph.current = { inf: mesh.morphTargetInfluences, dict };
+          } else {
+            // Procedural fallback — inject the ellipsoid jaw mask into her material.
+            // Mouth region (geometry-local); bust proportions put it high in the
+            // bbox. Tunable live via window.__avaMouth = {y,z,r,s}.
+            const ov = (typeof window !== 'undefined' && window.__avaMouth) || {};
+            uMouth.value.set(
+              ov.y !== undefined ? ov.y : bb.min.y + h * 0.62,
+              ov.z !== undefined ? ov.z : center.z + (size.z || 1) * 0.38,
+              ov.r !== undefined ? ov.r : h * 0.105,
+              ov.s !== undefined ? ov.s : h * 0.04
+            );
+            const mat = mesh.material;
+            mat.onBeforeCompile = (shader) => {
+              shader.uniforms.uJaw = uJaw;
+              shader.uniforms.uMouth = uMouth;
+              shader.vertexShader = `
+                uniform float uJaw;
+                uniform vec4 uMouth;
+              ` + shader.vertexShader.replace('#include <begin_vertex>', `
+                #include <begin_vertex>
+                {
+                  vec3 mrel = (position - vec3(0.0, uMouth.x, uMouth.y)) * vec3(1.0, 1.55, 1.15);
+                  float mMask = 1.0 - smoothstep(uMouth.z * 0.35, uMouth.z, length(mrel));
+                  transformed.y -= uJaw * mMask * uMouth.w;
+                  transformed.z -= uJaw * mMask * uMouth.w * 0.3;
+                }
+              `);
+            };
+            mat.needsUpdate = true;
+          }
+          const s = 3.1 / h;
+          gltf.scene.position.set(-center.x * s, -center.y * s, -center.z * s);
+          gltf.scene.scale.setScalar(s);
+          const shell = new THREE.Mesh(mesh.geometry, shellMaterial);
+          shell.position.copy(gltf.scene.position);
+          shell.scale.copy(gltf.scene.scale).multiplyScalar(1.015);
+          const holder = new THREE.Group();
+          holder.add(gltf.scene);
+          holder.add(shell);
+          try {
+            window.__avaCore = {
+              loaded: true, url: AVATAR_URLS[i], size: size.toArray(), scale: s,
+              morphs: hasMorphs ? Object.keys(dict).length : 0,
+              mode: hasMorphs ? 'blendshapes' : 'procedural',
+            };
+          } catch { /* debug */ }
+          setModel(holder);
+        } catch (e) {
+          console.warn('[Core3D] avatar prepare failed:', e);
+          try { window.__avaCore = { error: 'prepare: ' + e.message }; } catch { /* debug */ }
+          onFail && onFail(e.message);
+        }
+      }, undefined, (err) => {
+        if (!dead) {
+          console.warn('[Core3D] avatar load failed:', AVATAR_URLS[i], err);
+          tryLoad(i + 1);
+        }
+      });
+    };
+    tryLoad(0);
     return () => { dead = true; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -219,6 +261,44 @@ function AvatarScene({ stateRef, ampRef, onDegrade, onFail }) {
     const flutter = 0.55 + 0.45 * Math.abs(Math.sin(time * 11.7) * Math.sin(time * 6.3));
     uJaw.value = jaw.current * flutter;
     try { window.__avaJaw = uJaw.value; window.__avaFrames = (window.__avaFrames || 0) + 1; window.__avaAmpSeen = ampRef.current | 0; } catch { /* debug */ }
+
+    // ── ARKit blendshape driver ──────────────────────────────────────────────
+    const m = morph.current;
+    if (m) {
+      const { inf, dict } = m;
+      const k = Math.min(delta * 12, 1);
+      const set = (name, v) => {
+        const i = dict[name];
+        if (i !== undefined) inf[i] += (v - inf[i]) * k;
+      };
+      // Mouth: amplitude drives jawOpen; a slow drifting LFO mixes the shape
+      // between open (jaw), rounded (funnel/pucker) and lip-parted so speech
+      // reads as articulation, not a flapping jaw. No phoneme stream yet.
+      const jawV = uJaw.value;
+      const shapeMix = 0.5 + 0.5 * Math.sin(time * 1.7 + Math.sin(time * 0.9) * 2.0);
+      set('jawOpen', jawV * 0.8);
+      set('mouthFunnel', jawV * 0.45 * shapeMix);
+      set('mouthPucker', jawV * 0.22 * (1 - shapeMix));
+      set('mouthLowerDownLeft', jawV * 0.3);
+      set('mouthLowerDownRight', jawV * 0.3);
+      set('mouthUpperUpLeft', jawV * 0.18);
+      set('mouthUpperUpRight', jawV * 0.18);
+      // Autonomous blinks (instant, not smoothed — real blinks are fast).
+      const b = blink.current;
+      if (b.at < 0 && time >= b.next) b.at = time;
+      let blinkV = 0;
+      if (b.at >= 0) {
+        const t = time - b.at;
+        blinkV = t < 0.1 ? t / 0.1 : t < 0.25 ? 1 - (t - 0.1) / 0.15 : 0;
+        if (t >= 0.25) { b.at = -1; b.next = time + 2 + Math.random() * 4; }
+      }
+      if (dict.eyeBlinkLeft !== undefined) inf[dict.eyeBlinkLeft] = blinkV;
+      if (dict.eyeBlinkRight !== undefined) inf[dict.eyeBlinkRight] = blinkV;
+      // State expressions; untouched keys decay to 0.
+      const expr = STATE_EXPR[s] || STATE_EXPR.idle;
+      for (let i = 0; i < EXPR_KEYS.length; i++) set(EXPR_KEYS[i], expr[EXPR_KEYS[i]] || 0);
+      try { window.__avaMorphs = { jaw: inf[dict.jawOpen], blink: blinkV, mode: s }; } catch { /* debug */ }
+    }
 
     if (headGroup.current) {
       const g = headGroup.current;
