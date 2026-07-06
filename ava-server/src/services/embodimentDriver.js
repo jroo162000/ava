@@ -1,69 +1,86 @@
-// embodimentDriver.js — AVA's autonomous body reflexes.
+// embodimentDriver.js — AVA's SELF-DIRECTED body impulses.
 //
-// Why: avatar_body gives her deliberate control, but most casual replies run
-// the conversational path (no tool calls), so her body sat still unless the
-// agent loop happened to engage. This layer makes the body live WITHOUT the
-// LLM in the loop: it listens to what she just said on the voice bus and fires
-// small gestures/expressions through the same avatar.* channels her tool uses.
+// Jelani: "she should be moving around as she pleases, not just when spoken
+// to — nothing about her movement should be hardcoded." So there are NO
+// heuristics and NO mappings here (the old reflex table is gone). On a loose
+// cadence while she isn't speaking, SHE is asked — one tiny, cheap LLM call —
+// how she wants to hold or move her body right now, and whatever <move>
+// directives she returns are executed through her normal body channel. She can
+// also answer "still" and not move at all. The only mechanical part is the
+// clock; every choice is hers.
 //
-// These are GENERAL presentation reflexes (punctuation classes, a small valence
-// lexicon, reply length) with randomness — not phrase-to-response mappings, and
-// they change nothing about what she says or does. Her deliberate avatar_body
-// calls always win (explicit pose outranks reflexes in Core3D's arbitration).
-// Revert wholesale with AVA_EMBODIMENT_AUTO=0.
+// AVA_EMBODIMENT_AUTO=0 disables. Cadence: AVA_BODY_IMPULSE_MIN/MAX seconds
+// (default 25-75). Skips while her voice is playing (her in-reply <move>
+// directives own that time) and fails silent on LLM/quota errors.
 
-import { onVoiceEvent, emitVoiceEvent } from './voiceBus.js';
+import llm from './llm.js';
+import avatarBody from './avatarBody.js';
+import { onVoiceEvent } from './voiceBus.js';
 import logger from '../utils/logger.js';
 
-const POSITIVE = /\b(great|love|nice|awesome|glad|perfect|happy|excellent|wonderful|beautiful|success|done|works|working now|got it|fixed)\b/i;
-const NEGATION = /\b(no|not|can't|cannot|won't|don't|never|unfortunately|failed|error|problem|sorry)\b/i;
+const SYSTEM = [
+  'You are AVA. You have a real, physical avatar body on the Stage — your photoreal head and',
+  'shoulders. Full-range head movement, eyes that look anywhere, dozens of facial expressions,',
+  'gestures (nod, shake, tilt, lean_in, look_away). This is a quiet moment between conversations:',
+  'how do you want to hold or move your body right now? It is YOUR body and YOUR mood — maybe you',
+  'glance around, settle your gaze somewhere, let an expression sit on your face, stretch your',
+  'neck, or just be still.',
+  '',
+  'Reply with ONLY 1-3 movement directives, or the single word: still',
+  'Directive forms (JSON inside <move> tags):',
+  '<move>{"look":[x,y]}</move>            x,y in -1..1 (where to aim eyes+head)',
+  '<move>{"head":{"yaw":0.3,"pitch":-0.1,"roll":0.05},"hold":10}</move>',
+  '<move>{"gesture":"tilt"}</move>        nod|shake|tilt|lean_in|look_away',
+  '<move>{"express":{"mouthSmileLeft":0.5,"mouthSmileRight":0.5},"hold":12}</move>',
+  '<move>{"release":true}</move>          let your body go back to its own idle drift',
+  'No prose, no explanation — directives or "still" only.',
+].join('\n');
 
-let started = false;
-const chance = (p) => Math.random() < p;
+let running = false;
+let lastSpeech = 0;
+let lastGaze = 0;
 
-function react(text) {
-  const t = String(text || '').slice(0, 400);
-  if (!t) return;
-  const question = t.includes('?');
-  const exclaim = t.includes('!');
-  const positive = POSITIVE.test(t);
-  const negation = NEGATION.test(t.slice(0, 120));   // opening stance, not any late clause
+function delayMs() {
+  const lo = Math.max(10, parseInt(process.env.AVA_BODY_IMPULSE_MIN || '25', 10) || 25);
+  const hi = Math.max(lo + 5, parseInt(process.env.AVA_BODY_IMPULSE_MAX || '75', 10) || 75);
+  return (lo + Math.random() * (hi - lo)) * 1000;
+}
 
-  // At most one gesture per reply, randomized so she reads alive, not scripted.
-  if (negation && chance(0.6)) emitVoiceEvent('avatar.gesture', { name: 'shake' }, 'embodiment');
-  else if (question && chance(0.5)) emitVoiceEvent('avatar.gesture', { name: 'tilt' }, 'embodiment');
-  else if (t.length > 220 && chance(0.4)) emitVoiceEvent('avatar.gesture', { name: 'lean_in' }, 'embodiment');
-  else if (positive && chance(0.45)) emitVoiceEvent('avatar.gesture', { name: 'nod' }, 'embodiment');
-
-  // At most one expression per reply.
-  if (positive && chance(0.7)) {
-    emitVoiceEvent('avatar.expression', {
-      morphs: { mouthSmileLeft: 0.55, mouthSmileRight: 0.55, cheekSquintLeft: 0.2, cheekSquintRight: 0.2 },
-      hold_ms: 4000,
-    }, 'embodiment');
-  } else if (exclaim && chance(0.5)) {
-    emitVoiceEvent('avatar.expression', {
-      morphs: { browInnerUp: 0.45, eyeWideLeft: 0.3, eyeWideRight: 0.3 },
-      hold_ms: 2500,
-    }, 'embodiment');
-  }
+async function tick() {
+  try {
+    if (Date.now() - lastSpeech > 3000) {
+      const present = Date.now() - lastGaze < 5000;
+      const ctx = `${present ? 'Jelani IS on camera right now (your eyes are already tracking him).' : 'Nobody is on camera right now.'} Local time ${new Date().toLocaleTimeString()}.`;
+      const r = await llm.chat([
+        { role: 'system', content: SYSTEM },
+        { role: 'user', content: ctx },
+      ], { max_tokens: 150, temperature: 1.0 });
+      const text = (r && (r.text || r.content)) || '';
+      if (text.includes('<move>')) {
+        avatarBody.extractAndApply(text);
+        logger.debug('[embodiment] body impulse applied');
+      }
+    }
+  } catch { /* optional behavior: quota/provider failures stay silent */ }
+  setTimeout(tick, delayMs());
 }
 
 function start() {
-  if (started) return;
-  started = true;
+  if (running) return;
+  running = true;
   if (process.env.AVA_EMBODIMENT_AUTO === '0') {
-    logger.info('[embodiment] autonomous body reflexes DISABLED (AVA_EMBODIMENT_AUTO=0)');
+    logger.info('[embodiment] self-directed body impulses DISABLED (AVA_EMBODIMENT_AUTO=0)');
     return;
   }
   onVoiceEvent((ev) => {
     try {
-      if (!ev || ev.type !== 'assistant.final') return;
-      const d = ev.data || {};
-      react(d.text || d.content || d.output_text || '');
-    } catch { /* reflexes must never break the bus */ }
+      if (!ev) return;
+      if (ev.type === 'tts.level' && ((ev.data || {}).rms | 0) > 500) lastSpeech = Date.now();
+      else if (ev.type === 'gaze.target' && (ev.data || {}).source === 'camera') lastGaze = Date.now();
+    } catch { /* never break the bus */ }
   });
-  logger.info('[embodiment] autonomous body reflexes ON (AVA_EMBODIMENT_AUTO=0 reverts)');
+  setTimeout(tick, 15000);
+  logger.info('[embodiment] self-directed body impulses ON (AVA_EMBODIMENT_AUTO=0 disables)');
 }
 
 export default { start };

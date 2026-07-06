@@ -24,6 +24,7 @@ import { shapeSpokenReply, normalizeSpokenReplyBudget, normalizeMoltbookMentions
 import trainingCollector from '../services/trainingCollector.js';  // capture conv-path corrections as DPO data
 import { isSelfSnapshotRequest, isManualProposalRequest, createSelfSnapshot, handleSelfModVoice } from '../services/selfModVoice.js';
 import { emitVoiceEvent } from '../services/voiceBus.js';  // Tier 2 #15: assistant.delta to the UI
+import avatarBody from '../services/avatarBody.js';  // native <move> body directives: strip here, execute at the logger
 import { markDuplicateTurn, buildSelfStatus } from './api.js';
 
 function isSelfDescriptionRequest(text = '') {
@@ -396,7 +397,20 @@ function _stripToolSyntax(s) {
 }
 
 // Realtime compatibility: route text/messages to Agent Loop with memory/tools
-router.post('/respond', respondHandler);
+// Blocking /respond: strip her <move> body directives from the outgoing payload
+// (they execute at the conversationLogger choke point; the runner and UI must
+// never see or speak the tags).
+router.post('/respond', (req, res) => {
+  const _json = res.json.bind(res);
+  res.json = (payload) => {
+    try {
+      if (payload && typeof payload.output_text === 'string') payload.output_text = avatarBody.strip(payload.output_text);
+      if (payload && typeof payload.display_text === 'string') payload.display_text = avatarBody.strip(payload.display_text);
+    } catch { /* never block the reply on body-channel cleanup */ }
+    return _json(payload);
+  };
+  return respondHandler(req, res);
+});
 
 async function respondHandler(req, res) {
   try {
@@ -1348,23 +1362,43 @@ router.post('/respond/stream', async (req, res) => {
   // quote/paren) followed by whitespace, or at a newline; require >=12 chars so fragments like
   // "Dr." or list numbers don't fire alone. force=true flushes whatever remains.
   const flushSentences = (force = false) => {
+    // Complete <move> directives are stripped (they EXECUTE at the logger, not
+    // here); an unfinished tag holds back flushing so a directive split across
+    // deltas never leaks into TTS.
+    buf = avatarBody.strip(buf);
+    const safe = avatarBody.safeLength(buf);
+    let head = buf.slice(0, safe);
+    const tail = buf.slice(safe);
     for (;;) {
-      const m = buf.match(/^([\s\S]{12,}?[.!?…][)"'’”]*)\s+([\s\S]*)$/);
-      if (m) { emitSentence(m[1]); buf = m[2]; continue; }
-      const nl = buf.indexOf('\n');
-      if (nl >= 12) { emitSentence(buf.slice(0, nl)); buf = buf.slice(nl + 1); continue; }
+      const m = head.match(/^([\s\S]{12,}?[.!?…][)"'’”]*)\s+([\s\S]*)$/);
+      if (m) { emitSentence(m[1]); head = m[2]; continue; }
+      const nl = head.indexOf('\n');
+      if (nl >= 12) { emitSentence(head.slice(0, nl)); head = head.slice(nl + 1); continue; }
       break;
     }
-    if (force && buf.trim()) { emitSentence(buf); buf = ''; }
+    if (force) {
+      if (head.trim()) emitSentence(head);
+      buf = '';           // a tag never closed by stream end is dropped, not spoken
+    } else {
+      buf = head + tail;
+    }
   };
 
+  let uiPending = '';
+  const flushUi = (force = false) => {
+    uiPending = avatarBody.strip(uiPending);
+    const safe = avatarBody.safeLength(uiPending);
+    const out = uiPending.slice(0, safe);
+    uiPending = force ? '' : uiPending.slice(safe);
+    if (out) { try { emitVoiceEvent('assistant.delta', { text: out }, 'stream'); } catch { /* ui push is best-effort */ } }
+  };
   req._streamDelta = (piece) => {
     buf += String(piece || '');
     buf = scrub(buf);   // remove the sentinel wherever it lands, before anything can be flushed
     // Tier 2 #15 / #11 UI leg: mirror the scrubbed delta so the reply types into the web client
-    // live. assistant.final still closes the bubble.
-    const cleanPiece = scrub(piece);
-    if (cleanPiece) { try { emitVoiceEvent('assistant.delta', { text: cleanPiece }, 'stream'); } catch { /* ui push is best-effort */ } }
+    // live — buffered through the same <move> stripper so directives never type on screen.
+    uiPending += scrub(piece);
+    flushUi(false);
     flushSentences(false);
   };
 
@@ -1388,7 +1422,12 @@ router.post('/respond/stream', async (req, res) => {
   // buffer; the runner speaks streamed sentences and only falls back to done.output_text when
   // nothing was streamed.
   flushSentences(true);
+  flushUi(true);
   const payload = captured._payload || { ok: false, error: 'no response produced' };
+  try {
+    if (typeof payload.output_text === 'string') payload.output_text = avatarBody.strip(payload.output_text);
+    if (typeof payload.display_text === 'string') payload.display_text = avatarBody.strip(payload.display_text);
+  } catch { /* cleanup only */ }
   send('done', { ...payload, streamed_sentences: sentencesSent, http_status: captured._status });
   try { res.end(); } catch { /* ignore */ }
 });

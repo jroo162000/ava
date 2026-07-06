@@ -4,6 +4,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import logger from '../utils/logger.js';
 import { emitVoiceEvent } from './voiceBus.js';
+import avatarBody from './avatarBody.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -95,7 +96,13 @@ class ConversationLogger {
   }
 
   logAssistantMessage(content, metadata = {}) {
-    return this.logMessage('assistant', content, {
+    // Native embodiment: execute her inline <move>{...}</move> body directives
+    // and strip them from the text. This is the ONE place they execute (every
+    // reply path logs through here exactly once); the stream route strips
+    // without executing so nothing double-fires and no tag is ever spoken.
+    let clean = content;
+    try { clean = avatarBody.extractAndApply(content); } catch { /* keep original */ }
+    return this.logMessage('assistant', clean, {
       ...metadata,
       model: metadata.model || 'unknown',
       responseTime: metadata.responseTime || null,
