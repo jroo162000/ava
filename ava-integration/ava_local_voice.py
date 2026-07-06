@@ -890,7 +890,20 @@ class LocalVoiceRunner:
         def _build_piper():
             return PiperBinTTS(exe_path=exe, model_path=model)
 
-        # Primary: ElevenLabs cloned voice, when fully configured.
+        # Primary: local Kokoro-82M (TRUE per-phoneme viseme timing + natural voice).
+        # Heavy deps (torch); first run downloads the model - scripts/kokoro_warmup.py
+        # pre-warms. Revert wholesale with AVA_TTS_KOKORO=0 (falls through to the
+        # ElevenLabs/Piper chain below unchanged).
+        if os.environ.get("AVA_TTS_KOKORO", "1").strip().lower() not in {"0", "false", "no", "off"}:
+            try:
+                from voice.tts.kokoro_tts import KokoroTTS
+                tts = KokoroTTS()
+                _log(f"tts=kokoro voice={tts.voice}")
+                return tts
+            except Exception as exc:  # noqa: BLE001
+                _log(f"tts_kokoro_failed={exc}; falling back")
+
+        # Fallback: ElevenLabs cloned voice, when fully configured.
         if el_ready:
             try:
                 tts = _build_el()
@@ -1623,6 +1636,23 @@ class LocalVoiceRunner:
             except Exception:
                 pass
 
+    def _emit_visemes_native(self, events, total_ms) -> None:
+        """Engine-measured timeline (Kokoro pred_dur): exact per-phoneme times.
+        Called by the engine after synthesis, before the first audio frame -
+        no estimation, no calibration."""
+        if not self._visemes_enabled() or not events or total_ms <= 0:
+            return
+        try:
+            self._viseme_chunk += 1
+            if self._event_sender is None:
+                self._event_sender = _EventSender(self.config)
+            self._event_sender.push("tts.visemes", {
+                "chunk": self._viseme_chunk, "est_ms": int(total_ms),
+                "v": [[int(t), int(v)] for t, v in events], "exact": True,
+            })
+        except Exception:
+            pass
+
     def _speak(self, text: str) -> None:
         self.last_spoken_text = text or ""
         if not text or self.tts is None:
@@ -1639,7 +1669,8 @@ class LocalVoiceRunner:
             # frame boundary here, injecting a discontinuity ~10x/sec that sounds choppy. The
             # state list resets per utterance (each _speak call), so utterances stay independent.
             rs_state = [None]
-            _vchunk, _vest = self._emit_visemes(spoken)
+            _native = bool(getattr(self.tts, "supports_visemes", False))
+            _vchunk, _vest = (0, 0) if _native else self._emit_visemes(spoken)
             _vframes = [0]
 
             def on_chunk(pcm: bytes) -> None:
@@ -1655,8 +1686,11 @@ class LocalVoiceRunner:
                     out, rs_state[0] = audioop.ratecv(pcm, SAMPLE_WIDTH, CHANNELS, source_rate, playback_rate, rs_state[0])
                 self.output_stream.write(out)
 
-            self.tts.speak(spoken, on_chunk, frame_ms=100)
-            self._calibrate_visemes(_vest, _vframes[0])
+            if _native:
+                self.tts.speak(spoken, on_chunk, frame_ms=100, on_timeline=self._emit_visemes_native)
+            else:
+                self.tts.speak(spoken, on_chunk, frame_ms=100)
+                self._calibrate_visemes(_vest, _vframes[0])
             self._emit_tts_level(0)  # settle the core immediately at utterance end
             _log("state=COOLDOWN")
             time.sleep(0.35)
@@ -1695,7 +1729,8 @@ class LocalVoiceRunner:
         source_rate = int(getattr(self.tts, "current_sample_rate", playback_rate) or playback_rate)
         _log(f"state=SPEAKING chunk={spoken[:80]!r}")
         rs_state = [None]
-        _vchunk, _vest = self._emit_visemes(spoken)
+        _native = bool(getattr(self.tts, "supports_visemes", False))
+        _vchunk, _vest = (0, 0) if _native else self._emit_visemes(spoken)
         _vframes = [0]
 
         def on_chunk(pcm: bytes) -> None:
@@ -1713,8 +1748,11 @@ class LocalVoiceRunner:
                 )
             self.output_stream.write(out)
 
-        self.tts.speak(spoken, on_chunk, frame_ms=100)
-        self._calibrate_visemes(_vest, _vframes[0])
+        if _native:
+            self.tts.speak(spoken, on_chunk, frame_ms=100, on_timeline=self._emit_visemes_native)
+        else:
+            self.tts.speak(spoken, on_chunk, frame_ms=100)
+            self._calibrate_visemes(_vest, _vframes[0])
         self._emit_tts_level(0)  # settle the core between sentence chunks / at end
 
     def _barge_monitor(

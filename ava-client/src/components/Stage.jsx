@@ -135,6 +135,12 @@ function usePanelDock() {
   const togglePin = useCallback((id) => setCards(prev => prev.map(c => (c.id === id ? { ...c, pinned: !c.pinned } : c))), []);
   // sweep: resolved unpinned cards auto-dismiss after their TTL
   useEffect(() => {
+    // Manual/local gaze feed: window.__avaGaze(x, y) from any script or console.
+    window.__avaGaze = (x, y) => { gazeRef.current = { x: +x || 0, y: +y || 0, at: performance.now() }; };
+    return () => { try { delete window.__avaGaze; } catch { /* noop */ } };
+  }, []);
+
+  useEffect(() => {
     const t = setInterval(() => {
       const now = Date.now();
       setCards(prev => {
@@ -223,6 +229,7 @@ export default function Stage() {
   const ampDecay = useRef(null);
   const ampRef = useRef(0);                          // #17b: ref mirror for the 3D core (no re-render churn)
   const visemeRef = useRef(null);                    // phoneme-class viseme timeline for the core's mouth
+  const gazeRef = useRef(null);                      // {x,y,at} gaze target: eyes lead, head follows
   const stateRef = useRef('idle');
   const [degraded3d, setDegraded3d] = useState(false); // #17b: auto-degrade -> CSS orb
   const [vitals, setVitals] = useState(null);        // #18: sys.stats machine vitals
@@ -289,6 +296,14 @@ export default function Stage() {
           if (d.state === 'working.start') core.onWorking(true, d.goal);
           else if (d.state === 'working.end') core.onWorking(false);
           break;
+        case 'gaze.target': {
+          // Eye/head tracking feed (Jelani's tracker posts x,y in [-1,1]).
+          const gd = ev.data || {};
+          if (Number.isFinite(+gd.x) && Number.isFinite(+gd.y)) {
+            gazeRef.current = { x: +gd.x, y: +gd.y, at: performance.now() };
+          }
+          break;
+        }
         case 'tts.visemes': {
           // Timeline for the NEXT audible chunk; clock starts on first audible tts.level.
           const d = ev.data || {};
@@ -557,7 +572,7 @@ export default function Stage() {
         {degraded3d ? cssCore : (
           <div className={`st-core3d ${attention ? 'attention' : ''}`}>
             <Suspense fallback={cssCore}>
-              <Core3D stateRef={stateRef} ampRef={ampRef} visemeRef={visemeRef} onDegrade={(why) => { console.warn('[stage] 3D core degraded:', why); setDegraded3d(true); }} />
+              <Core3D stateRef={stateRef} ampRef={ampRef} visemeRef={visemeRef} gazeRef={gazeRef} onDegrade={(why) => { console.warn('[stage] 3D core degraded:', why); setDegraded3d(true); }} />
             </Suspense>
           </div>
         )}

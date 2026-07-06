@@ -49,7 +49,7 @@ function broadcastEvent(event) {
 // Tier 3 #17: high-frequency transient telemetry (speech amplitude for the UI core) is
 // broadcast-only — storing it would flood the debug buffer AND get replayed to clients by
 // the reconnect backlog, which is wrong for realtime-only signals.
-const TRANSIENT_TYPES = new Set(['tts.level', 'tts.visemes', 'sys.stats']);
+const TRANSIENT_TYPES = new Set(['tts.level', 'tts.visemes', 'gaze.target', 'sys.stats']);
 
 /**
  * Store event in circular buffer

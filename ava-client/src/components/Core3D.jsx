@@ -19,8 +19,10 @@ import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 //   - state expressions via brow/eye/mouth morphs (thinking, working, speaking)
 // Fallback chain: rigged GLB → plain ava_head.glb with the old PROCEDURAL jaw
 // mask (onBeforeCompile ellipsoid deform) → orb scene → CSS orb.
-// State-driven head motion (idle sway, thinking tilt, speaking nods, working
-// tremor) + state-colored fresnel rim + speaking pulse apply in both modes.
+// Head: full-range rotation via the neck bone in ava_head_rig2.glb (idle
+// wander, thinking tilt, gaze tracking through window.__avaGaze(x,y) or the
+// gaze.target WS event; eyes lead via eyeLook* morphs, head follows). No
+// voice-driven jitter and no orbit rings - removed 2026-07-05 per Jelani.
 // Perf budget: frameloop="demand" (self-invalidate ~30fps active / ~8fps idle),
 // DPR clamped [1,1.5], antialias off. Auto-degrade only on sustained slow
 // ACTIVE frames; idle frames and hidden-tab throttling never count as slow
@@ -37,7 +39,7 @@ const STATE_COLORS = {
 };
 
 // Tried in order; first that loads wins.
-const AVATAR_URLS = ['/avatar/ava_head_rigged.glb', '/avatar/ava_head.glb'];
+const AVATAR_URLS = ['/avatar/ava_head_rig2.glb', '/avatar/ava_head_rigged.glb', '/avatar/ava_head.glb'];
 
 // Every expression morph the state machine touches — anything not set by the
 // current state decays back to 0 so states never leave residue on her face.
@@ -165,11 +167,10 @@ function useDemandLoop(stateRef, ampRef, paceRef) {
 }
 
 // ── AVATAR SCENE — her head as the persistent hologram ──────────────────────
-function AvatarScene({ stateRef, ampRef, visemeRef, onDegrade, onFail }) {
+function AvatarScene({ stateRef, ampRef, visemeRef, gazeRef, onDegrade, onFail }) {
   const headGroup = useRef();
   const bobRef = useRef();
-  const ring1 = useRef();
-  const ring2 = useRef();
+  const headBone = useRef(null);         // neck joint in ava_head_rig2.glb
   const pulseMesh = useRef();
   const pulseMat = useRef();
   const [model, setModel] = useState(null);
@@ -243,6 +244,9 @@ function AvatarScene({ stateRef, ampRef, visemeRef, onDegrade, onFail }) {
             };
             mat.needsUpdate = true;
           }
+          let hbFound = null;
+          gltf.scene.traverse((o) => { if (o.isBone && o.name === 'Head') hbFound = o; });
+          headBone.current = hbFound;
           const s = 3.1 / h;
           gltf.scene.position.set(-center.x * s, -center.y * s, -center.z * s);
           gltf.scene.scale.setScalar(s);
@@ -321,8 +325,26 @@ function AvatarScene({ stateRef, ampRef, visemeRef, onDegrade, onFail }) {
           const ev = vt.v;
           let cur = 0;
           while (cur + 1 < ev.length && ev[cur + 1][0] <= tMs) cur++;
-          vshape = VISEME_SHAPES[ev[cur][1]] || null;
-          vt.name = VISEME_NAMES[ev[cur][1]] || '?';
+          let idx = ev[cur][1];
+          // a sil shorter than 90ms between shapes reads as flicker - hold through it
+          if (idx === 0 && cur > 0 && cur + 1 < ev.length && (ev[cur + 1][0] - ev[cur][0]) < 90) idx = ev[cur - 1][1];
+          vshape = VISEME_SHAPES[idx] || null;
+          // coarticulation: pre-blend the next shape over its last 60ms of lead-in
+          if (vshape && cur + 1 < ev.length) {
+            const nxt = ev[cur + 1];
+            const lead = nxt[0] - tMs;
+            if (lead >= 0 && lead < 60 && nxt[1] !== idx) {
+              const nb = VISEME_SHAPES[nxt[1]] || {};
+              const f = (1 - lead / 60) * 0.5;
+              const mix = {};
+              for (let i = 0; i < MOUTH_KEYS.length; i++) {
+                const mk = MOUTH_KEYS[i];
+                mix[mk] = (vshape[mk] || 0) * (1 - f) + (nb[mk] || 0) * f;
+              }
+              vshape = mix;
+            }
+          }
+          vt.name = VISEME_NAMES[idx] || '?';
         } else if (jawV < 0.02) {
           visemeRef.current = null;    // exhausted and mouth settled — release
         }
@@ -356,39 +378,56 @@ function AvatarScene({ stateRef, ampRef, visemeRef, onDegrade, onFail }) {
       }
       if (dict.eyeBlinkLeft !== undefined) inf[dict.eyeBlinkLeft] = blinkV;
       if (dict.eyeBlinkRight !== undefined) inf[dict.eyeBlinkRight] = blinkV;
+      // Gaze -> eyes (eyes lead fully; the head bone follows at ~60% above).
+      const gzE = gazeRef ? gazeRef.current : null;
+      const gzFresh = gzE && (performance.now() - gzE.at) < 3000;
+      const gx = gzFresh ? Math.max(-1, Math.min(1, gzE.x)) : 0;
+      const gy = gzFresh ? Math.max(-1, Math.min(1, gzE.y)) : 0;
+      set('eyeLookOutRight', Math.max(gx, 0)); set('eyeLookInLeft', Math.max(gx, 0));
+      set('eyeLookOutLeft', Math.max(-gx, 0)); set('eyeLookInRight', Math.max(-gx, 0));
+      set('eyeLookUpLeft', Math.max(gy, 0)); set('eyeLookUpRight', Math.max(gy, 0));
+      set('eyeLookDownLeft', Math.max(-gy, 0)); set('eyeLookDownRight', Math.max(-gy, 0));
       // State expressions; untouched keys decay to 0.
       const expr = STATE_EXPR[s] || STATE_EXPR.idle;
       for (let i = 0; i < EXPR_KEYS.length; i++) set(EXPR_KEYS[i], expr[EXPR_KEYS[i]] || 0);
       try { window.__avaMorphs = { jaw: inf[dict.jawOpen], blink: blinkV, mode: s, viseme: vshape ? vt.name : null, chunk: vt ? vt.chunk : 0 }; } catch { /* debug */ }
     }
 
-    if (headGroup.current) {
+    // Head. Full range through the neck bone when the rig has one; gentle
+    // whole-group sway as fallback. NO voice-coupled jitter in either path.
+    const gz = gazeRef ? gazeRef.current : null;
+    const gzOn = gz && (performance.now() - gz.at) < 3000;
+    const hb = headBone.current;
+    if (hb) {
+      let ty, tp, tr = 0;
+      if (gzOn) {
+        ty = Math.max(-1, Math.min(1, gz.x)) * 0.55;
+        tp = Math.max(-1, Math.min(1, -gz.y)) * 0.35;
+      } else {
+        ty = Math.sin(time * 0.13) * 0.28 + Math.sin(time * 0.047) * 0.12;
+        tp = Math.sin(time * 0.11 + 1.7) * 0.08;
+        if (s === 'thinking') { tr = 0.12; tp -= 0.10; ty = Math.sin(time * 0.3) * 0.18; }
+        if (s === 'speaking') { tp += Math.sin(time * 0.6) * 0.05; }
+      }
+      const hk = Math.min(delta * (gzOn ? 7 : 2.2), 1);
+      hb.rotation.y = THREE.MathUtils.lerp(hb.rotation.y, ty, hk);
+      hb.rotation.x = THREE.MathUtils.lerp(hb.rotation.x, tp, hk);
+      hb.rotation.z = THREE.MathUtils.lerp(hb.rotation.z, tr, Math.min(delta * 2, 1));
+      try { window.__avaHead = { yaw: +hb.rotation.y.toFixed(3), pitch: +hb.rotation.x.toFixed(3), roll: +hb.rotation.z.toFixed(3), gaze: gzOn ? [gz.x, gz.y] : null }; } catch { /* debug */ }
+    } else if (headGroup.current) {
       const g = headGroup.current;
-      let rx = Math.sin(time * 0.35) * 0.02;
-      let ry = Math.sin(time * 0.45) * 0.07;
-      let rz = 0;
-      if (s === 'thinking') { rz = 0.09; rx -= 0.05; ry = Math.sin(time * 0.8) * 0.1; }
-      if (s === 'speaking') { rx += uJaw.value * 0.045 * Math.sin(time * 9.0); ry += Math.sin(time * 1.2) * 0.03; }
-      if (s === 'working') { ry += Math.sin(time * 14.0) * 0.008; }
+      const rx = Math.sin(time * 0.35) * 0.02;
+      const ry = Math.sin(time * 0.45) * 0.07;
+      const rz = s === 'thinking' ? 0.09 : 0;
       g.rotation.x = THREE.MathUtils.lerp(g.rotation.x, rx, Math.min(delta * 6, 1));
       g.rotation.y = THREE.MathUtils.lerp(g.rotation.y, ry, Math.min(delta * 6, 1));
       g.rotation.z = THREE.MathUtils.lerp(g.rotation.z, rz, Math.min(delta * 4, 1));
     }
-    if (bobRef.current) bobRef.current.position.y = Math.sin(time * (1 + intensity.current)) * 0.06;
+    if (bobRef.current) bobRef.current.position.y = Math.sin(time * 0.9) * 0.05;
 
     const [a, b] = STATE_COLORS[s] || STATE_COLORS.idle;
     colA.set(a); colB.set(b);
     shellMaterial.uniforms.color.value.copy(colA).lerp(colB, 0.5);
-    const speedMult = 1.0 + intensity.current * 3.0;
-    if (ring1.current) {
-      ring1.current.rotation.x += delta * 0.5 * speedMult;
-      ring1.current.rotation.y += delta * 0.3 * speedMult;
-      ring1.current.material.opacity = 0.4 + intensity.current * 0.5;
-    }
-    if (ring2.current) {
-      ring2.current.rotation.y -= delta * 0.4 * speedMult;
-      ring2.current.rotation.z += delta * 0.6 * speedMult;
-    }
     if (pulseMesh.current && pulseMat.current) {
       if (amp > 0.02) {
         const scale = 1 + ((time * 2) % 1.5);
@@ -412,14 +451,6 @@ function AvatarScene({ stateRef, ampRef, visemeRef, onDegrade, onFail }) {
       <group ref={headGroup}>
         {model ? <primitive object={model} /> : null}
       </group>
-      <mesh ref={ring1} rotation={[Math.PI / 2, 0, 0]} position={[0, -1.35, 0]}>
-        <torusGeometry args={[2.2, 0.02, 12, 64]} />
-        <meshBasicMaterial color="#0088ff" transparent opacity={0.5} blending={THREE.AdditiveBlending} depthWrite={false} />
-      </mesh>
-      <mesh ref={ring2} rotation={[Math.PI / 2.2, 0.2, 0]} position={[0, -1.5, 0]}>
-        <torusGeometry args={[2.6, 0.015, 12, 64]} />
-        <meshBasicMaterial color="#22d3ee" transparent opacity={0.35} blending={THREE.AdditiveBlending} depthWrite={false} />
-      </mesh>
     </group>
   );
 }
@@ -524,7 +555,7 @@ function CoreScene({ stateRef, ampRef, onDegrade }) {
   );
 }
 
-export default function Core3D({ stateRef, ampRef, visemeRef, onDegrade }) {
+export default function Core3D({ stateRef, ampRef, visemeRef, gazeRef, onDegrade }) {
   const [dead, setDead] = useState(false);
   const [avatarOk, setAvatarOk] = useState(true);
   if (dead) return null;   // Stage renders the CSS orb when we bail
@@ -541,7 +572,7 @@ export default function Core3D({ stateRef, ampRef, visemeRef, onDegrade }) {
       fallback={null}
     >
       {avatarOk
-        ? <AvatarScene stateRef={stateRef} ampRef={ampRef} visemeRef={visemeRef} onFail={() => setAvatarOk(false)} onDegrade={(why) => { setDead(true); onDegrade && onDegrade(why); }} />
+        ? <AvatarScene stateRef={stateRef} ampRef={ampRef} visemeRef={visemeRef} gazeRef={gazeRef} onFail={() => setAvatarOk(false)} onDegrade={(why) => { setDead(true); onDegrade && onDegrade(why); }} />
         : <CoreScene stateRef={stateRef} ampRef={ampRef} onDegrade={(why) => { setDead(true); onDegrade && onDegrade(why); }} />}
     </Canvas>
   );
