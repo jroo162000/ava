@@ -469,9 +469,9 @@ function AvatarScene({ stateRef, ampRef, visemeRef, gazeRef, poseRef, gestureRef
       const tOn = tv && performance.now() < tv.until;
       // Visible body life: breath + a slow weight-shift sway. (First cut was
       // 0.012 rad — sub-pixel at Stage size; "the torso is still frozen".)
-      const breath = Math.sin(time * 0.85) * 0.02;
-      const sway = Math.sin(time * 0.09) * 0.06 + Math.sin(time * 0.031) * 0.03;
-      const shoulder = Math.sin(time * 0.13 + 0.8) * 0.018;
+      const breath = Math.sin(time * 0.85) * 0.03;
+      const sway = Math.sin(time * 0.09) * 0.10 + Math.sin(time * 0.031) * 0.04;
+      const shoulder = Math.sin(time * 0.13 + 0.8) * 0.025;
       const tx = (tOn ? tv.pitch : 0) + lean + breath;
       const tyw = (tOn ? tv.yaw : sway);
       const trl = tOn ? tv.roll : shoulder;
