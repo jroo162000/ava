@@ -1,11 +1,16 @@
 // Tiny in-memory queue of short spoken announcements the voice runner pulls and speaks aloud
 // (e.g., "I've queued a code change for your review"). Shared by the server (push) and the
 // /voice/announcements route (drain). Bounded so it can never grow unbounded.
+import avatarBody from './avatarBody.js';
+
 const _q = [];
 const MAX = 20;
 
 export function pushAnnouncement(text) {
-  const t = String(text || '').trim();
+  // Native embodiment: announcements are her words too — execute + strip any
+  // inline <move> directives so the runner never speaks a raw tag.
+  let t = String(text || '').trim();
+  try { t = avatarBody.extractAndApply(t).trim(); } catch { /* keep original */ }
   if (!t) return;
   _q.push(t);
   while (_q.length > MAX) _q.shift();

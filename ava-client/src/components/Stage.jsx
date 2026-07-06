@@ -300,10 +300,14 @@ export default function Stage() {
           break;
         case 'gaze.target': {
           // Eye/head tracking feed: the camera tracker (~8Hz) or her own
-          // avatar_body 'look'. hold_ms controls how long before idle resumes.
+          // deliberate 'look' (avatar_body tool / inline <move>). HER look wins:
+          // the camera may not overwrite it until its hold window expires.
           const gd = ev.data || {};
           if (Number.isFinite(+gd.x) && Number.isFinite(+gd.y)) {
-            gazeRef.current = { x: +gd.x, y: +gd.y, at: performance.now(), hold: (gd.hold_ms | 0) || 3000 };
+            const isAva = (gd.source || '') === 'ava';
+            const cur = gazeRef.current;
+            if (!isAva && cur && cur.ava && performance.now() < cur.at + (cur.hold || 3000)) break;
+            gazeRef.current = { x: +gd.x, y: +gd.y, at: performance.now(), hold: (gd.hold_ms | 0) || 3000, ava: isAva };
           }
           break;
         }
