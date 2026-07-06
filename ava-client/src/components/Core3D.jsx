@@ -171,6 +171,7 @@ function AvatarScene({ stateRef, ampRef, visemeRef, gazeRef, onDegrade, onFail }
   const headGroup = useRef();
   const bobRef = useRef();
   const headBone = useRef(null);         // neck joint in ava_head_rig2.glb
+  const ampPeak = useRef(6000);          // adaptive loudness reference (Piper is hot, Kokoro is natural)
   const pulseMesh = useRef();
   const pulseMat = useRef();
   const [model, setModel] = useState(null);
@@ -292,7 +293,11 @@ function AvatarScene({ stateRef, ampRef, visemeRef, gazeRef, onDegrade, onFail }
 
     const time = st.clock.getElapsedTime();
     const s = stateRef.current || 'idle';
-    const amp = Math.min(((ampRef.current | 0)) / 7000, 1);
+    const rawAmp = ampRef.current | 0;
+    // Engines differ wildly in loudness (Piper rms ~13k, Kokoro ~5k): track a
+    // slowly-decaying peak so the jaw envelope self-scales to whatever plays.
+    ampPeak.current = Math.max(ampPeak.current * 0.9995, rawAmp, 3500);
+    const amp = Math.min(rawAmp / (ampPeak.current * 0.75), 1);
     const target = s === 'speaking' ? Math.max(0.5, amp) : s === 'working' ? 0.55 : s === 'thinking' ? 0.7 : 0;
     intensity.current = THREE.MathUtils.lerp(intensity.current, target, Math.min(delta * 5, 1));
 
