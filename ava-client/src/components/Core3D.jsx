@@ -167,7 +167,7 @@ function useDemandLoop(stateRef, ampRef, paceRef) {
 }
 
 // ── AVATAR SCENE — her head as the persistent hologram ──────────────────────
-function AvatarScene({ stateRef, ampRef, visemeRef, gazeRef, poseRef, gestureRef, exprRef, onDegrade, onFail }) {
+function AvatarScene({ stateRef, ampRef, visemeRef, gazeRef, poseRef, gestureRef, exprRef, torsoRef, onDegrade, onFail }) {
   const headGroup = useRef();
   const bobRef = useRef();
   const headBone = useRef(null);         // neck joint in ava_head_rig2.glb
@@ -451,7 +451,20 @@ function AvatarScene({ stateRef, ampRef, visemeRef, gazeRef, poseRef, gestureRef
       }
     }
     const tb = torsoBone.current;
-    if (tb) tb.rotation.x = THREE.MathUtils.lerp(tb.rotation.x, lean, Math.min(delta * 4, 1));
+    if (tb) {
+      // Torso: her deliberate pose > gesture lean > breathing baseline. The
+      // breath is body-life, not a decision — every living body has it.
+      const tv = torsoRef ? torsoRef.current : null;
+      const tOn = tv && performance.now() < tv.until;
+      const breath = Math.sin(time * 0.85) * 0.012;
+      const tx = (tOn ? tv.pitch : 0) + lean + breath;
+      const tyw = tOn ? tv.yaw : 0;
+      const trl = tOn ? tv.roll : Math.sin(time * 0.23) * 0.008;
+      const tk = Math.min(delta * (tOn ? 4 : 1.5), 1);
+      tb.rotation.x = THREE.MathUtils.lerp(tb.rotation.x, tx, tk);
+      tb.rotation.y = THREE.MathUtils.lerp(tb.rotation.y, tyw, tk);
+      tb.rotation.z = THREE.MathUtils.lerp(tb.rotation.z, trl, tk);
+    }
     const hb = headBone.current;
     if (hb) {
       let ty, tp, tr = 0;
@@ -613,7 +626,7 @@ function CoreScene({ stateRef, ampRef, onDegrade }) {
   );
 }
 
-export default function Core3D({ stateRef, ampRef, visemeRef, gazeRef, poseRef, gestureRef, exprRef, onDegrade }) {
+export default function Core3D({ stateRef, ampRef, visemeRef, gazeRef, poseRef, gestureRef, exprRef, torsoRef, onDegrade }) {
   const [dead, setDead] = useState(false);
   const [avatarOk, setAvatarOk] = useState(true);
   if (dead) return null;   // Stage renders the CSS orb when we bail
@@ -630,7 +643,7 @@ export default function Core3D({ stateRef, ampRef, visemeRef, gazeRef, poseRef, 
       fallback={null}
     >
       {avatarOk
-        ? <AvatarScene stateRef={stateRef} ampRef={ampRef} visemeRef={visemeRef} gazeRef={gazeRef} poseRef={poseRef} gestureRef={gestureRef} exprRef={exprRef} onFail={() => setAvatarOk(false)} onDegrade={(why) => { setDead(true); onDegrade && onDegrade(why); }} />
+        ? <AvatarScene stateRef={stateRef} ampRef={ampRef} visemeRef={visemeRef} gazeRef={gazeRef} poseRef={poseRef} gestureRef={gestureRef} exprRef={exprRef} torsoRef={torsoRef} onFail={() => setAvatarOk(false)} onDegrade={(why) => { setDead(true); onDegrade && onDegrade(why); }} />
         : <CoreScene stateRef={stateRef} ampRef={ampRef} onDegrade={(why) => { setDead(true); onDegrade && onDegrade(why); }} />}
     </Canvas>
   );

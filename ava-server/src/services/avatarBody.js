@@ -46,6 +46,16 @@ export function applyDirective(d) {
     }, 'ava-body');
     did = true;
   }
+  if (d.body && typeof d.body === 'object') {
+    // Torso: lean (side, roll), bend (forward/back, pitch), turn (yaw).
+    emitVoiceEvent('avatar.torso', {
+      roll: clamp(d.body.lean, -0.14, 0.14),
+      pitch: clamp(d.body.bend, -0.16, 0.16),
+      yaw: clamp(d.body.turn, -0.3, 0.3),
+      hold_ms: holdMs,
+    }, 'ava-body');
+    did = true;
+  }
   if (d.gesture && GESTURES.has(String(d.gesture))) {
     emitVoiceEvent('avatar.gesture', { name: String(d.gesture) }, 'ava-body');
     did = true;

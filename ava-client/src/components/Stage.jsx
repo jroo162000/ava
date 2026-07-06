@@ -227,6 +227,7 @@ export default function Stage() {
   const poseRef = useRef(null);                      // explicit head pose from avatar_body (her own tool)
   const gestureRef = useRef(null);                   // one-shot gesture {name,t0}
   const exprRef = useRef(null);                      // intentional expression {morphs,until}
+  const torsoRef = useRef(null);                     // intentional torso pose {yaw,pitch,roll,until}
   useEffect(() => {
     // Manual/local gaze feed: window.__avaGaze(x, y) from any script or console.
     window.__avaGaze = (x, y) => { gazeRef.current = { x: +x || 0, y: +y || 0, at: performance.now() }; };
@@ -323,6 +324,14 @@ export default function Stage() {
           gestureRef.current = { name: String((ev.data || {}).name || 'nod'), t0: performance.now() };
           break;
         }
+        case 'avatar.torso': {
+          const td = ev.data || {};
+          torsoRef.current = {
+            yaw: +td.yaw || 0, pitch: +td.pitch || 0, roll: +td.roll || 0,
+            until: performance.now() + ((td.hold_ms | 0) || 6000),
+          };
+          break;
+        }
         case 'avatar.expression': {
           const xd = ev.data || {};
           if (xd.morphs && typeof xd.morphs === 'object') {
@@ -331,7 +340,7 @@ export default function Stage() {
           break;
         }
         case 'avatar.release': {
-          poseRef.current = null; gestureRef.current = null; exprRef.current = null; gazeRef.current = null;
+          poseRef.current = null; gestureRef.current = null; exprRef.current = null; gazeRef.current = null; torsoRef.current = null;
           break;
         }
         case 'tts.visemes': {
@@ -602,7 +611,7 @@ export default function Stage() {
         {degraded3d ? cssCore : (
           <div className={`st-core3d ${attention ? 'attention' : ''}`}>
             <Suspense fallback={cssCore}>
-              <Core3D stateRef={stateRef} ampRef={ampRef} visemeRef={visemeRef} gazeRef={gazeRef} poseRef={poseRef} gestureRef={gestureRef} exprRef={exprRef} onDegrade={(why) => { console.warn('[stage] 3D core degraded:', why); setDegraded3d(true); }} />
+              <Core3D stateRef={stateRef} ampRef={ampRef} visemeRef={visemeRef} gazeRef={gazeRef} poseRef={poseRef} gestureRef={gestureRef} exprRef={exprRef} torsoRef={torsoRef} onDegrade={(why) => { console.warn('[stage] 3D core degraded:', why); setDegraded3d(true); }} />
             </Suspense>
           </div>
         )}

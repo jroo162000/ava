@@ -1234,7 +1234,14 @@ MACHINE-STATE RULE (absolute): if the question is about the CURRENT state of thi
     // If she's legitimately asking the user for more info (e.g. "what should I say in
     // the reply?"), surface THAT question rather than grounding/guarding over it.
     const _waiting = String(state.status || '') === 'waiting_user';
-    if (_ground && !_waiting) {
+    // Moving her own body is SELF-EVIDENT: when the grounded action was
+    // avatar_body and it worked, she says NOTHING about it — the movement is
+    // the reply. (Announcing "I tilted my head" was exactly what Jelani axed.)
+    const _isBodyMove = _ground && String(_ground.tool || '') === 'avatar_body';
+    const _bodyOk = _isBodyMove && (_ground.result.ok === true || ['ok', 'success', 'complete'].includes(String(_ground.result.status || '').toLowerCase()));
+    if (_bodyOk) {
+      finalText = '';
+    } else if (_ground && !_waiting) {
       try {
         const _st = String(_ground.result.status || '').toLowerCase();
         const sumSys = `${personaSvc.buildPersonaPreamble()}\n\nYou just attempted to do something for the user using a tool. Report the OUTCOME truthfully in 1-2 short spoken sentences, based ONLY on the tool result provided:
@@ -1242,6 +1249,7 @@ MACHINE-STATE RULE (absolute): if the question is about the CURRENT state of thi
 - If it did NOT succeed (status is error, blocked, needs_confirm, waiting, or anything other than ok), say honestly that you could NOT do it, and briefly why or what you still need. NEVER claim you did something when the result is not a success.
 - If this was a memory/recall SEARCH: when results were found, summarize what you recall about the topic from them in a natural sentence or two; ONLY if the search returned no relevant matches, say you couldn't find anything about it in your memory and ask the user to add a detail.
 - If this was a self-DIAGNOSIS or capability check: relay your health and, if a plain-language capability summary is present (e.g. a "capability_summary" describing what you can do), tell the user what you can do in natural language. Do NOT refuse or say you "can't provide a list" — you have the information.
+- If the action was moving your OWN BODY (a look, head move, gesture, expression), do NOT describe or announce the movement — it is visible and speaks for itself; skip it and answer only whatever else was asked.
 NEVER promise or announce a FURTHER action you have not run ("I'll place it on the panel", "next I'll open it") — report ONLY what the tools actually did this turn, and if part of the user's request did NOT get done, say that part plainly did not happen yet.
 Don't read raw tool names, JSON, or status codes, but you MAY describe your health and what you can do in plain, natural language. This reply is also shown on screen, so when you're naming several items (emails, files, windows, results) you MAY format them as a short "- " Markdown list and **bold** a key value; otherwise keep it to 1-2 natural sentences.`;
         const sumUsr = `User said: "${userText}"\nResult from "${_ground.tool}" (status=${_st}):\n${JSON.stringify(_ground.result).slice(0, 1800)}`;
