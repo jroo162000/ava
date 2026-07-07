@@ -31,6 +31,9 @@ SERVER = os.environ.get("AVA_SERVER_URL", "http://127.0.0.1:5051").rstrip("/")
 # it instead of fighting over the device. Atomic replace = readers never see a
 # torn file. AVA_GAZE_FRAME_OFF=1 disables publishing.
 FRAME_PATH = os.path.join(os.path.expanduser("~"), ".cmpuse", "camera_live.jpg")
+# camera_ops drops this flag on "camera off": release the device entirely (LED
+# off, no frames, no tracking) until the flag is removed by any camera use.
+PAUSE_FLAG = os.path.join(os.path.expanduser("~"), ".cmpuse", "gaze_paused")
 FRAME_EVERY_S = 0.5
 LOCK_PORT = 5077
 POST_HZ = 8.0
@@ -103,6 +106,22 @@ def main() -> int:
     while True:
         t0 = time.time()
         try:
+            if os.path.exists(PAUSE_FLAG):
+                # user said camera OFF: release the device so the LED actually
+                # turns off; wipe the published frame; idle until unpaused
+                if cap is not None:
+                    try:
+                        cap.release()
+                    except Exception:
+                        pass
+                    cap = None
+                try:
+                    os.remove(FRAME_PATH)
+                except Exception:
+                    pass
+                ema_x = ema_y = None
+                time.sleep(2)
+                continue
             if cap is None or not cap.isOpened():
                 if cap is not None:
                     cap.release()
