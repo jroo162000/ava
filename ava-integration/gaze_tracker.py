@@ -26,6 +26,12 @@ import time
 import urllib.request
 
 SERVER = os.environ.get("AVA_SERVER_URL", "http://127.0.0.1:5051").rstrip("/")
+# Shared live frame: the tracker is the ONE owner of the webcam; it publishes
+# its latest frame here so camera_ops (snapshots, "what do you see") can read
+# it instead of fighting over the device. Atomic replace = readers never see a
+# torn file. AVA_GAZE_FRAME_OFF=1 disables publishing.
+FRAME_PATH = os.path.join(os.path.expanduser("~"), ".cmpuse", "camera_live.jpg")
+FRAME_EVERY_S = 0.5
 LOCK_PORT = 5077
 POST_HZ = 8.0
 HOLD_MS = 3500          # bridge brief detection dropouts instead of releasing to idle
@@ -85,6 +91,12 @@ def main() -> int:
     cap = None
     ema_x = ema_y = None
     base_x = base_y = None
+    publish_frames = os.environ.get("AVA_GAZE_FRAME_OFF") != "1"
+    last_publish = 0.0
+    try:
+        os.makedirs(os.path.dirname(FRAME_PATH), exist_ok=True)
+    except Exception:
+        publish_frames = False
     last_face = 0.0
     interval = 1.0 / POST_HZ
     fails = 0
@@ -95,8 +107,10 @@ def main() -> int:
                 if cap is not None:
                     cap.release()
                 cap = cv2.VideoCapture(cam_idx, cv2.CAP_DSHOW if os.name == "nt" else 0)
-                cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+                # 720p best-effort: detection downsamples anyway, and the shared
+                # snapshot frame benefits from the extra resolution.
+                cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
                 if not cap.isOpened():
                     time.sleep(5)
                     continue
@@ -111,6 +125,16 @@ def main() -> int:
                 time.sleep(interval)
                 continue
             fails = 0
+            # publish the shared live frame (atomic tmp+replace)
+            now_ts = time.time()
+            if publish_frames and now_ts - last_publish >= FRAME_EVERY_S:
+                last_publish = now_ts
+                try:
+                    tmp = FRAME_PATH + ".tmp"
+                    if cv2.imwrite(tmp, frame, [int(cv2.IMWRITE_JPEG_QUALITY), 85]):
+                        os.replace(tmp, FRAME_PATH)
+                except Exception:
+                    pass
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             small = cv2.resize(gray, (320, 240))
             faces = cascade.detectMultiScale(small, scaleFactor=1.12, minNeighbors=4, minSize=(28, 28))
