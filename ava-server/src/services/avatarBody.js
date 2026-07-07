@@ -25,7 +25,7 @@ const TAG_RE = /<move>([\s\S]*?)<\/move>/g;
 // (never **bold**). She emotes this way NATURALLY — so instead of fighting the
 // habit, we treat emotes as movement intent: strip them from her words and
 // hand the description to a tiny LLM that translates it into <move> directives.
-const EMOTE_RE = /(^|[^*])\*([^*\n]{2,240}?)\*(?!\*)/g;
+const EMOTE_RE = /(^|[^*])\*([A-Za-z][^*\n]{1,239}?)\*(?!\*)/g;  // letter-led: '5 * 3 * 2' math stays intact
 const GESTURES = new Set(['nod', 'shake', 'tilt', 'lean_in', 'look_away']);
 const clamp = (v, lo, hi) => Math.min(Math.max(Number(v) || 0, lo), hi);
 
@@ -142,11 +142,15 @@ export function safeLength(s) {
     const tail = str.slice(lastLt);
     if (tail.length < 7 && ('<move>'.startsWith(tail) || '</move>'.startsWith(tail))) return lastLt;
   }
-  // unpaired single-asterisk emote still streaming in: hold from its start
+  // unpaired single-asterisk emote still streaming in: hold from its start —
+  // but only when it LOOKS like an emote (letter-led or at the very end), so a
+  // lone math '*' can never stall sentence flushing.
   const lastStar = str.lastIndexOf('*');
   if (lastStar >= 0 && str[lastStar - 1] !== '*' && str[lastStar + 1] !== '*') {
-    const openCount = (str.match(/(^|[^*])\*(?!\*)/g) || []).length;
-    if (openCount % 2 === 1 && str.length - lastStar < 240) return Math.max(0, lastStar - 1);
+    const next = str[lastStar + 1];
+    const emoteish = next === undefined || /[A-Za-z]/.test(next);
+    const openCount = (str.match(/(^|[^*])\*(?=[A-Za-z]|$)/g) || []).length;
+    if (emoteish && openCount % 2 === 1 && str.length - lastStar < 240) return Math.max(0, lastStar - 1);
   }
   return str.length;
 }

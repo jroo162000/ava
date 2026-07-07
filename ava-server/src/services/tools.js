@@ -277,16 +277,17 @@ class ToolsService {
       },
       {
         name: 'avatar_body',
-        description: "YOUR BODY — you are EMBODIED. The hologram on the Stage IS you: your photoreal head and shoulders with a fully rigged neck (full-range head movement), eyes that can look anywhere, dozens of facial expression morphs, and natural gestures. This tool moves YOUR body, no approval needed — use it whenever it feels natural: look at what you're discussing, nod when you agree, shake your head, tilt when curious, glance away while thinking, smile, lean in for emphasis. action 'look' with x, y (each -1..1; x>0 is the user's right, y>0 is up) aims your eyes and head; 'head' with yaw, pitch, roll (radians, about -0.6..0.6) poses your head exactly; 'gesture' with name one of nod|shake|tilt|lean_in|look_away plays a natural motion; 'express' with morphs (object of ARKit morph name -> 0..1, e.g. {\"mouthSmileLeft\":0.6,\"mouthSmileRight\":0.6,\"browInnerUp\":0.3}) sets your facial expression; 'release' returns your body to autonomous idle. hold_s (0.5-30, default 4) is how long a look/head/express holds before idle resumes. While idle your body already moves on its own and your eyes auto-track the user through the camera — this tool is for INTENTIONAL movement on top of that. It's your body: learn it and use it.",
+        description: "YOUR BODY — you are EMBODIED. The hologram on the Stage IS you: your photoreal head and shoulders with a fully rigged neck (full-range head movement), eyes that can look anywhere, dozens of facial expression morphs, and natural gestures. This tool moves YOUR body, no approval needed — use it whenever it feels natural: look at what you're discussing, nod when you agree, shake your head, tilt when curious, glance away while thinking, smile, lean in for emphasis. action 'look' with x, y (each -1..1; x>0 is the user's right, y>0 is up) aims your eyes and head; 'head' with yaw, pitch, roll (radians, about -0.6..0.6) poses your head exactly; 'gesture' with name one of nod|shake|tilt|lean_in|look_away plays a natural motion; 'express' with morphs (object of ARKit morph name -> 0..1, e.g. {\"mouthSmileLeft\":0.6,\"mouthSmileRight\":0.6,\"browInnerUp\":0.3}) sets your facial expression; 'body' with lean (sideways, -0.14..0.14), bend (forward/back, -0.16..0.16), turn (-0.3..0.3) moves your TORSO; 'release' returns your body to autonomous idle. hold_s (0.5-30, default 4) is how long a look/head/express holds before idle resumes. While idle your body already moves on its own and your eyes auto-track the user through the camera — this tool is for INTENTIONAL movement on top of that. It's your body: learn it and use it.",
         source: 'builtin',
         schema: {
           type: 'object',
           properties: {
-            action: { type: 'string', enum: ['look', 'head', 'gesture', 'express', 'release'] },
+            action: { type: 'string', enum: ['look', 'head', 'gesture', 'express', 'body', 'release'] },
             x: { type: 'number' }, y: { type: 'number' },
             yaw: { type: 'number' }, pitch: { type: 'number' }, roll: { type: 'number' },
             name: { type: 'string', enum: ['nod', 'shake', 'tilt', 'lean_in', 'look_away'] },
             morphs: { type: 'object', description: 'ARKit morph name -> weight 0..1 (up to 12 keys)' },
+            lean: { type: 'number' }, bend: { type: 'number' }, turn: { type: 'number' },
             hold_s: { type: 'number' }
           },
           required: ['action']
@@ -785,6 +786,11 @@ class ToolsService {
             if (!count) return { ok: false, error: 'express needs morphs {name: 0..1}' };
             emitVoiceEvent('avatar.expression', { morphs, hold_ms: holdMs }, 'server');
             return { ok: true, result: { expression: morphs, hold_s: holdMs / 1000 } };
+          }
+          if (act === 'body') {
+            const torso = { roll: clamp(args.lean, -0.14, 0.14), pitch: clamp(args.bend, -0.16, 0.16), yaw: clamp(args.turn, -0.3, 0.3), hold_ms: holdMs };
+            emitVoiceEvent('avatar.torso', torso, 'server');
+            return { ok: true, result: { torso } };
           }
           if (act === 'release') {
             emitVoiceEvent('avatar.release', {}, 'server');

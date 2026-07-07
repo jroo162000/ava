@@ -41,6 +41,7 @@ const SYSTEM = [
 let running = false;
 let lastSpeech = 0;
 let lastGaze = 0;
+let lastActivity = Date.now();   // ANY voice-bus traffic; impulses pause when the house is quiet
 
 function delayMs() {
   const lo = Math.max(10, parseInt(process.env.AVA_BODY_IMPULSE_MIN || '25', 10) || 25);
@@ -48,9 +49,14 @@ function delayMs() {
   return (lo + Math.random() * (hi - lo)) * 1000;
 }
 
+const QUIET_MS = Math.max(5, parseInt(process.env.AVA_BODY_QUIET_MINUTES || '30', 10)) * 60000;
+
 async function tick() {
   try {
-    if (Date.now() - lastSpeech > 3000) {
+    // Nobody around for a while (no speech, no camera, no conversation): save
+    // the LLM quota and let the procedural idle carry her until life returns.
+    const quiet = Date.now() - lastActivity > QUIET_MS;
+    if (!quiet && Date.now() - lastSpeech > 3000) {
       const present = Date.now() - lastGaze < 5000;
       const ctx = `${present ? 'Jelani IS on camera right now (your eyes are already tracking him).' : 'Nobody is on camera right now.'} Local time ${new Date().toLocaleTimeString()}.`;
       const r = await llm.chat([
@@ -77,8 +83,9 @@ function start() {
   onVoiceEvent((ev) => {
     try {
       if (!ev) return;
-      if (ev.type === 'tts.level' && ((ev.data || {}).rms | 0) > 500) lastSpeech = Date.now();
-      else if (ev.type === 'gaze.target' && (ev.data || {}).source === 'camera') lastGaze = Date.now();
+      if (ev.type === 'tts.level' && ((ev.data || {}).rms | 0) > 500) { lastSpeech = Date.now(); lastActivity = lastSpeech; }
+      else if (ev.type === 'gaze.target' && (ev.data || {}).source === 'camera') { lastGaze = Date.now(); lastActivity = lastGaze; }
+      else if (ev.type === 'transcript.final' || ev.type === 'assistant.final' || ev.type === 'tts.request') lastActivity = Date.now();
     } catch { /* never break the bus */ }
   });
   setTimeout(tick, 15000);
