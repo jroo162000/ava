@@ -130,7 +130,9 @@ def main() -> int:
             if publish_frames and now_ts - last_publish >= FRAME_EVERY_S:
                 last_publish = now_ts
                 try:
-                    tmp = FRAME_PATH + ".tmp"
+                    # tmp name MUST keep .jpg: cv2.imwrite picks the codec from
+                    # the extension and silently fails on ".tmp"
+                    tmp = FRAME_PATH.replace("camera_live.jpg", "camera_live_tmp.jpg")
                     if cv2.imwrite(tmp, frame, [int(cv2.IMWRITE_JPEG_QUALITY), 85]):
                         os.replace(tmp, FRAME_PATH)
                 except Exception:
