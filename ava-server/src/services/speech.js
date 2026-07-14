@@ -3,8 +3,8 @@
 // Extracted verbatim from routes/api.js (Tier 2 split) — logic unchanged.
 import fs from 'fs';
 import path from 'path';
-import os from 'os';
 import config from '../utils/config.js';
+import avaPaths from '../utils/paths.js';
 
 /**
  * Detect if response is a step execution status message (not natural language)
@@ -192,8 +192,7 @@ function loadPronunciationLexicon() {
   try {
     const candidates = [
       config.AVA_INTEGRATION_DIR ? path.join(config.AVA_INTEGRATION_DIR, 'ava_pronunciations.json') : null,
-      path.join(process.cwd(), '..', 'ava-integration', 'ava_pronunciations.json'),
-      path.join(os.homedir(), 'ava', 'ava-integration', 'ava_pronunciations.json'),
+      path.join(avaPaths.integrationDir(), 'ava_pronunciations.json'),
     ].filter(Boolean);
     for (const p of candidates) {
       if (fs.existsSync(p)) {

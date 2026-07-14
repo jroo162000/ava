@@ -36,8 +36,8 @@ describe('File Generation Tool Tests', () => {
 
       const schema = res.body.tool.schema;
       expect(schema.properties).toHaveProperty('filename');
+      expect(schema.properties).toHaveProperty('file_path');
       expect(schema.properties).toHaveProperty('content');
-      expect(schema.required).toContain('filename');
       expect(schema.required).toContain('content');
     });
   });

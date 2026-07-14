@@ -24,12 +24,17 @@ jest.unstable_mockModule('../src/services/llm.js', () => ({
 describe('Chat API Tests', () => {
   let app;
   let llmService;
+  let groundCapabilityClaims;
+  let groundSelfDescription;
 
   beforeAll(async () => {
     process.env.NODE_ENV = 'test';
     
     // Import after mocking
     llmService = (await import('../src/services/llm.js')).default;
+    const respondRoute = await import('../src/routes/respond.js');
+    groundCapabilityClaims = respondRoute.groundCapabilityClaims;
+    groundSelfDescription = respondRoute.groundSelfDescription;
     app = createTestApp();
   });
 
@@ -101,10 +106,42 @@ describe('Chat API Tests', () => {
         .expect(200)
         .expect('Content-Type', /json/);
 
-      expect(res.body.output_text).toMatch(/AVA/i);
+      expect(res.body.display_text).toMatch(/AVA/i);
+      expect(res.body.output_text.trim().length).toBeGreaterThan(0);
       expect(res.body.output_text).not.toBe('Done.');
       expect(res.body.agent.steps).toBe(0);
       expect(res.body.agent.status).toBe('success');
+    });
+
+    it('should ground unsupported blanket capability-health claims', () => {
+      const result = groundCapabilityClaims(
+        "I can use my live tools, and I know they're available because they've all been confirmed working in my current environment."
+      );
+
+      expect(result).toMatch(/registered capabilities I can attempt/i);
+      expect(result).toMatch(/verify each external dependency/i);
+      expect(result).not.toMatch(/all been confirmed working/i);
+    });
+
+    it('should not treat registry membership as proof of dependency availability', () => {
+      const result = groundCapabilityClaims(
+        "I can use several tools, and I know exactly which capabilities are available right now because I've just read my live runtime capability registry."
+      );
+
+      expect(result).toMatch(/registered for me to attempt/i);
+      expect(result).toMatch(/verify each external dependency/i);
+      expect(result).not.toMatch(/exactly which capabilities are available/i);
+    });
+
+    it('should always finish self-descriptions with execution-time verification', () => {
+      const result = groundSelfDescription(
+        "I'm AVa. I can do anything in that runtime registry, including file and web tasks, and I know each capability is available because the registry lists it as registered and ready."
+      );
+
+      expect(result).toMatch(/use the tools listed in my live runtime registry/i);
+      expect(result).toMatch(/registered for me to attempt/i);
+      expect(result).toMatch(/verify each tool's dependencies when I use it/i);
+      expect(result).not.toMatch(/I know each capability is available/i);
     });
   });
 });

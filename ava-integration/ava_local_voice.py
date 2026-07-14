@@ -268,22 +268,9 @@ def _strip_wake(text: str) -> tuple[bool, str]:
     return False, normalized
 
 
-def _local_fact_reply(command_text: str) -> Optional[str]:
-    text = _normalize(command_text)
-    if not text:
-        return None
-    if any(p in text for p in ("what time", "time is it", "current time", "the time")):
-        now = datetime.now().strftime("%#I:%M %p" if os.name == "nt" else "%-I:%M %p")
-        return f"It's {now}."
-    if any(p in text for p in (
-        "what is today", "what s today", "what day", "what date",
-        "today s date", "date today", "date is it", "the date",
-    )):
-        today = datetime.now().strftime("%A, %B %#d, %Y" if os.name == "nt" else "%A, %B %-d, %Y")
-        return f"Today is {today}."
-    if any(p in text for p in ("who are you", "what are you", "your name")):
-        return "I'm AVA, your local voice assistant."
-    return None
+def _looks_like_question(command_text: str) -> bool:
+    words = _normalize(command_text).split()
+    return bool(words and words[0] in {"what", "when", "where", "which", "who", "why", "how", "can", "could", "would", "will", "is", "are", "do", "does", "did"})
 
 
 def _is_conversational_command(text: str) -> bool:
@@ -639,7 +626,15 @@ def _captured_utterance_from_wav(
 
 class LocalVoiceRunner:
     def __init__(self) -> None:
+        global WAKE_PHRASES, SOFT_WAKE_PHRASES
         self.config = _load_config()
+        validation = self.config.get("validation_mode") or {}
+        configured_wakes = validation.get("wake_words") or self.config.get("wake_words")
+        configured_soft = validation.get("soft_wake_words") or self.config.get("soft_wake_words")
+        if isinstance(configured_wakes, list) and configured_wakes:
+            WAKE_PHRASES = [str(value).strip().lower() for value in configured_wakes if str(value).strip()]
+        if isinstance(configured_soft, list):
+            SOFT_WAKE_PHRASES = [str(value).strip().lower() for value in configured_soft if str(value).strip()]
         self.audio = pyaudio.PyAudio()
         self.running = True
         self.input_stream: Optional[InputStream] = None
@@ -970,7 +965,6 @@ class LocalVoiceRunner:
         candidates = [
             os.getenv("AVA_VOSK_MODEL", ""),
             str(APP_DIR / "vosk-models" / "vosk-model-small-en-us-0.15"),
-            r"C:\Users\USER 1\ava\ava-integration\vosk-models\vosk-model-small-en-us-0.15",
         ]
         for candidate in candidates:
             if not candidate:
@@ -2035,7 +2029,7 @@ class LocalVoiceRunner:
         # re-opened the window (2026-07-05, Jelani: she rides along with conversations).
         if not command:
             return False
-        if _local_fact_reply(command) or _is_conversational_command(command):
+        if _looks_like_question(command) or _is_conversational_command(command):
             return True
         toks = command.split()
         if toks and toks[0] in COMMAND_VERBS:
@@ -2083,13 +2077,6 @@ class LocalVoiceRunner:
 
         self.followup_until = 0.0
         self.last_command = command
-        local = _local_fact_reply(command)
-        if local:
-            self.last_reply = local
-            self._speak(local)
-            self._open_followup("answered_local")
-            return
-
         _log(f"state=RESPONDING command={command!r}")
         if self._stream_enabled():
             try:

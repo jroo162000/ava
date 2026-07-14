@@ -18,9 +18,9 @@
 //                     (the exact hole the three bad 2026-07-02 self-mods went through).
 //
 // Design notes:
-// - The worktree is created detached at HEAD, then the live tree's uncommitted TRACKED
-//   modifications are overlaid so the sandbox mirrors what is actually running (the live
-//   tree is routinely ahead of HEAD on this machine).
+// - The worktree is created detached at HEAD, then the live tree's tracked modifications
+//   and safe untracked source files are overlaid so the sandbox mirrors what is actually
+//   running (the live tree is routinely ahead of HEAD on this machine).
 // - Gitignored runtime deps the tests need (ava-server/node_modules, ava-integration/.venv)
 //   are junction-linked from the live tree; ava-integration/.env is copied. Junctions are
 //   removed FIRST during teardown so nothing can ever recurse through them into live data.
@@ -43,6 +43,7 @@ import { pathToFileURL } from 'url';
 import logger from '../utils/logger.js';
 import { verifyFileSyntax } from '../utils/verifyFileSyntax.js';
 import proposalVerifier from './proposalVerifier.js';
+import avaPaths from '../utils/paths.js';
 
 const execFileP = promisify(execFile);
 
@@ -51,12 +52,29 @@ function pendingStorePath() {
 }
 
 function baselinePath() {
-  // cwd is ava-server when the server runs (all launchers cd there first).
-  return path.resolve(process.cwd(), 'data', 'selfmod-test-baseline.json');
+  return path.join(avaPaths.dataDir(), 'selfmod-test-baseline.json');
 }
 
 export function isEnabled() {
   return process.env.AVA_SELFMOD_SANDBOX !== '0';
+}
+
+const LIVE_SOURCE_EXTENSIONS = new Set(['.js', '.mjs', '.cjs', '.jsx', '.ts', '.tsx', '.py', '.ps1']);
+const LIVE_SOURCE_ROOTS = new Set(['ava-server', 'ava-client', 'ava-integration', 'scripts', 'tools']);
+const RUNTIME_PATH_PARTS = new Set([
+  '.git', '.venv', 'venv', 'node_modules', 'data', 'logs', 'backups', 'backup',
+  'coverage', 'dist', 'build', 'memory', 'vendor', '__pycache__',
+]);
+
+export function isSafeLiveOverlayPath(relativePath) {
+  const normalized = String(relativePath || '').replace(/\\/g, '/').replace(/^\.\//, '');
+  if (!normalized || normalized.startsWith('/') || normalized.includes('../')) return false;
+  const parts = normalized.split('/').filter(Boolean);
+  if (!parts.length || !LIVE_SOURCE_ROOTS.has(parts[0])) return false;
+  if (parts.some(part => RUNTIME_PATH_PARTS.has(part.toLowerCase()))) return false;
+  const name = parts[parts.length - 1].toLowerCase();
+  if (name === '.env' || /(?:secret|credential|api[-_]?key|access[-_]?token)/i.test(name)) return false;
+  return LIVE_SOURCE_EXTENSIONS.has(path.extname(name));
 }
 
 async function git(repo, args, timeout = 30000) {
@@ -184,16 +202,26 @@ export async function validateProposal(modId) {
   try {
     await git(repoRoot, ['worktree', 'add', '--detach', sandboxDir], 90000);
 
-    // Mirror the live tree: overlay uncommitted TRACKED modifications onto the worktree.
+    // Mirror the live tree. Git worktrees start from HEAD, but AVa routinely runs with
+    // uncommitted services and tests. Include safe untracked source dependencies too;
+    // never mirror secrets, runtime state, generated output, dependencies, or backups.
     let dirty = [];
     try { dirty = (await git(repoRoot, ['diff', '--name-only', 'HEAD'])).split('\n').filter(Boolean); } catch { dirty = []; }
-    for (const f of dirty) {
+    let untracked = [];
+    try {
+      untracked = (await git(repoRoot, ['ls-files', '--others', '--exclude-standard']))
+        .split('\n').filter(Boolean).filter(isSafeLiveOverlayPath);
+    } catch { untracked = []; }
+    const overlay = [...new Set([...dirty, ...untracked])];
+    for (const f of overlay) {
       try {
         const src = path.join(repoRoot, f);
         const dst = path.join(sandboxDir, f);
-        if (fs.existsSync(src) && fs.statSync(src).isFile()) {
+        if (fs.existsSync(src) && fs.lstatSync(src).isFile()) {
           fs.mkdirSync(path.dirname(dst), { recursive: true });
           fs.copyFileSync(src, dst);
+        } else if (dirty.includes(f) && fs.existsSync(dst)) {
+          fs.rmSync(dst, { force: true });
         }
       } catch { /* per-file best effort */ }
     }
@@ -354,4 +382,4 @@ export function describeGate(gate) {
   return 'sandbox blocked it';
 }
 
-export default { isEnabled, validateProposal, describeGate };
+export default { isEnabled, isSafeLiveOverlayPath, validateProposal, describeGate };

@@ -152,7 +152,7 @@ class IdempotencyCache {
 }
 
 // Global idempotency cache instance
-const idempotencyCache = new IdempotencyCache(60000); // 60 second TTL
+const idempotencyCache = new IdempotencyCache(Math.max(1000, Number(process.env.AVA_IDEMPOTENCY_TTL_MS) || 60000));
 
 // cmp-use (Python) tools arrive with NO parameter schema, so the model can't see their
 // action vocabulary and guesses (e.g. window_ops -> "list"/"focus" instead of "focus_tab").
@@ -226,13 +226,27 @@ const PYTHON_TOOL_SCHEMAS = {
   }
 };
 
+// cmp-use currently reports risk at the whole-tool level, while several medium-risk tools
+// also expose harmless observation actions. Keep that distinction in tool metadata so every
+// policy consumer can make the same action-level decision without guessing from a description.
+const PYTHON_TOOL_PERMISSIONS = {
+  window_ops: {
+    read_only_actions: ['list', 'active', 'get_active', 'foreground', 'get_foreground_info'],
+    action_arg: 'action',
+    default_action: 'list',
+  },
+  sys_ops: { read_only: true },
+  read_event_log: { read_only: true },
+  self_awareness: { read_only: true },
+};
+
 class ToolsService {
   constructor() {
     this.cache = null;
     this.cacheTime = 0;
     this.cachePythonCount = 0;
     this.cacheWorkerReady = false;
-    this.cacheTTL = 60000; // 1 minute cache
+    this.cacheTTL = Math.max(5000, Number(process.env.AVA_TOOLS_CACHE_TTL_MS) || 60000);
     this.initialized = false;
   }
 
@@ -254,7 +268,8 @@ class ToolsService {
             mode: { type: 'string', enum: ['write', 'append'], description: 'write = create/overwrite (default); append = add to the end of an existing text file (use this for "add a line")' },
             format: { type: 'string', enum: ['txt', 'md', 'csv', 'json', 'html', 'pdf', 'docx', 'xlsx', 'pptx', 'rtf'] }
           },
-          required: ['content']
+          required: ['content'],
+          anyOf: [{ required: ['file_path'] }, { required: ['filename'] }]
         },
         requires_confirm: false,
         risk_level: 'low'
@@ -323,7 +338,8 @@ class ToolsService {
           required: ['path']
         },
         requires_confirm: false,
-        risk_level: 'low'
+        risk_level: 'low',
+        permissions: { read_only: true }
       },
       { 
         name: 'fs_find', 
@@ -338,7 +354,8 @@ class ToolsService {
           required: ['pattern']
         },
         requires_confirm: false,
-        risk_level: 'low'
+        risk_level: 'low',
+        permissions: { read_only: true }
       },
       { 
         name: 'memory_search',
@@ -500,6 +517,9 @@ class ToolsService {
       // actions like focus_tab / click_text / click_target (they ship with no schema).
       if (PYTHON_TOOL_SCHEMAS[tool.name] && (!tool.schema || !tool.schema.properties || !tool.schema.properties.action)) {
         tool.schema = PYTHON_TOOL_SCHEMAS[tool.name];
+      }
+      if (PYTHON_TOOL_PERMISSIONS[tool.name]) {
+        tool.permissions = { ...(tool.permissions || {}), ...PYTHON_TOOL_PERMISSIONS[tool.name] };
       }
       toolMap.set(tool.name, tool);
     }
@@ -838,6 +858,7 @@ class ToolsService {
    *
    * Options:
    * - bypassIdempotency: boolean - Skip idempotency check (for confirmed retries)
+   * - recordIdempotency: boolean - Set false for fresh observations that must not suppress later work
    */
   async executeTool(name, args, dryRun = false, options = {}) {
     const requestId = crypto.randomUUID();
@@ -899,11 +920,22 @@ class ToolsService {
 
           logger.info('[tools] Idempotency blocked', logEntry);
 
-          // Return the PRIOR result (not a "blocked" error) so the agent loop uses it
-          // and STOPS, instead of spinning by retrying the same call repeatedly.
+          // API callers need an explicit duplicate verdict. Agent/workflow callers
+          // receive the prior evidenced result so they stop instead of retrying.
           const cached = idempotencyCheck.entry && idempotencyCheck.entry.result;
+          if (['api', 'test'].includes(String(options.source || '').toLowerCase())) {
+            return {
+              ok: false,
+              status: 'blocked',
+              reason: 'idempotency_blocked',
+              error: 'I already did that recently; use bypassIdempotency only for an intentional retry.',
+              previous_result: cached || null,
+              cacheKey: idempotencyCheck.key,
+              ageMs: idempotencyCheck.ageMs,
+            };
+          }
           if (cached) {
-            return cached;
+            return { ...cached, idempotent: true, duplicate_suppressed: true, ageMs: idempotencyCheck.ageMs };
           }
           return {
             ok: true,
@@ -1008,7 +1040,7 @@ class ToolsService {
       }
 
       // Record successful execution + its result in the idempotency cache (not dry_run)
-      if (!dryRun && response?.ok !== false) {
+      if (!dryRun && response?.ok !== false && options.recordIdempotency !== false) {
         idempotencyCache.record(name, args, null, response);
       }
 
@@ -1125,6 +1157,6 @@ const warmupCache = async (retries = 3, delay = 5000) => {
     }
   }
 };
-warmupCache();
+if (process.env.NODE_ENV !== 'test' && process.env.AVA_TOOL_WARMUP !== '0') warmupCache();
 
 export default toolsService;

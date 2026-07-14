@@ -26,23 +26,77 @@ import skillStore from './skillStore.js';
 import trainingGuidance from './trainingGuidance.js';
 import modelConfig from '../utils/modelConfig.js';
 import { emitVoiceEvent } from './voiceBus.js';  // Tier 2 #15: explicit working-state events for the UI
+import { answerFromSuccessfulTool, toolResultEvidence } from './toolResultAnswer.js';
 
-// Informational tools whose raw result should be SYNTHESIZED into a real answer (her own knowledge
-// + the findings) rather than returned verbatim -- otherwise a lookup shortens/replaces her answer.
-const INFO_TOOLS = new Set(['web_search', 'web_scrape', 'memory_search', 'finance_search', 'net_ops']);
-async function synthesizeAnswer(goal, tool, result) {
+async function synthesizeAnswer(goal, tool, result, localPriority = 'background') {
   try {
-    const r = (result && (result.result || result)) || {};
-    let found = '';
-    if (Array.isArray(r.results)) found = r.results.map((x, i) => `(${i + 1}) ${x.title || ''} - ${x.snippet || x.text || ''} [${x.url || x.href || ''}]`).join('\n');
-    else if (Array.isArray(r.matches)) found = r.matches.map((x, i) => `(${i + 1}) ${x.text || x.snippet || ''}`).join('\n');
-    else found = String(r.text || r.content || r.abstract || r.message || '').slice(0, 6000);
+    const found = toolResultEvidence(result);
     if (!found.trim()) return '';
-    const sys = 'You are AVA answering the user. You just looked something up; the findings are below. Write a COMPLETE, genuinely helpful answer in your own natural voice, SYNTHESIZING what you already know WITH these findings. Do not just repeat the search results, and do not shorten your answer merely because you searched -- be as thorough as the question deserves. If the findings are thin or conflict with what you know, say what is reliable. Do not mechanically say "the search results say".';
-    const usr = `The user asked: ${String(goal || '')}\n\nWhat you found (${tool}):\n${found}`;
-    const resp = await llmService.chat([{ role: 'system', content: sys }, { role: 'user', content: usr }], { temperature: 0.5, max_tokens: 1200 });
+    const sys = 'You are AVa answering the user after using a tool. Write a complete, genuinely helpful answer in your natural voice. Ground every factual or action claim in the tool outcome below; do not merely dump raw fields, do not claim more than the outcome proves, and do not replace the answer with a generic completion word. If the outcome is thin or ambiguous, say that clearly.';
+    const usr = `The user asked: ${String(goal || '')}\n\nTool outcome (${tool}):\n${found}`;
+    const resp = await llmService.chat(
+      [{ role: 'system', content: sys }, { role: 'user', content: usr }],
+      { temperature: 0.5, max_tokens: 1200, localPriority },
+    );
     return String((resp && (resp.text || resp.content)) || '').trim();
   } catch (e) { logger.warn('[agent] synthesis failed', { error: e.message }); return ''; }
+}
+
+async function successfulToolAnswer(state, tool, result) {
+  return answerFromSuccessfulTool({
+    tool,
+    result,
+    synthesize: () => synthesizeAnswer(state.goal, tool, result, state.localPriority),
+  });
+}
+
+function successfulHistoryResult(state) {
+  const results = (state?.history || []).flatMap(entry => {
+    const tool = entry?.action?.tool || entry?.decision?.tool || '';
+    const result = entry?.result;
+    if (!tool || String(result?.status || '').toLowerCase() !== 'ok') return [];
+    const message = String(result?.message || '').trim();
+    const evidence = message || toolResultEvidence(result, 700);
+    return [{
+      title: `${tool} receipt`,
+      content: `${entry?.action?.args ? `Args: ${JSON.stringify(entry.action.args)}\n` : ''}${evidence || 'Succeeded without additional details.'}`,
+    }];
+  });
+  return results.length > 1 ? { status: 'ok', results } : null;
+}
+
+function completedExplicitNamedToolResult(state) {
+  const goal = String(state?.goal || '');
+  const escapePattern = value => String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const requested = [...new Set((state?.toolset || []).flatMap(tool => {
+    const name = typeof tool === 'string' ? tool : tool?.name;
+    if (!name) return [];
+    const named = new RegExp(`(^|[^a-z0-9_])${escapePattern(name)}([^a-z0-9_]|$)`, 'i').test(goal);
+    return named ? [String(name)] : [];
+  }))];
+  if (requested.length < 2) return null;
+
+  const succeeded = new Set((state?.history || []).flatMap(entry => {
+    const tool = entry?.action?.tool || entry?.decision?.tool || '';
+    return tool && String(entry?.result?.status || '').toLowerCase() === 'ok' ? [tool] : [];
+  }));
+  return requested.every(tool => succeeded.has(tool)) ? successfulHistoryResult(state) : null;
+}
+
+function formatSuccessfulHistoryAnswer(combined) {
+  const receipts = Array.isArray(combined?.results) ? combined.results : [];
+  if (!receipts.length) return '';
+  return [
+    'I completed the requested checks:',
+    ...receipts.map(receipt => `- ${receipt.title}: ${String(receipt.content || 'Succeeded.').replace(/\s+/g, ' ').trim()}`),
+  ].join('\n');
+}
+
+async function successfulRunAnswer(state, fallbackTool, fallbackResult) {
+  const combined = successfulHistoryResult(state);
+  if (!combined) return successfulToolAnswer(state, fallbackTool, fallbackResult);
+  const synthesized = await synthesizeAnswer(state.goal, 'completed tool receipts', combined, state.localPriority);
+  return synthesized || formatSuccessfulHistoryAnswer(combined);
 }
 import skillCapture from './skillCapture.js';
 import lessonLearner from './lessonLearner.js';
@@ -61,6 +115,28 @@ Never answer "I can't" or "I don't have a tool" for actions like these — those
 const DEFAULT_STEP_LIMIT = 12;
 const MAX_STEP_LIMIT = 25;
 const MAX_CONSECUTIVE_ERRORS = 3;
+
+function errorMessageForResult(result = {}, action = 'action') {
+  const candidates = [
+    result?.message,
+    result?.error,
+    result?.details?.message,
+    result?.details?.error,
+    result?.result?.message,
+    result?.result?.error,
+  ];
+  for (const candidate of candidates) {
+    if (typeof candidate === 'string' && candidate.trim()) return candidate.trim();
+    if (candidate && typeof candidate === 'object') {
+      if (typeof candidate.message === 'string' && candidate.message.trim()) return candidate.message.trim();
+      try {
+        const serialized = JSON.stringify(candidate);
+        if (serialized && serialized !== '{}') return serialized;
+      } catch { /* keep checking */ }
+    }
+  }
+  return `${String(action || 'action')} failed without an error message`;
+}
 
 /**
  * Decision types returned by LLM
@@ -200,6 +276,14 @@ function isMultiStepGoal(goal) {
 }
 
 function createAgentState(goal, options = {}) {
+  const pendingConfirmation = options.pendingConfirmation?.tool
+    ? {
+        tool: String(options.pendingConfirmation.tool),
+        args: options.pendingConfirmation.args && typeof options.pendingConfirmation.args === 'object'
+          ? { ...options.pendingConfirmation.args }
+          : {},
+      }
+    : null;
   return {
     _multiStep: options.multiStep !== undefined ? !!options.multiStep : isMultiStepGoal(goal),
     id: `agent-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
@@ -208,11 +292,14 @@ function createAgentState(goal, options = {}) {
     step_count: 0,
     step_limit: Math.min(options.stepLimit || DEFAULT_STEP_LIMIT, MAX_STEP_LIMIT),
     runTools: options.runTools !== false,  // default true; false skips tool execution
+    localPriority: options.localPriority === 'interactive' ? 'interactive' : 'background',
     // Tier 3 #22: READ-ONLY execution — a HARD, prompt-independent guarantee that this run can
     // observe (read/scan/enumerate/search) but can NEVER write, send, delete, execute, or take
     // any confirm-gated/high-risk/destructive action. Used by self-initiated proactive
     // investigation so writes STAY behind the user's approval; enforced at the act() gate.
     readOnly: !!options.readOnly,
+    preapproved: !!options.preapproved,
+    approvalId: options.approvalId || null,
     canDelegate: options.canDelegate !== false,  // LEAD may spawn subagents; subagents get false (no recursion)
     allowedTools: options.allowedTools || null,  // subagent ROLE tool scoping (allowlist of names/'*' patterns)
     deniedTools: options.deniedTools || null,    // optional denylist
@@ -225,8 +312,8 @@ function createAgentState(goal, options = {}) {
       memories: [],
       system_info: {},
       user_info: options.userInfo || {},
-      user_response: null,
-      pending_confirmation: null
+      user_response: options.userResponse ? String(options.userResponse) : null,
+      pending_confirmation: pendingConfirmation
     },
     toolset: [],
     history: [],
@@ -243,6 +330,42 @@ function createAgentState(goal, options = {}) {
     updated_at: new Date().toISOString(),
     final_result: null
   };
+}
+
+function classifyConfirmationResponse(value = '') {
+  const text = String(value || '').toLowerCase().replace(/[\u2018\u2019]/g, "'").trim();
+  if (!text) return 'unknown';
+  const denied = /\b(?:no|nope|deny|denied|reject|rejected|decline|declined|cancel|stop)\b|\b(?:do not|don't|dont|cannot|can't|cant|not)\s+(?:approve|confirm|proceed|continue|go ahead|move forward)\b/.test(text);
+  if (denied) return 'denied';
+  const approved = /\b(?:yes|yep|yeah|approve|approved|confirm|confirmed|okay|ok|proceed|continue)\b|\b(?:go ahead|move forward|permission granted|you can)\b/.test(text);
+  return approved ? 'approved' : 'unknown';
+}
+
+function isReadOnlyObservationTool(name = '', args = {}, tool = null) {
+  if (!name || !tool || typeof tool !== 'object') return false;
+  const permissions = tool.permissions && typeof tool.permissions === 'object'
+    ? tool.permissions
+    : {};
+  if (permissions.read_only === true) return true;
+
+  const readOnlyActions = Array.isArray(permissions.read_only_actions)
+    ? permissions.read_only_actions.map(action => String(action).toLowerCase())
+    : [];
+  if (!readOnlyActions.length) return false;
+  const actionKey = String(permissions.action_arg || 'action');
+  const action = String(
+    args?.[actionKey] ?? args?.action ?? args?.operation ?? permissions.default_action ?? ''
+  ).toLowerCase();
+  return Boolean(action && readOnlyActions.includes(action));
+}
+
+function autonomyCategoryForTool(name = '') {
+  const toolName = String(name || '');
+  if (toolName === 'ps_exec') return 'system_commands';
+  if (/^(?:fs_ops|fs_(?:write|append|delete|move|copy|mkdir|rmdir)|file_gen)$/.test(toolName)) {
+    return 'file_write_outside_allowlist';
+  }
+  return undefined;
 }
 
 /**
@@ -447,7 +570,7 @@ CRITICAL RULES:
 10b. **SELECT / SWITCH A BROWSER TAB.** To select, switch to, or go to a specific browser tab (e.g. "select the ava hologram tab in Edge"), call window_ops action=focus_tab with tab=<tab name> and window=<browser, e.g. "edge">. It foregrounds the browser and cycles tabs until the live window title matches, so it is SELF-VERIFYING. Do NOT take a screenshot to "look for" the tab, and do NOT say you can't identify or click tabs — focus_tab IS that capability. A screenshot is NEVER the completion of a click/select/switch request. If focus_tab returns found:false (or any tool returns an error / ocr_available:false), tell the user plainly that it didn't work and name the open tabs from checked_tabs — do NOT claim you switched, do NOT emit an empty plan, and do NOT repeat the same non-action.
 10c. **CLICKING SOMETHING ON SCREEN — try methods in this order (most→least reliable), and NEVER just screenshot and stop.** (1) a browser TAB → window_ops focus_tab. (2) a window's menu/button/save/next by name → app_control. (3) VISIBLE TEXT (a label, link, or button caption) → computer_use click_text (OCR — reliable). (4) only if the target is NOT plain text (an icon, a picture, an unlabeled control) → computer_use click_target with target=<plain-language description> (vision grounding; it may be imprecise and returns found:false honestly when it can't locate the element). Report the outcome truthfully: only say you clicked it if the tool returned found:true; if every applicable method fails, say so plainly instead of pretending.
 10d. **EDITING / CHANGING / MAKING AN IMAGE — you CAN do this, so DO it (don't deny).** You have image_ops. To modify/change/adjust/restyle/retouch an EXISTING image or photo (e.g. "give her longer hair", "make it brighter", "remove the background"), call image_ops with action=edit, args.image=<full file path>, args.prompt=<the change>. If you only have a name (e.g. "the 3d holo ava image in Downloads"), FIRST resolve it with fs_find (fuzzy, e.g. pattern "*holo*ava*") — do NOT web-search for it and do NOT give up. To make a NEW image from scratch, use image_ops action=generate. For a 3D model, use model3d_ops (generate from text, or from_image). NEVER tell the user you "can't edit images" or that you "can only find/read them" — that is FALSE; image_ops edits images. If the edit tool returns an error (e.g. no image-provider credit), report that specific error honestly — that is different from claiming you lack the ability.
-11. **3D SCENES / HOLOGRAMS + OPENING A LOCALHOST SITE.** To build or SHOW a 3D scene / hologram / AR view from a model, call scene3d (action "create") with args.models=[{"path":"<full path to the .glb>"}], args.name, args.open=true — it copies the model in, starts a LOCAL web server, opens the browser, and returns preview_url like http://localhost:PORT/ (that URL IS the site). The port is EPHEMERAL (fresh every run), so to "pull up" / "reopen" / "show" a hologram you already made, RUN scene3d AGAIN — do NOT search Downloads for a file and do NOT assume an old port (e.g. :19525) is still up. Jelani's 3D avatar models are in C:\\Users\\Dell\\Downloads\\ava_models\\ (newest ava_model_*.glb) with a copy at C:\\Users\\Dell\\Claude\\Projects\\AVA Development\\ava_hologram_model.glb. To OPEN a localhost URL / "the site" / "the localhost", call open_item with args.target="http://localhost:<port>" (an http target opens the real browser) — NEVER search Downloads for a "site". If the port is unknown, recall the last scene3d preview_url or re-run scene3d. NOTE: speech-to-text garbles these names — ".glb" arrives as "gab"/"gib"/"glib"/"g l b", and model/scene names as "3d hollow"/"holoava"/"hologram model gab". If the GOAL references a hologram or 3D model file under ANY such spelling, do NOT literal-search the garbled name and do NOT ask which file — use the known model paths above and run scene3d. FINDING or LISTING the model file is NOT completion: when the goal asks to open/show/display/put up the hologram (in the panel, a scene, or the browser), the goal is complete ONLY when scene3d has RUN this turn and returned a preview_url (the preview_url is auto-shown in your pop-up panel). After locating the file, your NEXT action is scene3d — never a final answer.
+11. **3D SCENES / HOLOGRAMS + OPENING A LOCALHOST SITE.** Resolve the requested model from recent artifact receipts or memory first; if no verified path is available, use fs_find to research the live filesystem and inspect the candidates instead of assuming a machine-specific location. Treat common speech-to-text variants of ".glb" and "hologram" as search hints, not literal filenames. Then call scene3d with the verified model path and args.open=true. A scene request is complete only when scene3d succeeds in this turn and returns a preview_url. Re-run scene3d when an old preview is no longer live; never invent or reuse an unverified port.
 
 ${_DECISION_EXAMPLES}
 
@@ -501,7 +624,7 @@ CRITICAL RULES:
 17b. **SELECT / SWITCH A BROWSER TAB.** To select, switch to, or go to a specific browser tab (e.g. "select the ava hologram tab in Edge"), call window_ops action=focus_tab with tab=<tab name> and window=<browser, e.g. "edge">. It foregrounds the browser and cycles tabs until the live window title matches, so it is SELF-VERIFYING. Do NOT take a screenshot to "look for" the tab, and do NOT say you can't identify or click tabs — focus_tab IS that capability. A screenshot is NEVER the completion of a click/select/switch request. If focus_tab returns found:false (or any tool returns an error / ocr_available:false), tell the user plainly that it didn't work and name the open tabs from checked_tabs — do NOT claim you switched, do NOT emit an empty plan, and do NOT repeat the same non-action.
 17c. **CLICKING SOMETHING ON SCREEN — try methods in this order (most→least reliable), and NEVER just screenshot and stop.** (1) a browser TAB → window_ops focus_tab. (2) a window's menu/button/save/next by name → app_control. (3) VISIBLE TEXT (a label, link, or button caption) → computer_use click_text (OCR — reliable). (4) only if the target is NOT plain text (an icon, a picture, an unlabeled control) → computer_use click_target with target=<plain-language description> (vision grounding; it may be imprecise and returns found:false honestly when it can't locate the element). Report the outcome truthfully: only say you clicked it if the tool returned found:true; if every applicable method fails, say so plainly instead of pretending.
 17d. **EDITING / CHANGING / MAKING AN IMAGE — you CAN do this, so DO it (don't deny).** You have image_ops. To modify/change/adjust/restyle/retouch an EXISTING image or photo (e.g. "give her longer hair", "make it brighter", "remove the background"), call image_ops with action=edit, args.image=<full file path>, args.prompt=<the change>. If you only have a name (e.g. "the 3d holo ava image in Downloads"), FIRST resolve it with fs_find (fuzzy, e.g. pattern "*holo*ava*") — do NOT web-search for it and do NOT give up. To make a NEW image from scratch, use image_ops action=generate. For a 3D model, use model3d_ops (generate from text, or from_image). NEVER tell the user you "can't edit images" or that you "can only find/read them" — that is FALSE; image_ops edits images. If the edit tool returns an error (e.g. no image-provider credit), report that specific error honestly — that is different from claiming you lack the ability.
-18. **3D SCENES / HOLOGRAMS + OPENING A LOCALHOST SITE.** To BUILD or SHOW a 3D scene / hologram / AR view from a model, call scene3d (action "create") with args.models=[{"path":"<full path to the .glb>"}], args.name, args.open=true. scene3d copies the model in, starts a LOCAL web server, opens the browser, and returns preview_url like http://localhost:PORT/ — that preview_url IS the site/hologram. The port is EPHEMERAL (a fresh free port every run), so to "pull up" / "reopen" / "show" a hologram you already made, RUN scene3d AGAIN — do NOT search Downloads for a file, and do NOT assume an old port (e.g. :19525) is still listening. Jelani's generated 3D avatar models are in C:\\Users\\Dell\\Downloads\\ava_models\\ (use the NEWEST ava_model_*.glb) and a copy is at C:\\Users\\Dell\\Claude\\Projects\\AVA Development\\ava_hologram_model.glb. To OPEN a localhost URL or when the user says "open the site / the localhost / that page", call open_item with args.target="http://localhost:<port>" (an http/https target opens the REAL browser) — NEVER search Downloads/Documents for a "site". If you don't know the port, recall the last scene3d preview_url from recent context, or just re-run scene3d to get a fresh live one. NOTE: speech-to-text garbles these names — ".glb" arrives as "gab"/"gib"/"glib"/"g l b", and model/scene names as "3d hollow"/"holoava"/"hologram model gab". If the GOAL references a hologram or 3D model file under ANY such spelling, do NOT literal-search the garbled name and do NOT ask which file — use the known model paths above and run scene3d. FINDING or LISTING the model file is NOT completion: when the goal asks to open/show/display/put up the hologram (in the panel, a scene, or the browser), the goal is complete ONLY when scene3d has RUN this turn and returned a preview_url (the preview_url is auto-shown in your pop-up panel). After locating the file, your NEXT action is scene3d — never a final answer.
+18. **3D SCENES / HOLOGRAMS + OPENING A LOCALHOST SITE.** Resolve the requested model from recent artifact receipts or memory first; if no verified path is available, use fs_find to research the live filesystem and inspect the candidates instead of assuming a machine-specific location. Treat common speech-to-text variants of ".glb" and "hologram" as search hints, not literal filenames. Then call scene3d with the verified model path and args.open=true. A scene request is complete only when scene3d succeeds in this turn and returns a preview_url. Re-run scene3d when an old preview is no longer live; never invent or reuse an unverified port.
 
 ${_DECISION_EXAMPLES}
 
@@ -574,7 +697,10 @@ function buildNativeTools(state) {
  * Returns null when the response is unusable (caller falls back to the legacy JSON path).
  */
 function mapNativeDecision(state, resp) {
-  const calls = (resp && resp.toolCalls) || [];
+  const calls = ((resp && resp.toolCalls) || []).map(call => ({
+    ...call,
+    name: normalizeRegisteredToolName(state, call?.name),
+  }));
   const text = String((resp && resp.text) || '').trim();
 
   if (calls.length) {
@@ -595,9 +721,75 @@ function mapNativeDecision(state, resp) {
     }
   }
 
-  // Plain text with no tool calls = the final answer (STOP).
-  if (text) return { decision: DecisionType.STOP, result: text, success: true };
+  // A provider fallback can preserve the old JSON decision contract but put it in the native
+  // response's text field instead of toolCalls. Recognize an exact JSON envelope before treating
+  // text as a final answer; otherwise AVa literally says the JSON and skips the requested tool.
+  if (text) {
+    const structured = mapNativeTextDecision(state, text);
+    if (structured) return structured;
+    return { decision: DecisionType.STOP, result: text, success: true };
+  }
   return null;
+}
+
+function mapNativeTextDecision(state, text = '') {
+  const trimmed = String(text || '').trim();
+  const exactJson = /^\{[\s\S]*\}$/.test(trimmed)
+    || /^```(?:json)?\s*\{[\s\S]*\}\s*```$/i.test(trimmed);
+  if (!exactJson) return null;
+
+  let decision;
+  try { decision = normalizeDecisionToolNames(state, parseDecisionJson(trimmed)); }
+  catch { return null; }
+  if (!decision || typeof decision !== 'object') return null;
+
+  const calls = Array.isArray(decision.tool_calls)
+    ? decision.tool_calls.filter(call => call && call.tool)
+    : [];
+  if (calls.length > 1) {
+    return { ...decision, decision: DecisionType.PARALLEL, tool_calls: calls };
+  }
+  if (calls.length === 1 && !decision.tool) {
+    return { ...decision, decision: DecisionType.TOOL_CALL, tool: calls[0].tool, args: calls[0].args || {} };
+  }
+  if ((decision.decision === DecisionType.TOOL_CALL || (!decision.decision && decision.tool)) && decision.tool) {
+    return { ...decision, decision: DecisionType.TOOL_CALL, args: decision.args || {} };
+  }
+  if (decision.decision === DecisionType.ASK_USER && decision.question) return decision;
+  if (decision.decision === DecisionType.DELEGATE && state.canDelegate && Array.isArray(decision.subtasks)) return decision;
+  if (decision.decision === DecisionType.STOP && decision.result) return decision;
+  return null;
+}
+
+// Some providers occasionally return their API namespace as part of the function name
+// (for example, "functions.self_awareness"). Strip that namespace only when the remaining
+// name is a tool AVa actually registered, so an unknown name is never silently redirected.
+function normalizeRegisteredToolName(state, name = '') {
+  const raw = String(name || '').trim();
+  if (!raw) return raw;
+  const available = new Set([
+    ...((Array.isArray(state?.toolset) ? state.toolset : []).map(tool => String(tool?.name || '')).filter(Boolean)),
+    'ask_user',
+    'delegate',
+  ]);
+  if (available.has(raw)) return raw;
+  const match = raw.match(/^functions\.(.+)$/i);
+  const candidate = match ? match[1] : '';
+  return candidate && available.has(candidate) ? candidate : raw;
+}
+
+function normalizeDecisionToolNames(state, decision) {
+  if (!decision || typeof decision !== 'object') return decision;
+  if (decision.tool) decision.tool = normalizeRegisteredToolName(state, decision.tool);
+  if (Array.isArray(decision.tool_calls)) {
+    decision.tool_calls = decision.tool_calls.map(call => call && typeof call === 'object'
+      ? { ...call, tool: normalizeRegisteredToolName(state, call.tool) }
+      : call);
+  }
+  if (decision.decision && !Object.values(DecisionType).includes(decision.decision) && !decision.tool) {
+    decision.decision = normalizeRegisteredToolName(state, decision.decision);
+  }
+  return decision;
 }
 
 // FALSE-CAPABILITY-DENIAL guard. The decision model sometimes tries to STOP by claiming it
@@ -631,14 +823,8 @@ async function decide(state, observations) {
 
   // Check if we have a pending confirmation and user confirmed
   if (state.current_context.pending_confirmation && state.current_context.user_response) {
-    const userResponse = state.current_context.user_response.toLowerCase();
-    const isConfirmed = userResponse.includes('yes') || 
-                        userResponse.includes('confirm') || 
-                        userResponse.includes('ok') ||
-                        userResponse.includes('proceed') ||
-                        userResponse.includes('go ahead');
-    
-    if (isConfirmed) {
+    const confirmation = classifyConfirmationResponse(state.current_context.user_response);
+    if (confirmation === 'approved') {
       const pending = state.current_context.pending_confirmation;
       logger.info('[agent] Auto-confirming pending tool', { tool: pending.tool });
       
@@ -650,6 +836,17 @@ async function decide(state, observations) {
         tool: pending.tool,
         args: { ...pending.args, confirmed: true },
         reasoning: 'User confirmed the action'
+      };
+    }
+    if (confirmation === 'denied') {
+      const pending = state.current_context.pending_confirmation;
+      state.current_context.pending_confirmation = null;
+      state.current_context.user_response = null;
+      return {
+        decision: DecisionType.STOP,
+        success: false,
+        result: `The user denied the requested ${pending.tool} action, so it was not performed.`,
+        reasoning: 'User denied the pending action'
       };
     }
   }
@@ -665,7 +862,8 @@ async function decide(state, observations) {
         tools: buildNativeTools(state),
         temperature: 0.3,
         max_tokens: parseInt(process.env.AVA_DECISION_MAX_TOKENS || '', 10) || 4000,
-        model: modelConfig.decisionModel()
+        model: modelConfig.decisionModel(),
+        localPriority: state.localPriority,
       });
       const nativeDecision = mapNativeDecision(state, nativeResp);
       if (nativeDecision) {
@@ -691,12 +889,13 @@ async function decide(state, observations) {
     ], {
       temperature: 0.3,
       max_tokens: parseInt(process.env.AVA_DECISION_MAX_TOKENS || '', 10) || 4000,  // headroom so the decision JSON doesn't truncate mid-string
-      model: modelConfig.decisionModel()
+      model: modelConfig.decisionModel(),
+      localPriority: state.localPriority,
     });
 
     const text = response.text || response.content || '';
     
-    const decision = parseDecisionJson(text);
+    const decision = normalizeDecisionToolNames(state, parseDecisionJson(text));
 
     // Parallel fan-out: if the model returned a `tool_calls` array, route it to the PARALLEL path
     // (multiple) or collapse a single entry into a normal tool_call.
@@ -739,7 +938,8 @@ async function decide(state, observations) {
             temperature: 0.2,
             max_tokens: parseInt(process.env.AVA_DECISION_MAX_TOKENS || '', 10) || 4000,
             model: modelConfig.decisionModel(),
-            responseFormat: { type: 'json_object' }   // force valid JSON on the retry (esp. local models)
+            responseFormat: { type: 'json_object' },   // force valid JSON on the retry (esp. local models)
+            localPriority: state.localPriority,
           });
           retried = parseDecisionJson(r2.text || r2.content || '');
         } catch { retried = null; }
@@ -780,7 +980,13 @@ async function decide(state, observations) {
           const corr = await llmService.chat([
             { role: 'system', content: 'You are a task execution agent. Respond with EXACTLY ONE JSON object and no prose: {"decision":"tool_call","tool":"<tool_name>","args":{...}}.' },
             { role: 'user', content: `The user's goal: ${state.goal}\n\nYou were about to reply: "${String(decision.result).slice(0, 300)}"\n\nThat reply is FALSE — you DO have the tool for this. Use it: ${denial.tool}. ${denial.hint}\n\nDo NOT claim you can't. Output ONE tool_call JSON for ${denial.tool} with the right args now.` }
-          ], { temperature: 0.1, max_tokens: 800, model: modelConfig.decisionModel(), responseFormat: { type: 'json_object' } });
+          ], {
+            temperature: 0.1,
+            max_tokens: 800,
+            model: modelConfig.decisionModel(),
+            responseFormat: { type: 'json_object' },
+            localPriority: state.localPriority,
+          });
           const forced = parseDecisionJson(corr.text || corr.content || '');
           if (forced && (forced.tool || forced.decision === DecisionType.TOOL_CALL)) {
             decision.decision = DecisionType.TOOL_CALL;
@@ -805,6 +1011,7 @@ async function decide(state, observations) {
       }
     }
 
+    normalizeDecisionToolNames(state, decision);
     logger.info('[agent] Decision made', {
       type: decision.decision,
       tool: decision.tool,
@@ -863,6 +1070,8 @@ async function act(state, decision) {
           break;
         }
 
+        const safeObservation = isReadOnlyObservationTool(decision.tool, action.args, tool);
+
         // Tier 3 #22 READ-ONLY gate: for self-initiated proactive investigation, refuse any
         // side-effectful action STRUCTURALLY (not via prompt). A tool is blocked when it's
         // confirm-gated, high/medium risk, matches the destructive-family prefixes, or the model
@@ -870,8 +1079,8 @@ async function act(state, decision) {
         // record the finding as "would require your approval" instead of doing it.
         if (state.readOnly) {
           const RO_DESTRUCTIVE = /^(fs_(write|append|delete|move|copy|mkdir|rmdir)|ps_exec|file_gen|app_control|comm_|voice_|camera_|calendar_ops|iot_ops|remote_ops|web_automation|open_item|self_mod)/;
-          const risky = tool.requires_confirm || (tool.risk_level && tool.risk_level !== 'low')
-            || RO_DESTRUCTIVE.test(decision.tool) || action.args.confirm || action.args.confirmed;
+          const risky = !safeObservation && (tool.requires_confirm || (tool.risk_level && tool.risk_level !== 'low')
+            || RO_DESTRUCTIVE.test(decision.tool) || action.args.confirm || action.args.confirmed);
           if (risky) {
             result = {
               status: 'blocked_readonly',
@@ -883,15 +1092,20 @@ async function act(state, decision) {
           }
         }
 
+        // A durable workflow may carry an explicit approval receipt from the
+        // user (for example, an approved proactive initiative). Apply that
+        // receipt to confirmation-gated tools without weakening normal turns.
+        if (state.preapproved && tool.requires_confirm) {
+          action.args.confirmed = true;
+          action.args.confirm = true;
+          action.args.approval_id = state.approvalId;
+        }
+
         // Autonomy policy gate
         try {
           const { getAutonomy } = autonomyLib;
           const autonomy = getAutonomy(logger);
-          const category = (decision.tool === 'ps_exec')
-            ? 'system_commands'
-            : ((decision.tool || '').startsWith('fs_') || decision.tool === 'file_gen')
-              ? 'file_write_outside_allowlist'
-              : undefined;
+          const category = autonomyCategoryForTool(decision.tool);
           const requiresWrite = !!(category || tool.requires_confirm || action.args.confirm || action.args.confirmed);
           const policyDecision = autonomy.decide({
             domain: 'personal_assistant',
@@ -949,7 +1163,9 @@ async function act(state, decision) {
           state.status = _spinOk ? AgentStatus.SUCCESS : AgentStatus.FAILED;
           // Surface the REAL failure reason (tools return .error, not .message, on failure) so a
           // dead-end says WHY instead of a bare "I could not complete that." (log-review fix).
-          state.final_result = state.final_result || result.message || result.error || (_spinOk ? 'Done.' : "I couldn't complete that — my last tool didn't return a result.");
+          state.final_result = state.final_result || (_spinOk
+            ? await successfulRunAnswer(state, decision.tool, result)
+            : (result.message || result.error || "I couldn't complete that — my last tool didn't return a result."));
           logger.info('[agent] Anti-spin: repeated tool+args, reusing prior result', { tool: decision.tool });
           break;
         }
@@ -970,7 +1186,11 @@ async function act(state, decision) {
         }
 
         logger.info('[agent] Executing tool', { tool: decision.tool, args: action.args });
-        const toolResult = await toolsService.executeTool(decision.tool, action.args, false, { source: state.eventSource || '' });
+        const toolResult = await toolsService.executeTool(decision.tool, action.args, false, {
+          source: state.eventSource || 'agent',
+          bypassIdempotency: safeObservation,
+          recordIdempotency: !safeObservation,
+        });
         result = toolResult.result || toolResult;
         // AUTO-PRESENT a live preview (scene3d 3D/WebXR scene, web_builder site) IN AVA's pop-up
         // panel — a 'web' iframe card — so the result renders INSIDE her panel, not only as a
@@ -1016,9 +1236,14 @@ async function act(state, decision) {
             const t = await toolsService.getTool(c.tool);
             if (!t) return { tool: c.tool, result: { status: 'error', message: `Tool not found: ${c.tool}` } };
             if (!_toolAllowed(state, c.tool)) return { tool: c.tool, result: { status: 'blocked', message: `${c.tool} not in this role's toolset` } };
-            const unsafe = t.requires_confirm || DESTRUCTIVE.test(c.tool) || (t.risk_level && t.risk_level !== 'low');
+            const safeObservation = isReadOnlyObservationTool(c.tool, c.args || {}, t);
+            const unsafe = !safeObservation && (t.requires_confirm || DESTRUCTIVE.test(c.tool) || (t.risk_level && t.risk_level !== 'low'));
             if (unsafe) return { tool: c.tool, result: { status: 'deferred', message: `${c.tool} needs sequential/confirmed execution — issue it as a single tool_call` } };
-            const r = await toolsService.executeTool(c.tool, c.args || {}, false, { source: state.eventSource || '' });
+            const r = await toolsService.executeTool(c.tool, c.args || {}, false, {
+              source: state.eventSource || 'agent',
+              bypassIdempotency: safeObservation,
+              recordIdempotency: !safeObservation,
+            });
             return { tool: c.tool, result: r.result || r };
           } catch (e) { return { tool: c.tool, result: { status: 'error', message: e.message } }; }
         }));
@@ -1037,7 +1262,13 @@ async function act(state, decision) {
         try {
           // Lazy import avoids the subagentOrchestrator <-> agentLoop circular dependency at load time.
           const orch = (await import('./subagentOrchestrator.js')).default;
-          const out = await orch.orchestrate({ goal: state.goal, subtasks, sharedContext: state.goal, synthesize: false });
+          const out = await orch.orchestrate({
+            goal: state.goal,
+            subtasks,
+            sharedContext: state.goal,
+            synthesize: false,
+            localPriority: state.localPriority,
+          });
           const subs = (out && out.subagents) || [];
           const okN = subs.filter(s => s.status === 'done').length;
           result = {
@@ -1077,6 +1308,7 @@ async function act(state, decision) {
   }
 
   if (result.status === 'error') {
+    result.message = errorMessageForResult(result, decision.tool || decision.decision);
     state.errors.push({
       step: state.step_count,
       action: decision.tool || decision.decision,
@@ -1191,6 +1423,7 @@ async function record(state, observations, decision, actionResult) {
           : (decision.tool || '').includes('audio') ? 'voice'
           : 'tool';
         moltbookScheduler.trackIssue(category, lastError.message, {
+          source: 'agent-error',
           tool: decision.tool,
           goal: state.goal?.slice(0, 100),
           error: lastError.message,
@@ -1339,7 +1572,9 @@ async function runAgentLoop(goal, options = {}) {
           const _ok = String(_prior.result.status || '').toLowerCase() === 'ok';
           state.last_result = _prior.result;
           state.status = _ok ? AgentStatus.SUCCESS : AgentStatus.FAILED;
-          state.final_result = state.final_result || (_ok ? (_prior.result.message || 'Done.') : (_prior.result.message || _prior.result.error || "I couldn't complete that — my last tool didn't return a result."));
+          state.final_result = state.final_result || (_ok
+            ? await successfulRunAnswer(state, decision.tool, _prior.result)
+            : (_prior.result.message || _prior.result.error || "I couldn't complete that — my last tool didn't return a result."));
           logger.info('[agent] Anti-spin: repeated tool+args, stopping with prior result', { tool: decision.tool });
           break;
         }
@@ -1351,20 +1586,21 @@ async function runAgentLoop(goal, options = {}) {
       // Tier 2 #14: per-step heartbeat for long-horizon supervisors (progress + stuck detection).
       if (state.onStep) { try { state.onStep(state, decision, actionResult); } catch { /* never break the loop */ } }
 
+      const explicitCompletion = completedExplicitNamedToolResult(state);
+      if (explicitCompletion) {
+        state.status = AgentStatus.SUCCESS;
+        state.final_result = formatSuccessfulHistoryAnswer(explicitCompletion);
+        logger.info('[agent] Explicit named-tool sequence complete', { receipts: explicitCompletion.results.length });
+        break;
+      }
+
       // Scope: a single-action goal stops after the FIRST successful tool result, so the
       // loop doesn't tack on unrequested follow-up actions (e.g. take screenshot THEN open).
       if (!state._multiStep && decision && decision.decision === 'tool_call'
           && actionResult && actionResult.result
           && String(actionResult.result.status).toLowerCase() === 'ok') {
         state.status = AgentStatus.SUCCESS;
-        if (!state.final_result) {
-          if (INFO_TOOLS.has(decision.tool)) {
-            const _syn = await synthesizeAnswer(state.goal, decision.tool, actionResult.result);
-            state.final_result = _syn || actionResult.result.message || 'Done.';
-          } else {
-            state.final_result = actionResult.result.message || 'Done.';
-          }
-        }
+        if (!state.final_result) state.final_result = await successfulToolAnswer(state, decision.tool, actionResult.result);
         logger.info('[agent] Scope: single-action complete, stopping', { goal: String(state.goal).slice(0, 40) });
         break;
       }
@@ -1461,7 +1697,9 @@ async function runAgentLoopFromState(state) {
           const _ok = String(_prior.result.status || '').toLowerCase() === 'ok';
           state.last_result = _prior.result;
           state.status = _ok ? AgentStatus.SUCCESS : AgentStatus.FAILED;
-          state.final_result = state.final_result || (_ok ? (_prior.result.message || 'Done.') : (_prior.result.message || _prior.result.error || "I couldn't complete that — my last tool didn't return a result."));
+          state.final_result = state.final_result || (_ok
+            ? await successfulRunAnswer(state, decision.tool, _prior.result)
+            : (_prior.result.message || _prior.result.error || "I couldn't complete that — my last tool didn't return a result."));
           logger.info('[agent] Anti-spin: repeated tool+args, stopping with prior result', { tool: decision.tool });
           break;
         }
@@ -1473,20 +1711,21 @@ async function runAgentLoopFromState(state) {
       // Tier 2 #14: per-step heartbeat for long-horizon supervisors (progress + stuck detection).
       if (state.onStep) { try { state.onStep(state, decision, actionResult); } catch { /* never break the loop */ } }
 
+      const explicitCompletion = completedExplicitNamedToolResult(state);
+      if (explicitCompletion) {
+        state.status = AgentStatus.SUCCESS;
+        state.final_result = formatSuccessfulHistoryAnswer(explicitCompletion);
+        logger.info('[agent] Explicit named-tool sequence complete', { receipts: explicitCompletion.results.length });
+        break;
+      }
+
       // Scope: a single-action goal stops after the FIRST successful tool result, so the
       // loop doesn't tack on unrequested follow-up actions (e.g. take screenshot THEN open).
       if (!state._multiStep && decision && decision.decision === 'tool_call'
           && actionResult && actionResult.result
           && String(actionResult.result.status).toLowerCase() === 'ok') {
         state.status = AgentStatus.SUCCESS;
-        if (!state.final_result) {
-          if (INFO_TOOLS.has(decision.tool)) {
-            const _syn = await synthesizeAnswer(state.goal, decision.tool, actionResult.result);
-            state.final_result = _syn || actionResult.result.message || 'Done.';
-          } else {
-            state.final_result = actionResult.result.message || 'Done.';
-          }
-        }
+        if (!state.final_result) state.final_result = await successfulToolAnswer(state, decision.tool, actionResult.result);
         logger.info('[agent] Scope: single-action complete, stopping', { goal: String(state.goal).slice(0, 40) });
         break;
       }
@@ -1568,5 +1807,11 @@ export default {
   DecisionType,
   createAgentState,
   // Tier 1 #9: pure decision helpers exported for golden-path tests
-  _internals: { parseDecisionJson, isMultiStepGoal, mapNativeDecision, buildNativeTools, _toolAllowed }
+  _internals: {
+    parseDecisionJson, isMultiStepGoal, mapNativeDecision, mapNativeTextDecision, buildNativeTools, _toolAllowed,
+    errorMessageForResult, classifyConfirmationResponse, isReadOnlyObservationTool,
+    normalizeRegisteredToolName, normalizeDecisionToolNames,
+    autonomyCategoryForTool, successfulHistoryResult, completedExplicitNamedToolResult,
+    formatSuccessfulHistoryAnswer, decide,
+  }
 };

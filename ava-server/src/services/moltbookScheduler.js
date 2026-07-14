@@ -8,10 +8,14 @@ import memoryService, { MemoryType, MemorySource } from './memory.js';
 import digestQueue from './digestQueue.js';
 import interests from './moltbookInterests.js';
 import watchlist from './moltbookWatchlist.js';
+import capabilityRegistry from './capabilityRegistry.js';
+import { synthesizeLearnings } from './learningSynthesis.js';
 import logger from '../utils/logger.js';
 import { emitVoiceEvent } from './voiceBus.js';
 import fs from 'fs';
 import path from 'path';
+import crypto from 'crypto';
+import avaPaths from '../utils/paths.js';
 // Content composition (post/comment text building, LLM prompt assembly, persona/interest-driven
 // generators) + the privacy sanitizer and issues-file store live in moltbookComposer.js (Tier 2 split).
 import {
@@ -26,14 +30,20 @@ import {
   evolveInterestFrom,
 } from './moltbookComposer.js';
 
-const STATE_PATH = path.join(process.cwd(), 'data', 'moltbook-scheduler-state.json');
-const AVA_CODE_ROOT = path.join(process.env.HOME || process.env.USERPROFILE, 'ava-integration');
-const AVA_SERVER_ROOT = process.cwd();
+const STATE_PATH = path.join(avaPaths.dataDir(), 'moltbook-scheduler-state.json');
 const HOME_SYNC_EVERY_MS = Math.max(5, parseInt(process.env.AVA_MOLTBOOK_HOME_SYNC_MIN || '15', 10)) * 60 * 1000;
 const HOME_SYNC_COMMENT_LIMIT = Math.max(10, parseInt(process.env.AVA_MOLTBOOK_HOME_COMMENT_LIMIT || '60', 10));
 const POST_CHECK_LIMIT = Math.max(5, parseInt(process.env.AVA_MOLTBOOK_POST_CHECK_LIMIT || '12', 10));
 const EXTERNAL_CHECK_LIMIT = Math.max(5, parseInt(process.env.AVA_MOLTBOOK_EXTERNAL_CHECK_LIMIT || '20', 10));
 const REPLY_LIMIT_PER_CYCLE = Math.max(1, parseInt(process.env.AVA_MOLTBOOK_REPLY_LIMIT_PER_CYCLE || '12', 10));
+const COMMENT_REPLY_MAX_ATTEMPTS = Math.max(1, parseInt(process.env.AVA_MOLTBOOK_REPLY_MAX_ATTEMPTS || '3', 10));
+const PROCESSED_COMMENT_LIMIT = Math.max(5000, parseInt(process.env.AVA_MOLTBOOK_PROCESSED_COMMENT_LIMIT || '50000', 10));
+const TRACKED_EXTERNAL_LIMIT = Math.max(1000, parseInt(process.env.AVA_MOLTBOOK_TRACKED_EXTERNAL_LIMIT || '10000', 10));
+const KNOWN_POST_LIMIT = Math.max(1000, parseInt(process.env.AVA_MOLTBOOK_KNOWN_POST_LIMIT || '10000', 10));
+const RECENT_POST_LIMIT = Math.max(200, parseInt(process.env.AVA_MOLTBOOK_RECENT_POST_LIMIT || '2000', 10));
+const LEARN_FEED_LIMIT = Math.max(25, parseInt(process.env.AVA_MOLTBOOK_LEARN_FEED_LIMIT || '100', 10));
+const LEARN_SEARCH_LIMIT = Math.max(25, parseInt(process.env.AVA_MOLTBOOK_LEARN_SEARCH_LIMIT || '100', 10));
+const PREVIEW_DRAFT_TTL_MS = Math.max(5, parseInt(process.env.AVA_MOLTBOOK_PREVIEW_TTL_MIN || '30', 10)) * 60 * 1000;
 
 function readState() {
   try {
@@ -55,13 +65,33 @@ function readState() {
   };
 }
 
-function writeState(state) {
+const ISOLATED_STATE_FIELDS = ['pendingVerifications', 'previewDrafts'];
+
+export function mergeSchedulerStateForWrite(nextState = {}, currentState = {}, authoritativeFields = []) {
+  const merged = { ...nextState };
+  const authoritative = new Set(authoritativeFields);
+  for (const field of ISOLATED_STATE_FIELDS) {
+    if (!authoritative.has(field) && Object.prototype.hasOwnProperty.call(currentState, field)) {
+      merged[field] = currentState[field];
+    }
+  }
+  return merged;
+}
+
+function writeState(state, { authoritativeFields = [] } = {}) {
   try {
     const dir = path.dirname(STATE_PATH);
     if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-    fs.writeFileSync(STATE_PATH, JSON.stringify(state, null, 2));
+    let current = {};
+    if (fs.existsSync(STATE_PATH)) {
+      try { current = JSON.parse(fs.readFileSync(STATE_PATH, 'utf8')); } catch { /* replace unreadable state */ }
+    }
+    const merged = mergeSchedulerStateForWrite(state, current, authoritativeFields);
+    fs.writeFileSync(STATE_PATH, JSON.stringify(merged, null, 2));
+    return merged;
   } catch (e) {
     logger.warn('[moltbook-scheduler] Failed to write state', { error: e.message });
+    return null;
   }
 }
 
@@ -77,6 +107,15 @@ function commentAuthorName(comment) {
   return comment?.author?.name || comment?.author?.username || comment?.author_name || comment?.agent_name || '';
 }
 
+export function isOwnMoltbookPost(post, agentName = 'AVA-Voice') {
+  const authorName = post?.author?.name
+    || post?.author?.username
+    || post?.author_name
+    || post?.agent_name
+    || '';
+  return !!authorName && String(authorName).trim().toLowerCase() === String(agentName).trim().toLowerCase();
+}
+
 function rememberExternalComment(state, postId, commentResult, postTitle = '') {
   const comment = commentResult?.comment || commentResult?.data?.comment || commentResult;
   const commentId = commentIdOf(comment);
@@ -89,7 +128,7 @@ function rememberExternalComment(state, postId, commentResult, postTitle = '') {
     postTitle: String(postTitle || '').slice(0, 160),
     commentedAt: new Date().toISOString()
   });
-  state.commentsOnOthers = state.commentsOnOthers.slice(-300);
+  state.commentsOnOthers = state.commentsOnOthers.slice(-TRACKED_EXTERNAL_LIMIT);
 }
 
 function commentContentOf(comment) {
@@ -110,6 +149,61 @@ function flattenComments(comments, parentId = null) {
     }
   }
   return out;
+}
+
+export function markMoltbookCommentProcessed(state, commentKey) {
+  if (!state || !commentKey) return;
+  state.processedComments = Array.isArray(state.processedComments) ? state.processedComments : [];
+  if (!state.processedComments.includes(commentKey)) state.processedComments.push(commentKey);
+  state.processedComments = state.processedComments.slice(-PROCESSED_COMMENT_LIMIT);
+  if (state.commentReplyAttempts && typeof state.commentReplyAttempts === 'object') {
+    delete state.commentReplyAttempts[commentKey];
+  }
+}
+
+export function recordMoltbookReplyFailure(
+  state,
+  commentKey,
+  reason = 'draft_rejected',
+  maxAttempts = COMMENT_REPLY_MAX_ATTEMPTS,
+) {
+  if (!state || !commentKey) return { attempts: 0, exhausted: false };
+  state.commentReplyAttempts = state.commentReplyAttempts && !Array.isArray(state.commentReplyAttempts)
+    ? state.commentReplyAttempts
+    : {};
+
+  const prior = state.commentReplyAttempts[commentKey];
+  const priorCount = Number(typeof prior === 'object' ? prior?.attempts : prior) || 0;
+  const attempts = priorCount + 1;
+  const exhausted = attempts >= Math.max(1, Number(maxAttempts) || COMMENT_REPLY_MAX_ATTEMPTS);
+
+  if (exhausted) {
+    state.skippedCommentReplies = Array.isArray(state.skippedCommentReplies) ? state.skippedCommentReplies : [];
+    state.skippedCommentReplies.push({
+      commentKey,
+      reason: String(reason || 'draft_rejected').slice(0, 120),
+      attempts,
+      skippedAt: new Date().toISOString(),
+    });
+    state.skippedCommentReplies = state.skippedCommentReplies.slice(-PROCESSED_COMMENT_LIMIT);
+    markMoltbookCommentProcessed(state, commentKey);
+    return { attempts, exhausted: true };
+  }
+
+  state.commentReplyAttempts[commentKey] = {
+    attempts,
+    reason: String(reason || 'draft_rejected').slice(0, 120),
+    lastAttemptAt: new Date().toISOString(),
+  };
+
+  const entries = Object.entries(state.commentReplyAttempts);
+  if (entries.length > PROCESSED_COMMENT_LIMIT) {
+    entries
+      .sort((a, b) => String(a[1]?.lastAttemptAt || '').localeCompare(String(b[1]?.lastAttemptAt || '')))
+      .slice(0, entries.length - PROCESSED_COMMENT_LIMIT)
+      .forEach(([key]) => delete state.commentReplyAttempts[key]);
+  }
+  return { attempts, exhausted: false };
 }
 
 async function syncMoltbookHomeActivity(sharedState = null) {
@@ -136,15 +230,28 @@ async function syncMoltbookHomeActivity(sharedState = null) {
       if (!postId) continue;
       posts++;
 
-      if (!state.knownPostIds.includes(postId)) state.knownPostIds.push(postId);
+      let post = null;
+      try { post = await moltbookService.getPost(postId); } catch { post = null; }
+      const ownPost = isOwnMoltbookPost(post, moltbookService.agentName);
+      if (ownPost && !state.knownPostIds.includes(postId)) state.knownPostIds.push(postId);
 
-      let threadComments = [];
-      try {
-        threadComments = await moltbookService.getPostComments(postId, HOME_SYNC_COMMENT_LIMIT);
-      } catch {
-        threadComments = [];
+      let threadComments = Array.isArray(post?.comments) ? post.comments : [];
+      if (!threadComments.length) {
+        try {
+          threadComments = await moltbookService.getPostComments(postId, HOME_SYNC_COMMENT_LIMIT);
+        } catch {
+          threadComments = [];
+        }
       }
       threadComments = flattenComments(threadComments);
+
+      if (!ownPost) {
+        for (const comment of threadComments) {
+          if (commentAuthorName(comment).toLowerCase() === moltbookService.agentName.toLowerCase()) {
+            rememberExternalComment(state, postId, comment, post?.title || item.post_title || item.title || '');
+          }
+        }
+      }
 
       for (const comment of threadComments) {
         const cid = commentIdOf(comment);
@@ -174,8 +281,8 @@ async function syncMoltbookHomeActivity(sharedState = null) {
       try { await moltbookService.markPostNotificationsRead(postId); } catch {}
     }
 
-    state.knownPostIds = state.knownPostIds.slice(-300);
-    state.processedHomeComments = state.processedHomeComments.slice(-2000);
+    state.knownPostIds = state.knownPostIds.slice(-KNOWN_POST_LIMIT);
+    state.processedHomeComments = state.processedHomeComments.slice(-PROCESSED_COMMENT_LIMIT);
     state.lastHomeActivitySync = Date.now();
     writeState(state);
     return { posts, comments, learned, state };
@@ -188,28 +295,68 @@ async function syncMoltbookHomeActivity(sharedState = null) {
 /**
  * Track an issue for potential Moltbook posting
  */
+function isActionableIssueDescription(value) {
+  const description = String(value || '').trim();
+  if (description.length < 12) return false;
+  if (/^(?:query required|description required|unknown|undefined|null|none|n\/a|error|failed|deferred|denied)$/i.test(description)) {
+    return false;
+  }
+  return !/^(?:[\w.-]+\s*:\s*(?:deferred|denied|undefined|unknown|error|skipped|unavailable)\s*;?\s*)+$/i.test(description);
+}
+
 export function trackIssue(category, description, context = {}) {
   const issues = readIssues();
-  const sanitizedDesc = sanitizeForMoltbook(description);
+  const sanitizedDesc = sanitizeForMoltbook(description).trim();
+  if (!sanitizedDesc) {
+    logger.warn('[moltbook-scheduler] Ignored issue without a usable description', { category });
+    return { tracked: false, reason: 'empty_description' };
+  }
+  if (!isActionableIssueDescription(sanitizedDesc)) {
+    logger.info('[moltbook-scheduler] Ignored low-information issue receipt', { category });
+    return { tracked: false, reason: 'non_actionable_receipt' };
+  }
   const sanitizedContext = {};
   for (const [k, v] of Object.entries(context)) {
     sanitizedContext[k] = typeof v === 'string' ? sanitizeForMoltbook(v) : v;
   }
 
-  issues.issues.push({
+  const normalizedCategory = String(category || 'general').trim() || 'general';
+  const tool = String(sanitizedContext.tool || '').toLowerCase();
+  const existing = issues.issues.find(issue => !issue.posted
+    && String(issue.category || '').toLowerCase() === normalizedCategory.toLowerCase()
+    && String(issue.description || '').toLowerCase() === sanitizedDesc.toLowerCase()
+    && String(issue.context?.tool || '').toLowerCase() === tool);
+  if (existing) {
+    existing.occurrences = Math.max(1, Number(existing.occurrences) || 1) + 1;
+    existing.updatedAt = new Date().toISOString();
+    existing.context = { ...(existing.context || {}), ...sanitizedContext };
+    writeIssues(issues);
+    return { tracked: true, deduplicated: true, id: existing.id, occurrences: existing.occurrences };
+  }
+
+  const issue = {
     id: `issue-${Date.now()}`,
-    category,
+    category: normalizedCategory,
     description: sanitizedDesc,
     context: sanitizedContext,
     createdAt: new Date().toISOString(),
-    posted: false
-  });
+    posted: false,
+    occurrences: 1,
+  };
+  issues.issues.push(issue);
 
   // Keep last 50 issues
   issues.issues = issues.issues.slice(-50);
   writeIssues(issues);
 
   logger.info('[moltbook-scheduler] Issue tracked', { category, description: sanitizedDesc.slice(0, 100) });
+  return { tracked: true, deduplicated: false, id: issue.id, occurrences: 1 };
+}
+
+export function isPostableIssue(issue) {
+  if (!issue || issue.posted || issue.resolvedAt || !isActionableIssueDescription(issue.description)) return false;
+  if (issue.context?.source === 'agent-error') return (Number(issue.occurrences) || 1) >= 3;
+  return true;
 }
 
 /**
@@ -238,43 +385,48 @@ async function fetchAndLearnDirect() {
 
   try {
     // 1. Fetch feed
-    const posts = await moltbookService.getFeed(25, 'hot');
+    const posts = await moltbookService.getFeed(LEARN_FEED_LIMIT, 'hot');
     logger.info('[moltbook-scheduler] Fetched feed', { count: posts.length });
 
-    // 2. Search for random relevant topic
-    const searchTerms = [
-      'voice assistant', 'agent self improvement', 'troubleshooting',
-      'local device control', 'autonomous agent', 'audio processing',
-      'speech recognition', 'personal assistant', 'agent memory',
-      'tool execution', 'error handling', 'agent architecture'
-    ];
-    const randomTerm = searchTerms[Math.floor(Math.random() * searchTerms.length)];
-    const searchResults = await moltbookService.search(randomTerm, 10);
-    logger.info('[moltbook-scheduler] Searched', { term: randomTerm, count: searchResults.length });
+    // 2. Search from AVA's evolving interests, open issues, watchlist, and
+    // current capability registry. The query rotates durably instead of using
+    // a fixed hand-written topic list.
+    const state = readState();
+    const candidates = new Set();
+    try { for (const topic of interests.top(30) || []) candidates.add(typeof topic === 'string' ? topic : topic.topic); } catch { /* optional */ }
+    try { for (const item of watchlist.list?.() || []) candidates.add(item.term || item.topic || item.handle); } catch { /* optional */ }
+    try { for (const issue of readIssues().issues || []) if (!issue.resolvedAt) candidates.add(`${issue.category || ''} ${issue.description || ''}`); } catch { /* optional */ }
+    try {
+      for (const tool of capabilityRegistry.snapshot().tools || []) {
+        if (tool.status !== 'registered' || !tool.actions.length) candidates.add(`${tool.name} reliability`);
+      }
+    } catch { /* optional */ }
+    const searchTerms = [...candidates].map(term => String(term || '').replace(/\s+/g, ' ').trim()).filter(term => term.length >= 4);
+    const cursor = Math.max(0, Number(state.learningQueryCursor) || 0);
+    const searchTerm = searchTerms.length ? searchTerms[cursor % searchTerms.length] : 'agent reliability';
+    state.learningQueryCursor = cursor + 1;
+    state.lastLearningQuery = searchTerm;
+    writeState(state);
+    const searchResults = await moltbookService.search(searchTerm, LEARN_SEARCH_LIMIT);
+    logger.info('[moltbook-scheduler] Searched', { term: searchTerm, count: searchResults.length, candidates: searchTerms.length });
 
     // 3. Store learnings directly in memory
-    const learningSubmolts = ['selfimprovement', 'improvements', 'tips', 'voiceai', 'agentstack', 'continual-learning', 'metaprompting', 'askagents', 'builds'];
-
     for (const post of posts) {
       if (!post || !post.content || post.content.length < 50) continue;
       const submolt = post.submolt?.name || 'general';
-      const isLearningSubmolt = learningSubmolts.includes(submolt);
-      const hasHighUpvotes = (post.upvotes || 0) > 10;
-
-      if (isLearningSubmolt || hasHighUpvotes) {
-        const summary = moltbookService.summarize(post.content);
-        if (summary && summary.length > 30) {
-          try {
-            await memoryService.store({
-              text: `[Moltbook/${submolt}] ${post.title}: ${summary}`,
-              type: 'fact',
-              priority: 2,
-              source: 'learned',
-              tags: ['moltbook', 'community', submolt]
-            });
-            newLearnings++;
-          } catch (e) {}
-        }
+      const summary = moltbookService.summarize(post.content);
+      if (summary && summary.length > 30) {
+        try {
+          await memoryService.upsert({
+            text: `[Moltbook/${submolt}] ${post.title}: ${summary}`,
+            type: MemoryType.OBSERVATION,
+            priority: (post.upvotes || 0) > 10 ? 3 : 2,
+            source: MemorySource.COMMUNITY,
+            tags: ['moltbook', 'community', 'unverified', submolt],
+            meta: { postId: post.id || post.postId || null, upvotes: post.upvotes || 0 }
+          });
+          newLearnings++;
+        } catch (e) {}
       }
     }
 
@@ -284,12 +436,13 @@ async function fetchAndLearnDirect() {
       const summary = moltbookService.summarize(post.content);
       if (summary && summary.length > 30) {
         try {
-          await memoryService.store({
-            text: `[Moltbook Search: ${randomTerm}] ${post.title}: ${summary}`,
-            type: 'fact',
+          await memoryService.upsert({
+            text: `[Moltbook Search: ${searchTerm}] ${post.title}: ${summary}`,
+            type: MemoryType.OBSERVATION,
             priority: 2,
-            source: 'learned',
-            tags: ['moltbook', 'search', randomTerm.replace(/\s+/g, '-')]
+            source: MemorySource.COMMUNITY,
+            tags: ['moltbook', 'search', 'unverified', searchTerm.replace(/\s+/g, '-')],
+            meta: { postId: post.id || post.postId || null, query: searchTerm }
           });
           newLearnings++;
         } catch (e) {}
@@ -411,7 +564,10 @@ async function runMoltbookLearning(isUserInitiated = false) {
  * Post a question or insight to Moltbook
  */
 // Posts awaiting the user's answer to a Moltbook verification challenge (AVA does not auto-solve).
-const _pendingVerifications = [];
+const persistedVerificationState = readState();
+const _pendingVerifications = Array.isArray(persistedVerificationState.pendingVerifications)
+  ? persistedVerificationState.pendingVerifications.slice(-20)
+  : [];
 const VERIFICATION_TTL_MS = 9.5 * 60 * 1000; // challenges expire around 10 minutes
 
 function verificationStatusOf(obj) {
@@ -425,8 +581,19 @@ function verificationStatusOf(obj) {
   ).toLowerCase();
 }
 
+export function publicationStatusOf(result) {
+  if (!result?.success) return 'failed';
+  const status = verificationStatusOf(result);
+  const verification = result?.post?.verification;
+  if (status === 'pending' || (verification && (verification.verification_code || verification.challenge_text))) {
+    return 'pending_verification';
+  }
+  return 'published';
+}
+
 function verificationSucceeded(res) {
   const status = verificationStatusOf(res);
+  if (status === 'pending') return false;
   const msg = String(res?.message || res?.status || '').toLowerCase();
   return !!(
     res?.success ||
@@ -438,6 +605,60 @@ function verificationSucceeded(res) {
     ['verified', 'published', 'approved', 'active', 'live'].includes(status) ||
     /\b(verified|published|approved)\b/.test(msg)
   );
+}
+
+export function applyPublishedPostToState(state, publication = {}) {
+  const postId = publication.post_id || publication.postId || publication.id;
+  if (!postId) return false;
+  state.recentPosts = Array.isArray(state.recentPosts) ? state.recentPosts : [];
+  if (state.recentPosts.some(post => post.id === postId)) return false;
+
+  const suppliedAt = Number(publication.publishedAt || publication.published_at);
+  const publishedAt = Number.isFinite(suppliedAt) && suppliedAt > 0 ? suppliedAt : Date.now();
+  state.recentPosts.push({
+    id: postId,
+    submolt: publication.submolt || 'general',
+    title: String(publication.title || '').slice(0, 160),
+    postedAt: new Date(publishedAt).toISOString(),
+    verified: true,
+  });
+  state.recentPosts = state.recentPosts.slice(-RECENT_POST_LIMIT);
+  const publicationDate = new Date(publishedAt).toDateString();
+  if (state.postsDate !== publicationDate) {
+    state.postsDate = publicationDate;
+    state.postsToday = 0;
+  }
+  state.postsToday = (state.postsToday || 0) + 1;
+  state.postsTotal = (state.postsTotal || 0) + 1;
+  state.verifiedPostsTotal = (state.verifiedPostsTotal || 0) + 1;
+  state.lastPostAt = publishedAt;
+  if (publication.kind === 'self') {
+    state.selfPostsTotal = (state.selfPostsTotal || 0) + 1;
+    state.verifiedSelfPostsTotal = (state.verifiedSelfPostsTotal || 0) + 1;
+    state.lastSelfPostAt = publishedAt;
+  }
+  return true;
+}
+
+function recordPublishedPost(publication) {
+  const state = readState();
+  if (!applyPublishedPostToState(state, publication)) return false;
+  writeState(state);
+  return true;
+}
+
+function markIssuePublished(publication) {
+  if (publication.kind !== 'issue') return false;
+  const issues = readIssues();
+  const issue = (issues.issues || []).find(item => (
+    (publication.issue_id && (item.id === publication.issue_id || item.issueId === publication.issue_id))
+    || (publication.issue_description && item.description === publication.issue_description)
+  ));
+  if (!issue) return false;
+  issue.posted = true;
+  issue.postId = publication.post_id || publication.postId;
+  writeIssues(issues);
+  return true;
 }
 
 function shouldKeepAfterVerificationResponse(res) {
@@ -456,9 +677,19 @@ function _emitVerifications() {
   try { emitVoiceEvent('moltbook.verifications', { pending: _pendingVerifications.slice() }, 'server'); } catch { /* ui push is best-effort */ }
 }
 
+function persistPendingVerifications() {
+  const state = readState();
+  state.pendingVerifications = _pendingVerifications.slice();
+  writeState(state, { authoritativeFields: ['pendingVerifications'] });
+}
+
 function removePendingVerification(code) {
   const i = _pendingVerifications.findIndex(v => v.verification_code === code);
-  if (i >= 0) { _pendingVerifications.splice(i, 1); _emitVerifications(); }
+  if (i >= 0) {
+    _pendingVerifications.splice(i, 1);
+    persistPendingVerifications();
+    _emitVerifications();
+  }
 }
 
 async function prunePendingVerifications({ refresh = false } = {}) {
@@ -477,6 +708,9 @@ async function prunePendingVerifications({ refresh = false } = {}) {
       const status = verificationStatusOf(post);
       const stillNeedsChallenge = !!(post?.verification && (post.verification.verification_code || post.verification.challenge_text));
       if (verificationSucceeded(post) || (post && !stillNeedsChallenge && status && status !== 'pending')) {
+        const publication = { ...v, publishedAt: Date.now() };
+        recordPublishedPost(publication);
+        markIssuePublished(publication);
         _pendingVerifications.splice(i, 1);
         changed = true;
       }
@@ -484,7 +718,10 @@ async function prunePendingVerifications({ refresh = false } = {}) {
       // Keep the local card if the status check itself failed; the submit path will reconcile it.
     }
   }
-  if (changed) _emitVerifications();
+  if (changed) {
+    persistPendingVerifications();
+    _emitVerifications();
+  }
 }
 
 export async function getPendingVerifications() {
@@ -493,14 +730,20 @@ export async function getPendingVerifications() {
 }
 
 export async function submitMoltbookVerification(code, answer) {
+  const pending = _pendingVerifications.find(item => item.verification_code === code);
   const res = await moltbookService.submitVerification(code, answer);
   const ok = verificationSucceeded(res);
   const keep = shouldKeepAfterVerificationResponse(res);
+  if (ok && pending) {
+    const publication = { ...pending, publishedAt: Date.now() };
+    recordPublishedPost(publication);
+    markIssuePublished(publication);
+  }
   if (!keep) removePendingVerification(code);
-  return { ok, cleared: !keep, retryable: keep, result: res };
+  return { ok, published: ok, cleared: !keep, retryable: keep, result: res };
 }
 
-async function postToMoltbook(submolt, title, content) {
+async function postToMoltbook(submolt, title, content, options = {}) {
   if (!moltbookService.isConfigured) {
     return { ok: false, reason: 'not_configured' };
   }
@@ -515,34 +758,43 @@ async function postToMoltbook(submolt, title, content) {
   try {
     const result = await moltbookService.post(submolt, safeTitle, fullContent);
     if (result.success) {
-      logger.info('[moltbook-scheduler] Posted to Moltbook', { submolt, title: safeTitle });
-
-      // Track the post
-      const state = readState();
-      if (!state.recentPosts) state.recentPosts = [];
-      state.recentPosts.push({
-        id: result.post?.id,
+      const publicationStatus = publicationStatusOf(result);
+      const publication = {
+        post_id: result.post?.id,
         submolt,
         title: safeTitle,
-        postedAt: new Date().toISOString()
-      });
-      state.recentPosts = state.recentPosts.slice(-50);
-      state.postsToday++;
-      state.lastPostAt = Date.now();
-      writeState(state);
+        kind: options.kind || 'post',
+        issue_id: options.issueId || null,
+        issue_description: options.issueDescription || null,
+      };
+      logger.info('[moltbook-scheduler] Moltbook accepted post', { submolt, title: safeTitle, publicationStatus });
 
       // Per-post verification challenge -> queue for the USER to answer (AVA does not auto-solve).
       const _v = result.post && result.post.verification;
       if (_v && (_v.verification_code || _v.challenge_text)) {
-        _pendingVerifications.push({
-          post_id: result.post.id, title: safeTitle, submolt,
+        const pending = {
+          ...publication,
           challenge_text: _v.challenge_text || '', instructions: _v.instructions || '',
           verification_code: _v.verification_code || '', expires_at: _v.expires_at || '', queued_at: Date.now(),
-        });
+        };
+        const existing = _pendingVerifications.findIndex(item => item.post_id === pending.post_id
+          || item.verification_code === pending.verification_code);
+        if (existing >= 0) _pendingVerifications.splice(existing, 1, pending);
+        else _pendingVerifications.push(pending);
         while (_pendingVerifications.length > 20) _pendingVerifications.shift();
+        persistPendingVerifications();
         _emitVerifications();  // Tier 2 #15: card appears in the UI immediately, no poll
         logger.info('[moltbook-scheduler] Post needs verification — queued for user', { post: result.post.id });
+      } else if (publicationStatus === 'published') {
+        recordPublishedPost({ ...publication, publishedAt: Date.now() });
+        markIssuePublished(publication);
       }
+      return {
+        ...result,
+        publicationStatus,
+        published: publicationStatus === 'published',
+        verificationRequired: publicationStatus === 'pending_verification',
+      };
     } else {
       logger.warn('[moltbook-scheduler] Moltbook post returned non-success', {
         submolt,
@@ -564,7 +816,7 @@ async function postToMoltbook(submolt, title, content) {
  */
 async function askMoltbookForHelp() {
   const issues = readIssues();
-  const unpostedIssues = issues.issues.filter(i => !i.posted);
+  const unpostedIssues = issues.issues.filter(isPostableIssue);
 
   if (unpostedIssues.length === 0) {
     return { ok: false, reason: 'no_issues' };
@@ -589,13 +841,19 @@ ${issue.context?.attempted ? `**What I tried:** ${issue.context.attempted}` : ''
 
 Has anyone encountered something similar? Any tips or solutions would be appreciated!`;
 
-  const result = await postToMoltbook(submolt, title, content);
+  const result = await postToMoltbook(submolt, title, content, {
+    kind: 'issue',
+    issueId: issue.id || issue.issueId || null,
+    issueDescription: issue.description,
+  });
 
-  if (result.success) {
+  if (result.published) {
     issue.posted = true;
     issue.postId = result.post?.id;
     writeIssues(issues);
     logger.info('[moltbook-scheduler] Posted help request successfully', { submolt, title: title.slice(0, 50) });
+  } else if (result.verificationRequired) {
+    logger.info('[moltbook-scheduler] Help request is awaiting user verification', { submolt, title: title.slice(0, 50) });
   } else {
     logger.warn('[moltbook-scheduler] Help request post failed', { error: result.error });
   }
@@ -704,7 +962,7 @@ ${learning.source ? `Source: ${learning.source}` : ''}
 
 Hope this helps someone else!`;
 
-  return postToMoltbook('improvements', title, content);
+  return postToMoltbook('improvements', title, content, { kind: 'learning' });
 }
 
 /**
@@ -718,6 +976,7 @@ async function checkAndRespondToComments(sharedState = null) {
   try {
     const state = sharedState || readState();
     if (!state.processedComments) state.processedComments = [];
+    if (!state.commentReplyAttempts || Array.isArray(state.commentReplyAttempts)) state.commentReplyAttempts = {};
     if (!state.recentPosts) state.recentPosts = [];
     if (!state.knownPostIds) state.knownPostIds = [];
 
@@ -730,7 +989,7 @@ async function checkAndRespondToComments(sharedState = null) {
       for (const result of searchResults) {
         const post = result.post || result;
         // Only track posts authored by AVA-Voice
-        if (post && post.id && post.author?.name === 'AVA-Voice') {
+        if (post && post.id && isOwnMoltbookPost(post, moltbookService.agentName)) {
           if (!state.knownPostIds.includes(post.id)) {
             state.knownPostIds.push(post.id);
             logger.info('[moltbook-scheduler] Discovered own post from search', { postId: post.id, title: post.title?.slice(0, 50) });
@@ -768,6 +1027,16 @@ async function checkAndRespondToComments(sharedState = null) {
           logger.debug('[moltbook-scheduler] Could not fetch post', { postId });
           continue;
         }
+        if (!isOwnMoltbookPost(post, moltbookService.agentName)) {
+          allPostIds.delete(postId);
+          state.knownPostIds = state.knownPostIds.filter(id => id !== postId);
+          state.recentPosts = state.recentPosts.filter(item => item.id !== postId);
+          logger.info('[moltbook-scheduler] Removed foreign post from own-post reply queue', {
+            postId,
+            author: post?.author?.name || post?.author_name || 'unknown',
+          });
+          continue;
+        }
 
         let comments = post.comments || [];
         if (!comments.length) {
@@ -795,7 +1064,7 @@ async function checkAndRespondToComments(sharedState = null) {
           const commenter = commentAuthorName(comment) || 'someone';
           const commentContent = commentContentOf(comment);
 
-          if (commentContent.length > 15) {
+          if (commentContent) {
             // Generate contextual response using LLM
             const response = await generateResponse(
               post.title,
@@ -804,8 +1073,8 @@ async function checkAndRespondToComments(sharedState = null) {
               commenter
             );
 
-            if (response) {
-              const safeResponse = sanitizeForMoltbook(response);
+            const safeResponse = response ? sanitizeForMoltbook(response).trim() : '';
+            if (safeResponse) {
               // Reply to the specific comment using parent_id
               await moltbookService.comment(postId, safeResponse, cid);
               responded++;
@@ -819,22 +1088,31 @@ async function checkAndRespondToComments(sharedState = null) {
               // Learn from helpful replies
               if (commentContent.length > 50) {
                 try {
-                  await memoryService.store({
+                  await memoryService.upsert({
                     text: `[Moltbook advice from ${commenter}]: ${sanitizeForMoltbook(commentContent).slice(0, 300)}`,
-                    type: 'fact',
+                    type: MemoryType.OBSERVATION,
                     priority: 3,
-                    source: 'learned',
-                    tags: ['moltbook', 'advice', 'community']
+                    source: MemorySource.COMMUNITY,
+                    tags: ['moltbook', 'advice', 'community', 'unverified'],
+                    meta: { postId, commentId: cid, author: commenter }
                   });
                 } catch (e) {}
               }
+              markMoltbookCommentProcessed(state, commentKey);
+            } else {
+              const failure = recordMoltbookReplyFailure(state, commentKey, 'grounding_gate_rejected');
+              logger.warn('[moltbook-scheduler] Grounded reply unavailable', {
+                postId,
+                commentId: cid,
+                attempts: failure.attempts,
+                exhausted: failure.exhausted,
+              });
             }
+          } else {
+            markMoltbookCommentProcessed(state, commentKey);
           }
 
-          // Mark as processed and save immediately to prevent duplicate responses
-          state.processedComments.push(commentKey);
-          // Keep only last 500 processed comments
-          state.processedComments = state.processedComments.slice(-3000);
+          // Save immediately so retries and successful replies both survive restarts.
           writeState(state);
           if (responded >= REPLY_LIMIT_PER_CYCLE) break;
         }
@@ -845,7 +1123,7 @@ async function checkAndRespondToComments(sharedState = null) {
     }
 
     // Save knownPostIds (limit to 100)
-    state.knownPostIds = [...allPostIds].slice(-100);
+    state.knownPostIds = [...allPostIds].slice(-KNOWN_POST_LIMIT);
     writeState(state);
 
     return { checked, responded, state };
@@ -865,12 +1143,13 @@ async function checkAndRespondToExternalReplies(sharedState = null) {
   try {
     const state = sharedState || readState();
     state.processedComments = state.processedComments || [];
+    if (!state.commentReplyAttempts || Array.isArray(state.commentReplyAttempts)) state.commentReplyAttempts = {};
     state.commentsOnOthers = state.commentsOnOthers || [];
 
     let checked = 0;
     let responded = 0;
 
-    const trackedComments = state.commentsOnOthers.slice(-300);
+    const trackedComments = state.commentsOnOthers.slice(-TRACKED_EXTERNAL_LIMIT);
     const startIndex = Math.max(0, state.externalCommentCheckIndex || 0) % Math.max(1, trackedComments.length);
     const selected = trackedComments.slice(startIndex, startIndex + EXTERNAL_CHECK_LIMIT);
     if (selected.length < Math.min(EXTERNAL_CHECK_LIMIT, trackedComments.length)) {
@@ -912,8 +1191,8 @@ async function checkAndRespondToExternalReplies(sharedState = null) {
             commenter
           );
 
-          if (response) {
-            const safeResponse = sanitizeForMoltbook(response);
+          const safeResponse = response ? sanitizeForMoltbook(response).trim() : '';
+          if (safeResponse) {
             const replyResult = await moltbookService.comment(tracked.postId, safeResponse, cid);
             rememberExternalComment(state, tracked.postId, replyResult, post.title || tracked.postTitle || '');
             responded++;
@@ -923,10 +1202,17 @@ async function checkAndRespondToExternalReplies(sharedState = null) {
               replyCommentId: cid,
               commenter,
             });
+            markMoltbookCommentProcessed(state, commentKey);
+          } else {
+            const failure = recordMoltbookReplyFailure(state, commentKey, 'grounding_gate_rejected');
+            logger.warn('[moltbook-scheduler] Grounded external reply unavailable', {
+              postId: tracked.postId,
+              commentId: cid,
+              attempts: failure.attempts,
+              exhausted: failure.exhausted,
+            });
           }
 
-          state.processedComments.push(commentKey);
-          state.processedComments = state.processedComments.slice(-3000);
           writeState(state);
           if (responded >= REPLY_LIMIT_PER_CYCLE) break;
         }
@@ -947,8 +1233,10 @@ async function checkAndRespondToExternalReplies(sharedState = null) {
  * Post a new question to Moltbook
  */
 async function postNewQuestion() {
-  const { submolt, title, content } = await generateNewQuestion();
-  return postToMoltbook(submolt, title, content);
+  const generated = await generateNewQuestion();
+  if (!generated) return { success: false, skipped: true, reason: 'nothing_grounded_to_post' };
+  const { submolt, title, content } = generated;
+  return postToMoltbook(submolt, title, content, { kind: 'self' });
 }
 
 // Engage with the community: comment on one fresh post by someone else (never AVA's own, never
@@ -984,7 +1272,7 @@ async function engageWithFeed(state) {
       state.engagedPosts.push(pid);
       rememberExternalComment(state, pid, r, target.title || '');
       evolveInterestFrom(target).catch(() => {});  // her interests grow from what she reads
-      if (state.engagedPosts.length > 800) state.engagedPosts = state.engagedPosts.slice(-800);
+      if (state.engagedPosts.length > KNOWN_POST_LIMIT) state.engagedPosts = state.engagedPosts.slice(-KNOWN_POST_LIMIT);
       state.commentsOnOthersTotal = (state.commentsOnOthersTotal || 0) + 1;
       logger.info('[moltbook-scheduler] Commented on a feed post', { postId: pid });
       return { engaged: 1, state };
@@ -1008,17 +1296,22 @@ async function runActivity() {
     return;
   }
   _activityRunning = true;
+  let learningCompleted = null;
 
   try {
-    await _runActivityInternal();
+    learningCompleted = await _runActivityInternal();
   } finally {
     _activityRunning = false;
+    if (learningCompleted) {
+      emitVoiceEvent('moltbook.learning.completed', learningCompleted, 'moltbook');
+    }
   }
 }
 
 async function _runActivityInternal() {
   let state = readState();
   const now = Date.now();
+  let learningCompleted = null;
 
   // Pull Moltbook home activity first so active posts/comments are known before reply checks.
   try {
@@ -1116,6 +1409,13 @@ async function _runActivityInternal() {
       state.learnsToday = (state.learnsToday || 0) + 1;
       state.learnsTotal = (state.learnsTotal || 0) + findings;
       writeState(state);
+      const synthesis = synthesizeLearnings(moltbookService.learnings || []);
+      learningCompleted = {
+        newLearnings: findings,
+        totalRecords: synthesis.totalInput,
+        uniqueRecords: synthesis.uniqueCount,
+        corpusHash: synthesis.corpusHash,
+      };
       logger.info('[moltbook-scheduler] Learning complete', {
         newLearnings: findings,
         learnsToday: state.learnsToday,
@@ -1139,36 +1439,31 @@ async function _runActivityInternal() {
       const selfPostDue = !state.lastSelfPostAt || now - state.lastSelfPostAt > SELF_POST_MIN;
       if (selfPostDue) {
         const sp = await generateSelfPost();
-        const result = sp ? await postToMoltbook(sp.submolt, sp.title, sp.content) : null;
-        if (result && result.success) {
-          state.lastPostAt = now;
-          state.lastSelfPostAt = now;
-          state.postsTotal = (state.postsTotal || 0) + 1;
-          state.selfPostsTotal = (state.selfPostsTotal || 0) + 1;
-          writeState(state);
+        const result = sp ? await postToMoltbook(sp.submolt, sp.title, sp.content, { kind: 'self' }) : null;
+        if (result?.published) {
           logger.info('[moltbook-scheduler] Posted original self-post');
-          return;
+          return learningCompleted;
+        }
+        if (result?.verificationRequired) {
+          logger.info('[moltbook-scheduler] Original self-post is awaiting user verification');
+          return learningCompleted;
         }
         logger.warn('[moltbook-scheduler] Original self-post was due but failed', {
           error: result && result.error,
           statusCode: result && result.statusCode,
           message: result && result.message,
         });
-        return;
+        return learningCompleted;
       }
 
       // First check if there are tracked issues to post
       const issues = readIssues();
-      const unpostedIssues = issues.issues.filter(i => !i.posted);
+      const unpostedIssues = issues.issues.filter(isPostableIssue);
 
       if (unpostedIssues.length > 0) {
         logger.info('[moltbook-scheduler] Posting tracked issue');
         const result = await askMoltbookForHelp();
-        if (result.success) {
-          state.lastPostAt = now;
-          state.postsTotal = (state.postsTotal || 0) + 1;
-          writeState(state);
-        }
+        if (result.verificationRequired) logger.info('[moltbook-scheduler] Tracked issue is awaiting user verification');
       } else {
         // Alternate an ORIGINAL self-interested post with a help question, so AVA takes part in
         // regular conversation — not only Q&A.
@@ -1176,21 +1471,21 @@ async function _runActivityInternal() {
         let result;
         if (even) {
           const sp = await generateSelfPost();
-          result = sp ? await postToMoltbook(sp.submolt, sp.title, sp.content) : await postNewQuestion();
+          result = sp ? await postToMoltbook(sp.submolt, sp.title, sp.content, { kind: 'self' }) : await postNewQuestion();
         } else {
           result = await postNewQuestion();
         }
-        if (result && result.success) {
-          state.lastPostAt = now;
-          state.postsTotal = (state.postsTotal || 0) + 1;
-          writeState(state);
+        if (result?.published) {
           logger.info('[moltbook-scheduler] Posted', { kind: even ? 'self-post' : 'question' });
+        } else if (result?.verificationRequired) {
+          logger.info('[moltbook-scheduler] Generated post is awaiting user verification', { kind: even ? 'self-post' : 'question' });
         }
       }
     } catch (e) {
       logger.warn('[moltbook-scheduler] Posting failed', { error: e.message });
     }
   }
+  return learningCompleted;
 }
 
 let _timer = null;
@@ -1205,12 +1500,42 @@ let _activityRunning = false; // Prevent concurrent activity runs
  */
 // Preview helper (debug/verify only): generate N sample posts WITHOUT posting them, plus the
 // identity block, so we can confirm posts are persona-driven and varied.
+export function previewDraftId(post = {}) {
+  return crypto.createHash('sha256').update(JSON.stringify([
+    post.submolt || '',
+    post.title || '',
+    post.content || '',
+    post.evidence || '',
+    post.learningCorpusHash || '',
+  ])).digest('hex').slice(0, 24);
+}
+
+export function findPreviewDraft(state = {}, draftId = '', now = Date.now()) {
+  const id = String(draftId || '').trim();
+  if (!id) return null;
+  return (state.previewDrafts || []).find(draft => (
+    draft?.draftId === id && Number(draft.expiresAt || 0) > Number(now)
+  )) || null;
+}
+
 export async function previewSelfPosts(n = 3) {
   const out = [];
   for (let i = 0; i < Math.max(1, Math.min(6, n)); i++) {
-    try { const p = await generateSelfPost(); if (p) out.push(p); } catch { /* skip */ }
+    try { const p = await generateSelfPost({ excludePosts: out, variationIndex: i }); if (p) out.push(p); } catch { /* skip */ }
   }
-  return { identity: buildMoltbookIdentity(), interests: interests.top(8), posts: out };
+  const generatedAt = Date.now();
+  const posts = out.map(post => ({
+    ...post,
+    draftId: previewDraftId(post),
+    expiresAt: generatedAt + PREVIEW_DRAFT_TTL_MS,
+  }));
+  const state = readState();
+  const retained = (state.previewDrafts || []).filter(draft => Number(draft?.expiresAt || 0) > generatedAt);
+  const byId = new Map(retained.map(draft => [draft.draftId, draft]));
+  for (const post of posts) byId.set(post.draftId, { ...post, generatedAt });
+  state.previewDrafts = [...byId.values()].slice(-24);
+  writeState(state, { authoritativeFields: ['previewDrafts'] });
+  return { identity: buildMoltbookIdentity(), interests: interests.top(8), posts };
 }
 
 export function startMoltbookScheduler() {
@@ -1257,21 +1582,34 @@ export async function triggerMoltbookLearning() {
  * Manually trigger posting
  */
 export async function triggerMoltbookPost(submolt, title, content) {
-  return postToMoltbook(submolt, title, content);
+  return postToMoltbook(submolt, title, content, { kind: 'manual' });
 }
 
 /** Manually post one ORIGINAL self-interested post (for testing / on demand). */
-export async function triggerMoltbookSelfPost() {
-  const sp = await generateSelfPost();
-  if (!sp) return { ok: false, reason: 'generation_failed' };
-  const r = await postToMoltbook(sp.submolt, sp.title, sp.content);
-  if (r && r.success) {
-    const state = readState();
-    state.lastSelfPostAt = Date.now();
-    state.selfPostsTotal = (state.selfPostsTotal || 0) + 1;
-    writeState(state);
+export async function triggerMoltbookSelfPost(draftId = '') {
+  const selectedId = String(draftId || '').trim();
+  const sp = selectedId ? findPreviewDraft(readState(), selectedId) : await generateSelfPost();
+  if (!sp) {
+    return selectedId
+      ? { ok: false, reason: 'preview_draft_not_found_or_expired', draftId: selectedId }
+      : { ok: false, reason: 'generation_failed' };
   }
-  return { ok: !!(r && r.success), submolt: sp.submolt, title: sp.title, postId: r && r.post && r.post.id, result: r };
+  const r = await postToMoltbook(sp.submolt, sp.title, sp.content, { kind: 'self' });
+  if (selectedId && r?.success) {
+    const state = readState();
+    state.previewDrafts = (state.previewDrafts || []).filter(draft => draft?.draftId !== selectedId);
+    writeState(state, { authoritativeFields: ['previewDrafts'] });
+  }
+  return {
+    ok: !!r?.published,
+    accepted: !!r?.success,
+    pendingVerification: !!r?.verificationRequired,
+    draftId: selectedId || null,
+    submolt: sp.submolt,
+    title: sp.title,
+    postId: r?.post?.id,
+    result: r,
+  };
 }
 
 /** Manually engage: comment on one of someone else's feed posts (for testing / on demand). */
@@ -1316,6 +1654,9 @@ export function getStats() {
     knownPostIds: (state.knownPostIds || []).length,
     homeActivityLearned: state.homeActivityLearned || 0,
     selfPostsTotal: state.selfPostsTotal || 0,
+    verifiedPostsTotal: state.verifiedPostsTotal || 0,
+    verifiedSelfPostsTotal: state.verifiedSelfPostsTotal || 0,
+    pendingVerifications: _pendingVerifications.length,
     lastLearnAt: state.lastLearnAt ? new Date(state.lastLearnAt).toISOString() : null,
     nextLearnIn: nextLearnIn > 0 ? `${Math.round(nextLearnIn / 60000)} minutes` : 'ready',
     lastPostAt: state.lastPostAt ? new Date(state.lastPostAt).toISOString() : null,
@@ -1324,7 +1665,7 @@ export function getStats() {
     lastExternalReplyCheck: state.lastExternalReplyCheck ? new Date(state.lastExternalReplyCheck).toISOString() : null,
     lastHomeActivitySync: state.lastHomeActivitySync ? new Date(state.lastHomeActivitySync).toISOString() : null,
     recentPosts: state.recentPosts || [],
-    pendingIssues: issues.issues.filter(i => !i.posted).length,
+    pendingIssues: issues.issues.filter(isPostableIssue).length,
     totalIssues: issues.issues.length,
     processedNotifications: (state.processedNotifications || []).length
   };
@@ -1335,6 +1676,7 @@ export default {
   triggerMoltbookLearning,
   triggerMoltbookPost,
   trackIssue,
+  isPostableIssue,
   resolveIssue,
   getStats,
   runMoltbookLearning

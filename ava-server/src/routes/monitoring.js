@@ -29,6 +29,7 @@ router.get('/health', async (_req, res) => {
     }
     return res.json({
       ok: true,
+      timestamp: new Date().toISOString(),
       tools: toolsReady ? 'ready' : 'empty',
       toolsCount,
       version: '0.1.0',

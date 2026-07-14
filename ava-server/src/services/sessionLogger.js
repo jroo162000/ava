@@ -219,10 +219,13 @@ class SessionLogger {
     }
   }
 
-  // Read last n conversation turns from the current session
+  // Read last n conversation turns from the active session. Audit receipts are
+  // execution evidence, not dialogue, and must never be presented as user turns.
   getRecentTurns(n = 10) {
-    if (!this.currentSession || !this.currentSession.conversations.length) return [];
-    return this.currentSession.conversations.slice(-n);
+    if (this.currentSession && this.currentSession.conversations.length > 0) {
+      return this.currentSession.conversations.slice(-n);
+    }
+    return [];
   }
 
   // Get all available session IDs

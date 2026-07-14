@@ -4,7 +4,6 @@
 import express from 'express';
 import fs from 'fs';
 import path from 'path';
-import { fileURLToPath } from 'url';
 import logger from '../utils/logger.js';
 import doctorService from '../services/doctor.js';
 import config from '../utils/config.js';
@@ -28,10 +27,13 @@ import evolutionLog from '../services/evolutionLog.js';
 import moltbookWatchlist from '../services/moltbookWatchlist.js';
 import selfModSandbox from '../services/selfModSandbox.js';  // Tier 2 #13: worktree + test gate
 import uiPush from '../services/uiPush.js';  // Tier 2 #15: push queue changes to the UI (no polling)
+import capabilityRegistry from '../services/capabilityRegistry.js';
+import externalProposalReview from '../services/externalProposalReview.js';
+import modelConfig from '../utils/modelConfig.js';
+import avaPaths from '../utils/paths.js';
+import { pushAnnouncement } from '../services/announceQueue.js';
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-const DATA_DIR = path.join(__dirname, '..', '..', 'data');
+const DATA_DIR = avaPaths.dataDir();
 
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 
@@ -43,18 +45,32 @@ const STYLE_PATH = path.join(DATA_DIR, 'style.json');
 
 const router = express.Router();
 
+function announceSelfModOutcome(text, req, responseType = 'self-mod-result') {
+  try {
+    pushAnnouncement(text, {
+      responseType,
+      source: 'self-mod',
+      sessionId: req.body?.sessionId || req.body?.session_id || undefined,
+      modificationId: req.body?.modification_id || req.body?.id || undefined,
+    });
+  } catch { /* the API response remains authoritative if speech/logging fails */ }
+}
+
+const INTEGRATION_DIR = avaPaths.integrationDir();
+const SERVER_DIR = avaPaths.serverDir();
+const REPO_ROOT = avaPaths.repoRoot();
 const CORE_PROPOSAL_FILES = {
-  voice_main: path.resolve(process.cwd(), '..', 'ava-integration', 'ava_local_voice.py'),
-  voice_config: path.resolve(process.cwd(), '..', 'ava-integration', 'ava_voice_config.json'),
-  identity: path.resolve(process.cwd(), '..', 'ava-integration', 'ava_identity.json'),
-  self_awareness: path.resolve(process.cwd(), '..', 'ava-integration', 'ava_self_awareness.py'),
-  self_mod: path.resolve(process.cwd(), '..', 'ava-integration', 'ava_self_modification.py'),
-  worker: path.resolve(process.cwd(), '..', 'ava-integration', 'ava_python_worker.py'),
-  server_main: path.resolve(process.cwd(), 'src', 'server.js'),
-  api_routes: path.resolve(process.cwd(), 'src', 'routes', 'api.js'),
-  agent_loop: path.resolve(process.cwd(), 'src', 'services', 'agentLoop.js'),
-  tools_service: path.resolve(process.cwd(), 'src', 'services', 'tools.js'),
-  llm_service: path.resolve(process.cwd(), 'src', 'services', 'llm.js'),
+  voice_main: path.join(INTEGRATION_DIR, 'ava_local_voice.py'),
+  voice_config: path.join(INTEGRATION_DIR, 'ava_voice_config.json'),
+  identity: path.join(INTEGRATION_DIR, 'ava_identity.json'),
+  self_awareness: path.join(INTEGRATION_DIR, 'ava_self_awareness.py'),
+  self_mod: path.join(INTEGRATION_DIR, 'ava_self_modification.py'),
+  worker: path.join(INTEGRATION_DIR, 'ava_python_worker.py'),
+  server_main: path.join(SERVER_DIR, 'src', 'server.js'),
+  api_routes: path.join(SERVER_DIR, 'src', 'routes', 'api.js'),
+  agent_loop: path.join(SERVER_DIR, 'src', 'services', 'agentLoop.js'),
+  tools_service: path.join(SERVER_DIR, 'src', 'services', 'tools.js'),
+  llm_service: path.join(SERVER_DIR, 'src', 'services', 'llm.js'),
 };
 
 function resolveProposalFile(fileKey = '') {
@@ -62,15 +78,13 @@ function resolveProposalFile(fileKey = '') {
   if (!raw) return '';
   if (CORE_PROPOSAL_FILES[raw]) return CORE_PROPOSAL_FILES[raw];
   if (path.isAbsolute(raw)) return path.resolve(raw);
-  const repoRoot = path.resolve(process.cwd(), '..');
   const candidates = [
-    path.resolve(process.cwd(), raw),
-    path.resolve(repoRoot, raw),
-    path.resolve(repoRoot, 'ava-integration', raw),
-    path.resolve(repoRoot, 'ava-server', raw),
-    path.resolve(repoRoot, 'cmp-use', 'cmpuse', 'tools', raw),
+    path.resolve(SERVER_DIR, raw),
+    path.resolve(REPO_ROOT, raw),
+    path.resolve(INTEGRATION_DIR, raw),
+    path.resolve(avaPaths.cmpuseToolsDir(), raw),
   ];
-  return candidates.find(p => fs.existsSync(p)) || path.resolve(repoRoot, raw);
+  return candidates.find(p => fs.existsSync(p)) || path.resolve(REPO_ROOT, raw);
 }
 
 function proposalReviewDiff(original, proposed) {
@@ -121,116 +135,56 @@ router.get('/self/diagnose', async (_req, res) => {
 });
 
 // Capability Inventory
+function capabilityView(snapshot) {
+  const tools = Array.isArray(snapshot?.tools) ? snapshot.tools : [];
+  const providers = Array.isArray(snapshot?.providers) ? snapshot.providers : [];
+  return {
+    ...snapshot,
+    permissions: {
+      writeEnabled: snapshot?.runtime?.writeEnabled === true,
+      confirmationRequired: tools.filter(tool => tool.requiresConfirmation).map(tool => tool.name),
+    },
+    write: { enabled: snapshot?.runtime?.writeEnabled === true },
+    bridge: {
+      host: config.BRIDGE_HOST || process.env.BRIDGE_HOST || '127.0.0.1',
+      port: Number(config.BRIDGE_PORT || process.env.BRIDGE_PORT || 3333),
+    },
+    llmProvider: providers.find(provider => provider.status === 'ready')?.name || null,
+  };
+}
+
 router.get('/self/capabilities', async (_req, res) => {
   try {
-    // Tools
-    const toolsService = (await import('../services/tools.js')).default;
-    const tools = await toolsService.getAllTools().catch(() => []);
-    const toolNames = tools.map(t => ({ name: t.name, risk: t.risk_level, requires_confirm: !!t.requires_confirm }));
-
-    // Permissions & write ability
-    const securityService = (await import('../utils/security.js')).default;
-    const security = securityService.getStatus();
-    const writeEnabled = !!process.env.ALLOW_WRITE && (process.env.ALLOW_WRITE === '1' || process.env.ALLOW_WRITE === 'true');
-
-    // Voice availability: check python modules and tool presence
-    const pwReady = pythonWorker.isReady();
-    const modules = pythonWorker.getModules() || {};
-    const voiceTool = tools.find(t => t.name === 'voice_ops');
-    const voiceAvailable = !!voiceTool || !!modules.voice || !!modules.voice_ops;
-
-    // Bridge availability: ping bridge /health directly
-    const config = (await import('../utils/config.js')).default;
-    const bridgeHealthy = await new Promise(resolve => {
-      try {
-        const http = require('http');
-        const req = http.request({
-          hostname: config.BRIDGE_HOST || '127.0.0.1',
-          port: config.BRIDGE_PORT || 3333,
-          path: '/health', method: 'GET', timeout: 1500
-        }, r => resolve(r.statusCode === 200));
-        req.on('error', () => resolve(false));
-        req.on('timeout', () => { req.destroy(); resolve(false); });
-        req.end();
-      } catch { resolve(false); }
-    });
-
-    // Current LLM provider
-    const llmService = (await import('../services/llm.js')).default;
-    const llm = llmService.getSessionStats();
-
-    // Policy status
-    const autonomyLib = (await import('../services/autonomyPolicy.js')).default;
-    const autonomy = autonomyLib.getAutonomy();
-    const policyStatus = autonomy.getStatus();
-
-    res.json({ ok: true, capabilities: {
-      tools: toolNames,
-      permissions: security,
-      write: writeEnabled,
-      voiceAvailable,
-      bridge: { host: config.BRIDGE_HOST, port: config.BRIDGE_PORT, healthy: bridgeHealthy },
-      llmProvider: llm.provider,
-      policy: {
-        loaded: policyStatus.loaded,
-        validationMode: policyStatus.validationMode,
-        strict: policyStatus.strict,
-        policyVersion: policyStatus.policyVersion
-      }
-    }});
+    llmService.syncProviderState();
+    const capabilities = capabilityView(await capabilityRegistry.refresh({ force: _req.query.refresh === '1' }));
+    res.json({ ok: true, capabilities });
   } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
 });
 
 // Explain Yourself Mode
 router.get('/self/explain', async (_req, res) => {
   try {
-    const os = await import('os');
-    const fs = await import('fs');
-    const path = await import('path');
-    const config = (await import('../utils/config.js')).default;
-    const llmService = (await import('../services/llm.js')).default;
-
-    // Identity from ava_identity.json if present
     let identity = { name: 'AVA', purpose: 'personal assistant' };
     try {
-      const idPath = path.default.join(config.AVA_INTEGRATION_DIR || path.default.join(os.homedir(), 'ava-integration'), 'ava_identity.json');
-      if (fs.default.existsSync(idPath)) {
-        identity = JSON.parse(fs.default.readFileSync(idPath, 'utf8')) || identity;
+      const idPath = path.join(avaPaths.integrationDir(), 'ava_identity.json');
+      if (fs.existsSync(idPath)) {
+        identity = JSON.parse(fs.readFileSync(idPath, 'utf8')) || identity;
       }
     } catch {}
-
-    // Capabilities (reuse internal call)
-    const resp = await fetch('http://127.0.0.1:' + (config.PORT || 5051) + '/self/capabilities').then(r => r.json()).catch(() => ({ ok: false }));
-    const caps = resp.ok ? resp.capabilities : {};
-
-    // Provider
-    const sessionStats = llmService.getSessionStats();
-
-    const who = {
+    llmService.syncProviderState();
+    const caps = capabilityView(await capabilityRegistry.refresh());
+    const improve = {
+      proposalGate: true,
+      externalReview: externalProposalReview.isEnabled(),
+      approvalRequired: true,
+    };
+    res.json({ ok: true, who: {
       name: identity.name || 'AVA',
       purpose: identity.purpose || 'personal assistant',
       build: config.BUILD_STAMP,
       platform: process.platform,
       node: process.version
-    };
-
-    const canDo = {
-      tools: (caps.tools || []).map(t => t.name),
-      write: !!caps.write,
-      highRiskNeedsConfirm: true,
-      bridgeHealthy: !!caps.bridge?.healthy,
-      voiceAvailable: !!caps.voiceAvailable,
-      llmProvider: sessionStats.provider
-    };
-
-    const improve = {
-      diagnosis: '/self/doctor (propose/apply)',
-      learning: ['/rlhf/*', '/learn', '/self/learn_correction'],
-      guardrails: 'Server-side enforcement for risk gating and paths',
-      applyMode: 'Requires ALLOW_WRITE=1 and confirm_token'
-    };
-
-    res.json({ ok: true, who, canDo, improve });
+    }, canDo: { tools: caps.tools.filter(tool => tool.available).map(tool => tool.name) }, improve, capabilities: caps });
   } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
 });
 // Doctor & Maintenance orchestrator
@@ -375,10 +329,10 @@ router.post('/self_mod', async (req, res) => {
           status: 'denied',
           approval_required: true,
           review_recommendation: 'deny',
-          review_reason: `codex: target file "${req.body?.file || ''}" does not exist, so this proposal cannot be verified or applied safely.`,
+          review_reason: `proposal-input-gate: target file "${req.body?.file || ''}" does not exist, so this proposal cannot be verified or applied safely.`,
           reviewers: [{
-            reviewer: 'codex',
-            model: 'local-gate',
+            reviewer: 'proposal-input-gate',
+            model: 'deterministic',
             recommendation: 'deny',
             reason: `Target file "${req.body?.file || ''}" does not exist.`,
             risks: ['Model-invented file path', 'Applying would create or overwrite the wrong file'],
@@ -393,10 +347,10 @@ router.post('/self_mod', async (req, res) => {
           status: 'denied',
           approval_required: true,
           review_recommendation: 'deny',
-          review_reason: 'codex: proposal did not include replacement file content.',
+          review_reason: 'proposal-input-gate: proposal did not include replacement file content.',
           reviewers: [{
-            reviewer: 'codex',
-            model: 'local-gate',
+            reviewer: 'proposal-input-gate',
+            model: 'deterministic',
             recommendation: 'deny',
             reason: 'Proposal did not include replacement file content.',
             risks: ['Empty proposal content cannot be reviewed or applied safely'],
@@ -411,10 +365,10 @@ router.post('/self_mod', async (req, res) => {
           status: 'denied',
           approval_required: true,
           review_recommendation: 'deny',
-          review_reason: 'codex: proposal content is a patch/error transcript, but self_mod requires full replacement content for an existing file.',
+          review_reason: 'proposal-input-gate: proposal content is a patch/error transcript, but self_mod requires full replacement content for an existing file.',
           reviewers: [{
-            reviewer: 'codex',
-            model: 'local-gate',
+            reviewer: 'proposal-input-gate',
+            model: 'deterministic',
             recommendation: 'deny',
             reason: 'Proposal content is a patch/error transcript, not full replacement file content.',
             risks: ['Would replace source file with a patch transcript', 'Could destroy the target file contents'],
@@ -438,6 +392,9 @@ router.post('/self_mod', async (req, res) => {
           reviewRecommendation: proposalReview.recommendation,
           reviewReason: proposalReview.reason,
           reviewers: proposalReview.reviewers,
+          internalReviewRecommendation: proposalReview.recommendation,
+          internalReviewReason: proposalReview.reason,
+          externalReviewStatus: externalProposalReview.isEnabled() ? 'pending' : 'not_configured',
         },
       };
     }
@@ -449,14 +406,26 @@ router.post('/self_mod', async (req, res) => {
     if (action === 'approve' && selfModSandbox.isEnabled()) {
       sandboxGate = await selfModSandbox.validateProposal(req.body?.modification_id);
       if (!sandboxGate.ok) {
+        const message = `Not applied — ${selfModSandbox.describeGate(sandboxGate)}. The proposal stays in the queue.`;
+        announceSelfModOutcome(message, req, 'self-mod-sandbox-result');
         return res.json({
           ok: true,
           status: 'blocked_sandbox',
           modification_id: req.body?.modification_id,
-          message: `Not applied — ${selfModSandbox.describeGate(sandboxGate)}. The proposal stays in the queue.`,
+          message,
           sandbox: sandboxGate,
         });
       }
+    }
+
+    let rejectionContext = null;
+    if (action === 'reject') {
+      try {
+        const listing = await pythonWorker.selfMod({ action: 'list_pending' });
+        const pending = listing?.pending || listing?.result?.pending || [];
+        const wantedId = req.body?.modification_id || req.body?.id;
+        rejectionContext = pending.find(item => item?.id === wantedId || item?.modification_id === wantedId) || null;
+      } catch { /* rejection still proceeds if context lookup fails */ }
     }
 
     const response = await pythonWorker.selfMod(body);
@@ -467,6 +436,41 @@ router.post('/self_mod', async (req, res) => {
     }
     if (response.ok) {
       const result = response.result || {};
+      if (action === 'reject' && result.status === 'success') {
+        selfImprove.rememberRejectedProposal({
+          file: rejectionContext?.file || req.body?.file || req.body?.modification_id || 'proposal',
+          proposalReason: rejectionContext?.reason || '',
+          reason: req.body?.reason || req.body?.rejection_reason || '',
+          reviewer: req.body?.reviewer || 'user',
+        });
+      }
+      if (action === 'propose_fix' && result.status === 'proposed' && externalProposalReview.isEnabled()) {
+        try {
+          const metadata = body.metadata || {};
+          externalProposalReview.queueReview({
+            modificationId: result.modification_id,
+            file: body.file,
+            reason: body.reason,
+            diff: result.diff || proposalReviewDiff(fs.readFileSync(body.file, 'utf8'), body.content),
+            decisionModel: metadata.decisionModel,
+            planModel: metadata.planModel,
+            editModel: metadata.editModel,
+            internalReview: {
+              recommendation: metadata.internalReviewRecommendation,
+              reason: metadata.internalReviewReason,
+              reviewers: metadata.reviewers || [],
+            },
+          });
+          result.status = 'awaiting_external_review';
+          result.message = 'Proposal drafted and sent to the external Codex review task. It will appear for approval after that verdict arrives.';
+        } catch (error) {
+          logger.warn('[self-mod] external review queue failed', { error: error.message });
+          await pythonWorker.selfMod({
+            action: 'update_review', modification_id: result.modification_id, external_review_status: 'queue_error',
+            review: { reviewer: 'codex-task', model: 'external-task', recommendation: 'unavailable', reason: error.message },
+          }).catch(() => {});
+        }
+      }
       if (['propose_fix','approve','rollback','undo','revert'].includes(action)) {
         result.safety_note = '⚠️ Code modification requires user approval.';
       }
@@ -484,6 +488,7 @@ router.post('/self_mod', async (req, res) => {
           result.status = 'reverted';
           result.verify_error = v.error;
           result.message = `I applied it, but it failed a syntax check (${v.error}) — so I reverted it instead of restarting into broken code.`;
+          announceSelfModOutcome(result.message, req, 'self-mod-sandbox-result');
           return res.json({ ok: true, ...result });
         }
         // Self-evolution changelog (#209): record the applied change so she can reflect on how
@@ -506,12 +511,12 @@ router.post('/self_mod', async (req, res) => {
             autoEval.recordApplied({ modId: result.modification_id || req.body?.modification_id, file: appliedFile, baseline: evalHarness.lastScore() });
           }
         } catch { /* auto-eval is best-effort */ }
-        result.restart = selfRestart.scheduleServerRestart({
+        result.activation = await selfRestart.activateAppliedChanges({
+          files: [appliedFile],
           reason: `UI approved proposal ${result.modification_id || req.body?.modification_id || ''}`.trim()
         });
-        if (result.restart?.scheduled) {
-          result.message = `${result.message || 'Modification applied.'} Verified it parses; server refresh scheduled so the change can load.`;
-        }
+        result.restart = result.activation;
+        result.message = `${result.message || 'Modification applied.'} Verified it parses. ${selfRestart.describeActivation(result.activation)}`;
       }
       // Undoing an applied change also needs the server to reload to take effect.
       if ((action === 'undo' || action === 'revert') && result.status === 'success') {
@@ -519,25 +524,51 @@ router.post('/self_mod', async (req, res) => {
           const rf = String(result.file || result.file_path || '').split(/[\\/]/).pop();
           evolutionLog.record({ kind: 'self_mod', title: `reverted ${rf || 'a change'}`, detail: result.reason || 'rolled back a change I had applied', meta: { id: result.modification_id || req.body?.modification_id || null, action: 'reverted' } });
         } catch { /* best effort */ }
-        result.restart = selfRestart.scheduleServerRestart({
+        const revertedFile = result.file || result.file_path || body.file;
+        result.activation = await selfRestart.activateAppliedChanges({
+          files: [revertedFile],
           reason: `UI undo of ${result.modification_id || req.body?.modification_id || ''}`.trim()
         });
-        if (result.restart?.scheduled) {
-          result.message = `${result.message || 'Change reverted.'} Server refresh scheduled so the revert can load.`;
-        }
+        result.restart = result.activation;
+        result.message = `${result.message || 'Change reverted.'} ${selfRestart.describeActivation(result.activation)}`;
+      }
+      if (action === 'approve' || action === 'reject') {
+        const id = req.body?.modification_id || '';
+        const succeeded = result.status === 'success';
+        const fallback = action === 'approve'
+          ? (succeeded
+            ? `Proposal ${id} was approved and processed.`.trim()
+            : `I could not apply proposal ${id}. Its status is ${result.status || 'unknown'}, and nothing new was applied.`.trim())
+          : (succeeded
+            ? `Proposal ${id} was rejected. Nothing was applied.`.trim()
+            : `I could not reject proposal ${id}. Its status is ${result.status || 'unknown'}.`.trim());
+        announceSelfModOutcome(result.message || fallback, req, action === 'approve' ? 'self-mod-sandbox-result' : 'self-mod-rejected');
       }
       res.json({ ok: true, ...result });
     } else {
+      if (action === 'approve' || action === 'reject') {
+        announceSelfModOutcome(`I couldn't ${action} that proposal: ${response.error || 'the self-modification worker failed'}. Nothing was applied.`, req, 'self-mod-error');
+      }
       res.status(500).json({ ok: false, error: response.error });
     }
-  } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+  } catch (e) {
+    if (req.body?.action === 'approve' || req.body?.action === 'reject') {
+      announceSelfModOutcome(`I couldn't ${req.body.action} that proposal: ${e.message}. Nothing was applied.`, req, 'self-mod-error');
+    }
+    res.status(500).json({ ok: false, error: e.message });
+  }
 });
 
 // Manually trigger a self-improvement scan now (otherwise it runs on a schedule). Produces at
 // most one proposed change, queued for approval in the UI / by voice. Never applies anything.
 router.post('/improve', async (req, res) => {
   try {
-    const out = await selfImprove.runScan({ reason: (req.body && req.body.reason) || 'manual', max: 1, avoid: (req.body && req.body.avoid) || [] });
+    const out = await selfImprove.runScan({
+      reason: (req.body && req.body.reason) || 'manual',
+      max: 1,
+      avoid: (req.body && req.body.avoid) || [],
+      focus: (req.body && req.body.focus) || [],
+    });
     res.json({ ok: true, ...out });
   } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
 });
@@ -547,16 +578,15 @@ router.post('/selfmod/probe', async (_req, res) => {
   const env = process.env;
   const k = (n) => config[n] || env[n] || '';
   const msgs = [{ role: 'user', content: 'Reply with the single word OK.' }];
-  const primaryOpenAI = env.AVA_SM_OPENAI || 'gpt-5.5';
-  const stableOpenAI = env.AVA_SM_OPENAI_FALLBACK || 'gpt-5.1';
-  const openAIModels = [...new Set([primaryOpenAI, stableOpenAI].filter(Boolean))];
+  const models = modelConfig.canonicalModels();
+  const openAIModels = models.openai;
   const tests = [
     // Claude is the PRIMARY self-mod model — probe it FIRST so we can see if it's healthy.
-    ['claude/' + (env.AVA_SM_CLAUDE || 'claude-opus-4-8'), () => llmService.createCompletionClaude({ messages: msgs, system: 'You reply tersely.', maxTokens: 50, model: env.AVA_SM_CLAUDE || 'claude-opus-4-8' })],
+    ['claude/' + models.claude, () => llmService.createCompletionClaude({ messages: msgs, system: 'You reply tersely.', maxTokens: 50, model: models.claude })],
     ...openAIModels.map(model => ['openai/' + model, () => llmService._openaiCompat({ baseURL: 'https://api.openai.com/v1', apiKey: k('OPENAI_API_KEY'), model, system: 'You reply tersely.', messages: msgs, maxTokens: 512 })]),
-    ['gemini/' + (env.AVA_SM_GEMINI || 'gemini-pro-latest'), () => llmService.createCompletionGemini({ messages: msgs, system: 'You reply tersely.', maxTokens: 512, model: env.AVA_SM_GEMINI || 'gemini-pro-latest' })],
-    ['deepseek/' + (env.AVA_SM_DEEPSEEK || 'deepseek-reasoner'), () => llmService._openaiCompat({ baseURL: 'https://api.deepseek.com', apiKey: k('DEEPSEEK_API_KEY'), model: env.AVA_SM_DEEPSEEK || 'deepseek-reasoner', system: 'You reply tersely.', messages: msgs, maxTokens: 512 })],
-    ['grok/' + (env.AVA_SM_GROK || 'grok-4'), () => llmService._openaiCompat({ baseURL: 'https://api.x.ai/v1', apiKey: k('GROK_API_KEY'), model: env.AVA_SM_GROK || 'grok-4', system: 'You reply tersely.', messages: msgs, maxTokens: 512 })],
+    ['gemini/' + models.gemini, () => llmService.createCompletionGemini({ messages: msgs, system: 'You reply tersely.', maxTokens: 512, model: models.gemini })],
+    ['deepseek/' + models.deepseek, () => llmService._openaiCompat({ baseURL: 'https://api.deepseek.com', apiKey: k('DEEPSEEK_API_KEY'), model: models.deepseek, system: 'You reply tersely.', messages: msgs, maxTokens: 512 })],
+    ['grok/' + models.grok, () => llmService._openaiCompat({ baseURL: 'https://api.x.ai/v1', apiKey: k('GROK_API_KEY'), model: models.grok, system: 'You reply tersely.', messages: msgs, maxTokens: 512 })],
   ];
   const out = [];
   for (const [name, fn] of tests) {
@@ -607,8 +637,8 @@ router.get('/moltbook/preview', async (req, res) => {
 });
 
 // Manually post one original self-interested post to Moltbook now.
-router.post('/moltbook/selfpost', async (_req, res) => {
-  try { res.json({ ok: true, ...(await triggerMoltbookSelfPost()) }); }
+router.post('/moltbook/selfpost', async (req, res) => {
+  try { res.json({ ok: true, ...(await triggerMoltbookSelfPost(req.body?.draftId || '')) }); }
   catch (e) { res.status(500).json({ ok: false, error: e.message }); }
 });
 
@@ -807,6 +837,14 @@ router.get('/workflow/:id', (req, res) => {
 router.get('/workflows', (_req, res) => { res.json({ ok: true, workflows: workflowEngine.list() }); });
 // Resume a paused/incomplete workflow on demand.
 router.post('/workflow/:id/resume', (req, res) => { res.json(workflowEngine.resume(req.params.id)); });
+// Supply the answer or approval requested by a durably paused stage.
+router.post('/workflow/:id/input', (req, res) => {
+  const answer = req.body?.text ?? req.body?.response ?? req.body?.answer;
+  if (!String(answer || '').trim()) return res.status(400).json({ ok: false, error: 'response required' });
+  const result = workflowEngine.provideInput(req.params.id, answer);
+  const status = result.ok ? 200 : (result.error === 'not found' ? 404 : 409);
+  return res.status(status).json(result);
+});
 // Abort a running workflow at the next stage/step boundary (Tier 2 #14).
 router.post('/workflow/:id/abort', (req, res) => { res.json(workflowEngine.abort(req.params.id)); });
 
@@ -819,6 +857,11 @@ router.get('/proactive/pending', (_req, res) => { res.json({ ok: true, pending: 
 router.post('/proactive/tick', async (_req, res) => { try { await proactiveAutonomy.tickOnce(); res.json({ ok: true, initiatives: proactiveAutonomy.list() }); } catch (e) { res.status(500).json({ ok: false, error: e.message }); } });
 // Dismiss an initiative you don't want to act on.
 router.post('/proactive/:id/dismiss', (req, res) => { res.json(proactiveAutonomy.dismiss(req.params.id)); });
+router.post('/proactive/:id/approve', async (req, res) => {
+  try { res.json(await proactiveAutonomy.approve(req.params.id)); }
+  catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+});
+router.post('/proactive/:id/reject', (req, res) => { res.json(proactiveAutonomy.reject(req.params.id, req.body?.reason)); });
 
 // ---- Tier 3 #21 auto A/B: post-apply keep-if-better evaluation ----
 // Inspect pending/resolved post-apply evaluations.

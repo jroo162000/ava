@@ -3,12 +3,13 @@
 Downloads hexgrad/Kokoro-82M (and misaki's spacy model) into the caches the
 runner will use, then measures cold/warm synthesis RTF on THIS machine so we
 know whether Kokoro is fast enough to be the primary engine. Writes results to
-codex_review/kokoro_warmup_result.txt (ASCII only).
+the repository's logs directory (ASCII only).
 """
 import sys
 import time
+from pathlib import Path
 
-OUT = r"C:\Users\Dell\Claude\Projects\AVA Development\codex_review\kokoro_warmup_result.txt"
+OUT = Path(__file__).resolve().parents[1] / "logs" / "kokoro_warmup_result.txt"
 
 
 def log(msg):
@@ -18,6 +19,7 @@ def log(msg):
 
 
 def main():
+    OUT.parent.mkdir(parents=True, exist_ok=True)
     open(OUT, "w").close()
     log("== kokoro warmup ==")
     t0 = time.time()

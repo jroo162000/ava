@@ -24,6 +24,99 @@ describe('agentLoop long-horizon hooks (Tier 2 #14)', () => {
     expect(agentLoop.createAgentState('g', { deadlineAt: 'soon' }).deadline_at).toBe(0);
     expect(agentLoop.createAgentState('g', { deadlineAt: -5 }).deadline_at).toBe(0);
   });
+
+  test('createAgentState restores a durable pending confirmation and its user response', () => {
+    const state = agentLoop.createAgentState('resume', {
+      pendingConfirmation: { tool: 'fs_read', args: { path: 'C:\\tmp\\registry.json' } },
+      userResponse: 'Approved for that exact read.',
+    });
+    expect(state.current_context.pending_confirmation).toEqual({
+      tool: 'fs_read', args: { path: 'C:\\tmp\\registry.json' },
+    });
+    expect(state.current_context.user_response).toBe('Approved for that exact read.');
+  });
+
+  test('confirmation language accepts approval but gives denial precedence', () => {
+    const classify = agentLoop._internals.classifyConfirmationResponse;
+    expect(classify('both workflows are approved to move forward')).toBe('approved');
+    expect(classify("No, don't proceed with that action.")).toBe('denied');
+    expect(classify('I am still thinking about it.')).toBe('unknown');
+  });
+
+  test('a restored approval becomes the exact confirmed tool call without another LLM decision', async () => {
+    const state = agentLoop.createAgentState('resume', {
+      pendingConfirmation: { tool: 'fs_read', args: { path: 'C:\\tmp\\registry.json' } },
+      userResponse: 'both workflows are approved to move forward',
+    });
+    const decision = await agentLoop._internals.decide(state, {});
+    expect(decision).toMatchObject({
+      decision: agentLoop.DecisionType.TOOL_CALL,
+      tool: 'fs_read',
+      args: { path: 'C:\\tmp\\registry.json', confirmed: true },
+    });
+    expect(state.current_context.pending_confirmation).toBeNull();
+  });
+
+  test('a restored denial deterministically stops the pending action', async () => {
+    const state = agentLoop.createAgentState('resume', {
+      pendingConfirmation: { tool: 'fs_read', args: { path: 'C:\\tmp\\registry.json' } },
+      userResponse: "No, don't proceed.",
+    });
+    const decision = await agentLoop._internals.decide(state, {});
+    expect(decision).toMatchObject({
+      decision: agentLoop.DecisionType.STOP,
+      success: false,
+    });
+    expect(decision.result).toMatch(/not performed/i);
+    expect(state.current_context.pending_confirmation).toBeNull();
+  });
+
+  test('read-only workflows use tool permission metadata for observations', () => {
+    const isObservation = agentLoop._internals.isReadOnlyObservationTool;
+    expect(isObservation('fs_read', {}, { permissions: { read_only: true } })).toBe(true);
+    expect(isObservation('self_awareness', { action: 'diagnose_tool' }, { permissions: { read_only: true } })).toBe(true);
+    const windowTool = { permissions: { read_only_actions: ['list', 'active'], default_action: 'list' } };
+    expect(isObservation('window_ops', { action: 'list' }, windowTool)).toBe(true);
+    expect(isObservation('window_ops', { action: 'focus' }, windowTool)).toBe(false);
+    expect(isObservation('fs_write', {}, {})).toBe(false);
+  });
+
+  test('autonomy policy categorizes filesystem mutation tools without mislabeling reads', () => {
+    const category = agentLoop._internals.autonomyCategoryForTool;
+    expect(category('fs_read')).toBeUndefined();
+    expect(category('fs_find')).toBeUndefined();
+    expect(category('fs_ops')).toBe('file_write_outside_allowlist');
+    expect(category('fs_write')).toBe('file_write_outside_allowlist');
+    expect(category('file_gen')).toBe('file_write_outside_allowlist');
+    expect(category('ps_exec')).toBe('system_commands');
+  });
+});
+
+describe('workflowEngine deterministic planning recovery', () => {
+  const fallback = workflowEngine._internals._fallbackPlanStages;
+
+  test('keeps a workflow runnable when the planning model returns no usable stages', () => {
+    const stages = fallback('Diagnose the live sys_ops registry', {
+      acceptanceCriteria: ['A successful live sys_ops receipt is captured.'],
+    });
+    expect(stages).toHaveLength(1);
+    expect(stages[0]).toMatchObject({
+      n: 1,
+      title: 'Complete and verify goal',
+      status: 'pending',
+      needsTools: true,
+      doneWhen: 'A successful live sys_ops receipt is captured.',
+    });
+    expect(stages[0].goal).toContain('Diagnose the live sys_ops registry');
+  });
+
+  test('replanning fallback preserves stage numbering and names the failed route to avoid', () => {
+    const stages = fallback('Diagnose window_ops', {}, 3, 'Reading an unrelated LM Studio registry failed.');
+    expect(stages[0].n).toBe(3);
+    expect(stages[0].title).toBe('Complete remaining goal');
+    expect(stages[0].goal).toMatch(/different route/i);
+    expect(stages[0].goal).toMatch(/LM Studio/i);
+  });
 });
 
 describe('workflowEngine crash-recovery injection (Tier 2 #14)', () => {
@@ -61,6 +154,137 @@ describe('workflowEngine crash-recovery injection (Tier 2 #14)', () => {
   });
 });
 
+describe('workflowEngine durable user-input checkpoints', () => {
+  const classify = workflowEngine._internals._classifyAgentOutcome;
+  const resumeBlock = workflowEngine._internals._resumeInputBlock;
+  const applyInput = workflowEngine._internals._applyWorkflowInput;
+  const parsePending = workflowEngine._internals._pendingConfirmationFromQuestion;
+
+  test('an explicit ask_user outcome pauses instead of failing verification', () => {
+    const outcome = classify({
+      status: agentLoop.AgentStatus.WAITING_USER,
+      last_action: { question: 'Which account should I use?' },
+      current_context: { pending_confirmation: null },
+    });
+    expect(outcome).toEqual({ kind: 'waiting_user', question: 'Which account should I use?' });
+  });
+
+  test('a pending tool confirmation pauses even if the loop ended in another status', () => {
+    const outcome = classify({
+      status: agentLoop.AgentStatus.STEP_LIMIT,
+      current_context: { pending_confirmation: { tool: 'comm_ops', args: { action: 'send' } } },
+    });
+    expect(outcome.kind).toBe('waiting_user');
+    expect(outcome.question).toMatch(/permission to use "comm_ops"/);
+    expect(outcome.question).toMatch(/approve this exact action/i);
+  });
+
+  test('a pending tool confirmation takes priority over a later provider-error question', () => {
+    const outcome = classify({
+      status: agentLoop.AgentStatus.WAITING_USER,
+      last_action: { question: 'Unexpected end of JSON input. How should I proceed?' },
+      current_context: { pending_confirmation: { tool: 'fs_find', args: { pattern: '*window_ops*' } } },
+    });
+    expect(outcome.question).toMatch(/permission to use "fs_find"/i);
+    expect(outcome.question).toContain('*window_ops*');
+    expect(outcome.question).not.toMatch(/Unexpected end of JSON input/i);
+  });
+
+  test('resume prompt carries the exact question, answer, and prior journal', () => {
+    const block = resumeBlock({
+      resumeInput: { question: 'Post this update?', response: 'Yes, post that exact draft.' },
+      progress: [{ step: 2, tool: 'moltbook_read', status: 'ok', note: 'loaded thread' }],
+    });
+    expect(block).toMatch(/PAUSED FOR USER INPUT/);
+    expect(block).toContain('Post this update?');
+    expect(block).toContain('Yes, post that exact draft.');
+    expect(block).toMatch(/step 2: moltbook_read -> ok/);
+    expect(block).toMatch(/Verify any prior side effects/);
+    expect(block).toMatch(/do not blindly repeat/i);
+  });
+
+  test('an answer transitions only the waiting stage back to pending', () => {
+    const wf = {
+      id: 'wf-test', status: 'waiting_user', currentStage: 1, waitingStage: 1,
+      pendingQuestion: 'Approve the send?', error: '', log: [],
+      stages: [
+        { title: 'Inspect', status: 'done' },
+        { title: 'Send', status: 'waiting_user', pendingQuestion: 'Approve the send?', error: 'old' },
+      ],
+    };
+    const result = applyInput(wf, 'Approved for that message.');
+    expect(result).toMatchObject({ ok: true, status: 'resuming', stageIndex: 1 });
+    expect(wf.status).toBe('running');
+    expect(wf.stages[0].status).toBe('done');
+    expect(wf.stages[1].status).toBe('pending');
+    expect(wf.stages[1].resumeInput).toMatchObject({
+      question: 'Approve the send?', response: 'Approved for that message.',
+    });
+    expect(wf.pendingQuestion).toBe('');
+    expect(wf.waitingStage).toBeNull();
+  });
+
+  test('legacy waiting questions recover the exact pending tool and structured arguments', () => {
+    const question = 'This stage needs permission to use "fs_read" with {"path":"C:\\\\Users\\\\Dell\\\\registry.json"}. Do you approve this exact action?';
+    expect(parsePending(question)).toEqual({
+      tool: 'fs_read', args: { path: 'C:\\Users\\Dell\\registry.json' },
+    });
+
+    const wf = {
+      id: 'wf-legacy', status: 'waiting_user', waitingStage: 0, pendingQuestion: question, error: '', log: [],
+      stages: [{ title: 'Inspect', status: 'waiting_user', pendingQuestion: question }],
+    };
+    expect(applyInput(wf, 'Approved for that exact read.').ok).toBe(true);
+    expect(wf.stages[0].pendingConfirmation).toEqual({
+      tool: 'fs_read', args: { path: 'C:\\Users\\Dell\\registry.json' },
+    });
+  });
+
+  test('input is rejected when empty or when no stage is waiting', () => {
+    expect(applyInput({ status: 'waiting_user', stages: [] }, '  ').error).toBe('response required');
+    expect(applyInput({ status: 'running', stages: [] }, 'yes').error).toMatch(/not waiting/);
+  });
+});
+
+describe('workflowEngine stage verification', () => {
+  const normalize = workflowEngine._internals._normalizeStageVerdict;
+  const successfulState = { status: agentLoop.AgentStatus.SUCCESS };
+  const substantiveResult = 'AVa assessed the recent changes, identified the strongest improvements, and explained the remaining reliability tradeoffs in concrete detail.';
+
+  test('accepts a successful no-tool stage when the only objection is empty receipts', () => {
+    const verdict = normalize(
+      { needsTools: false }, successfulState, substantiveResult, [],
+      { accepted: false, reason: 'There are no tool receipts or external evidence to verify the response.' },
+    );
+    expect(verdict.accepted).toBe(true);
+    expect(verdict.reason).toMatch(/explicitly required no tools/i);
+  });
+
+  test('does not override a substantive postcondition failure', () => {
+    const verdict = normalize(
+      { needsTools: false }, successfulState, substantiveResult, [],
+      { accepted: false, reason: 'The result did not address the requested comparison.' },
+    );
+    expect(verdict.accepted).toBe(false);
+  });
+
+  test('does not relax receipt requirements for tool stages', () => {
+    const verdict = normalize(
+      { needsTools: true }, successfulState, substantiveResult, [],
+      { accepted: false, reason: 'No successful tool receipts were provided.' },
+    );
+    expect(verdict.accepted).toBe(false);
+  });
+
+  test('does not accept a generic no-tool completion phrase', () => {
+    const verdict = normalize(
+      { needsTools: false }, successfulState, 'Completed.', [],
+      { accepted: false, reason: 'There is no evidence or receipt supporting completion.' },
+    );
+    expect(verdict.accepted).toBe(false);
+  });
+});
+
 describe('workflowEngine control surface (Tier 2 #14)', () => {
   test('abort of an unknown workflow reports not found', () => {
     expect(workflowEngine.abort('wf-does-not-exist').ok).toBe(false);
@@ -71,6 +295,30 @@ describe('workflowEngine control surface (Tier 2 #14)', () => {
     for (const r of rows) {
       expect(r).toHaveProperty('supervisor');
       expect(r).toHaveProperty('currentStage');
+      expect(r).toHaveProperty('pendingQuestion');
+    }
+  });
+
+  test('failed workflows cannot report a successful resume', () => {
+    const before = workflowEngine._internals._loadAll();
+    try {
+      workflowEngine._internals._saveAll({
+        ...before,
+        'wf-failed-resume-test': {
+          id: 'wf-failed-resume-test',
+          goal: 'terminal workflow',
+          status: 'failed',
+          stages: [],
+          currentStage: 0,
+          updatedAt: Date.now(),
+        },
+      });
+      expect(workflowEngine.resume('wf-failed-resume-test')).toMatchObject({
+        ok: false,
+        status: 'failed',
+      });
+    } finally {
+      workflowEngine._internals._saveAll(before);
     }
   });
 });

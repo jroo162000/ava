@@ -8,6 +8,7 @@ import fs from 'fs';
 import os from 'os';
 import logger from '../utils/logger.js';
 import config from '../utils/config.js';
+import avaPaths from '../utils/paths.js';
 
 class PythonWorker {
   constructor() {
@@ -18,11 +19,13 @@ class PythonWorker {
     this.modules = {};
     this.toolsCache = null;
     this.toolsCacheTime = 0;
-    this.TOOLS_CACHE_TTL = 60000; // 1 minute
+    this.intentionalRestart = false;
+    this.restartPromise = null;
+    this.TOOLS_CACHE_TTL = Math.max(5000, Number(process.env.AVA_TOOLS_CACHE_TTL_MS) || 60000);
   }
 
   spawn() {
-    const integrationDir = config.AVA_INTEGRATION_DIR || path.join(os.homedir(), 'ava-integration');
+    const integrationDir = config.AVA_INTEGRATION_DIR || avaPaths.integrationDir();
     const workerScript = path.join(integrationDir, 'ava_python_worker.py');
 
     if (!fs.existsSync(workerScript)) {
@@ -36,6 +39,13 @@ class PythonWorker {
       const venvPy = path.join(integrationDir, '.venv', 'Scripts', 'python.exe');
       const pythonExe = process.env.AVA_PYTHON || (fs.existsSync(venvPy) ? venvPy : 'python');
       const cmpUseDir = path.resolve(integrationDir, '..', 'cmp-use');
+      const configuredToolPaths = String(process.env.AVA_TOOL_PATHS || '').split(path.delimiter).filter(Boolean);
+      const discoveredToolPaths = [
+        process.env.ProgramFiles && path.join(process.env.ProgramFiles, 'Tesseract-OCR'),
+        process.env['ProgramFiles(x86)'] && path.join(process.env['ProgramFiles(x86)'], 'Nmap'),
+      ].filter(candidate => candidate && fs.existsSync(candidate));
+      const executablePath = [...new Set([process.env.PATH || '', ...configuredToolPaths, ...discoveredToolPaths])]
+        .filter(Boolean).join(path.delimiter);
       this.worker = spawn(pythonExe, [workerScript], {
         stdio: ['pipe', 'pipe', 'pipe'],
         cwd: integrationDir,
@@ -44,9 +54,7 @@ class PythonWorker {
           PYTHONPATH: cmpUseDir + path.delimiter + (process.env.PYTHONPATH || ''),
           CMPUSE_DIR: process.env.CMPUSE_DIR || cmpUseDir,
           // Make tool binaries (Tesseract OCR, nmap) discoverable to the worker.
-          PATH: (process.env.PATH || '') + path.delimiter +
-                'C:\\Program Files\\Tesseract-OCR' + path.delimiter +
-                'C:\\Program Files (x86)\\Nmap',
+          PATH: executablePath,
           // Real execution: cmp-use defaults to dry-run + confirm. Without these
           // every action tool only returns a "dry-run" preview instead of acting.
           CMPUSE_DRY_RUN: process.env.CMPUSE_DRY_RUN || '0',
@@ -57,7 +65,7 @@ class PythonWorker {
           // cmp-use Config.network_enabled reads CMPUSE_NETWORK (not *_ALLOW_NETWORK);
           // without this net_ops returns "network disabled by default".
           CMPUSE_NETWORK: process.env.CMPUSE_NETWORK || '1',
-          CMPUSE_PATH_WHITELIST: process.env.CMPUSE_PATH_WHITELIST || 'C:\\',
+          CMPUSE_PATH_WHITELIST: process.env.CMPUSE_PATH_WHITELIST || os.homedir(),
         },
       });
 
@@ -109,7 +117,9 @@ class PythonWorker {
           pending.reject(new Error('Python worker exited'));
         }
         this.pendingRequests.clear();
-        setTimeout(() => this.spawn(), 5000);
+        if (!this.intentionalRestart && process.env.NODE_ENV !== 'test' && process.env.AVA_PYTHON_WORKER_OFF !== '1') {
+          setTimeout(() => this.spawn(), 5000);
+        }
       });
 
       this.worker.on('error', (err) => {
@@ -128,7 +138,7 @@ class PythonWorker {
   async sendCommand(cmd, params = {}, timeoutMs = 10000) {
     return new Promise((resolve, reject) => {
       if (!this.worker || !this.ready) {
-        if (!this.worker) this.spawn();
+        if (!this.worker && process.env.NODE_ENV !== 'test' && process.env.AVA_PYTHON_WORKER_OFF !== '1') this.spawn();
         if (!this.ready) {
           return reject(new Error('Python worker not ready'));
         }
@@ -203,12 +213,54 @@ class PythonWorker {
     return this.sendCommand('get_tool', { name }, 5000);
   }
 
+  async restart({ reason = 'hot-applied Python change', delayMs = 250 } = {}) {
+    if (this.restartPromise) return this.restartPromise;
+    this.toolsCache = null;
+    this.toolsCacheTime = 0;
+    this.modules = {};
+
+    const oldWorker = this.worker;
+    const oldPid = oldWorker?.pid || null;
+    if (!oldWorker) {
+      const started = this.spawn();
+      return { started, oldPid, pid: this.worker?.pid || null, reason };
+    }
+
+    this.intentionalRestart = true;
+    this.restartPromise = new Promise(resolve => {
+      let finishing = false;
+      const finish = () => {
+        if (finishing) return;
+        finishing = true;
+        setTimeout(() => {
+          this.intentionalRestart = false;
+          const started = this.spawn();
+          const result = { started, oldPid, pid: this.worker?.pid || null, reason };
+          this.restartPromise = null;
+          logger.warn('[python-worker] Hot restart completed', result);
+          resolve(result);
+        }, Math.max(0, Number(delayMs) || 0));
+      };
+
+      oldWorker.once('exit', finish);
+      try { oldWorker.kill(); } catch { finish(); }
+      setTimeout(() => {
+        if (!finishing) {
+          try { oldWorker.kill('SIGKILL'); } catch { /* already gone */ }
+          finish();
+        }
+      }, 5000);
+    });
+    logger.warn('[python-worker] Hot restart requested', { oldPid, reason });
+    return this.restartPromise;
+  }
+
   isReady() { return this.ready; }
   getModules() { return this.modules; }
   getPid() { return this.worker?.pid || null; }
 }
 
 const pythonWorker = new PythonWorker();
-pythonWorker.spawn();
+if (process.env.NODE_ENV !== 'test' && process.env.AVA_PYTHON_WORKER_OFF !== '1') pythonWorker.spawn();
 
 export default pythonWorker;

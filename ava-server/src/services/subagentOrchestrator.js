@@ -10,6 +10,7 @@ import agentLoop from './agentLoop.js';
 import environmentContext from './environmentContext.js';
 import subagentRoles from './subagentRoles.js';
 import { emitVoiceEvent } from './voiceBus.js';
+import avaPaths from '../utils/paths.js';
 
 // Mirror live lead/subagent activity to the UI (the /voice/ws bus) so the user can WATCH the
 // workflow happen — planning, each subagent starting/finishing, and synthesis. Never throws.
@@ -17,7 +18,7 @@ function _emit(phase, label, detail, source = 'lead') {
   try { emitVoiceEvent('agent.activity', { phase, label, detail: detail ? String(detail).slice(0, 200) : '' }, source); } catch { /* ignore */ }
 }
 
-const FILE = path.join(process.cwd(), 'data', 'orchestrations.json');
+const FILE = path.join(avaPaths.dataDir(), 'orchestrations.json');
 const MAX_SUBAGENTS = parseInt(process.env.AVA_MAX_SUBAGENTS || '6', 10);
 const CONCURRENCY = parseInt(process.env.AVA_SUBAGENT_CONCURRENCY || '4', 10);
 const SUBAGENT_STEP_LIMIT = parseInt(process.env.AVA_SUBAGENT_STEPS || '12', 10);
@@ -49,7 +50,7 @@ function _normalizeSubs(arr) {
 }
 
 // LEAD plans the subtasks (each a subagent's goal + role) when not given explicitly.
-async function planSubtasks(goal) {
+async function planSubtasks(goal, localPriority = 'background') {
   const sys = [
     'You are AVA, the LEAD agent. Break the GOAL into INDEPENDENT subtasks that separate subagents can run IN PARALLEL.',
     'Assign each subtask the best-fitting ROLE from this list — each role has its OWN SCOPED toolset:',
@@ -60,14 +61,17 @@ async function planSubtasks(goal) {
     'Use 1-6 subtasks. Output STRICT JSON only: {"subtasks":[{"role":"<existing or new role name>","goal":"<instruction>","define":{"description":"...","prompt":"specialized instructions","tools":["tool_a","tool_b"]}}]}  — include "define" ONLY when inventing a new role.',
   ].join('\n');
   try {
-    const r = await llmService.chat([{ role: 'system', content: sys }, { role: 'user', content: `GOAL: ${goal}` }], { temperature: 0.3, max_tokens: 1100 });
+    const r = await llmService.chat(
+      [{ role: 'system', content: sys }, { role: 'user', content: `GOAL: ${goal}` }],
+      { temperature: 0.3, max_tokens: 1100, localPriority },
+    );
     const j = _parseLoose(r.text || r.content || '') || {};
     return Array.isArray(j.subtasks) ? j.subtasks.filter(s => s && s.goal).slice(0, MAX_SUBAGENTS) : [];
   } catch (e) { logger.warn('[subagents] planSubtasks failed', { error: e.message }); return []; }
 }
 
 // Run ONE subagent: a full agent-loop run with its own goal + role. canDelegate=false (no recursion).
-async function runSubagent(sub, sharedCtx) {
+async function runSubagent(sub, sharedCtx, localPriority = 'background') {
   let env = '';
   try { env = await environmentContext.buildEnvironmentBlock(); } catch { env = ''; }
   const roleDef = subagentRoles.getRole(sub.role);
@@ -81,6 +85,7 @@ async function runSubagent(sub, sharedCtx) {
   const state = await agentLoop.runAgentLoop(goal, {
     multiStep: true, runTools: true, stepLimit: SUBAGENT_STEP_LIMIT, environment: env,
     source: 'subagent', canDelegate: false, role: roleDef.name, allowedTools: roleDef.allow,
+    localPriority,
   });
   const ok = state && state.status === agentLoop.AgentStatus.SUCCESS;
   _emit('subagent_done', `Subagent ${roleDef.name}: ${ok ? 'done' : 'failed'}`, sub.goal, 'subagent');
@@ -92,28 +97,31 @@ async function runSubagent(sub, sharedCtx) {
 }
 
 // Run subagents with bounded concurrency.
-async function _runAll(subs, sharedCtx) {
+async function _runAll(subs, sharedCtx, localPriority) {
   const results = [];
   let i = 0;
-  async function worker() { while (i < subs.length) { const idx = i++; results[idx] = await runSubagent(subs[idx], sharedCtx); } }
+  async function worker() { while (i < subs.length) { const idx = i++; results[idx] = await runSubagent(subs[idx], sharedCtx, localPriority); } }
   await Promise.all(Array.from({ length: Math.min(CONCURRENCY, subs.length) }, worker));
   return results;
 }
 
 // LEAD synthesizes the subagent results into one final answer for the original goal.
-async function synthesize(goal, results) {
+async function synthesize(goal, results, localPriority = 'background') {
   const sys = 'You are AVA, the LEAD agent. Your subagents each completed a piece of the work. Synthesize their results into ONE clear, complete answer to the ORIGINAL GOAL, calling out anything that failed. Be direct and specific.';
   const user = `ORIGINAL GOAL: ${goal}\n\nSUBAGENT RESULTS:\n` + results.map((r, i) => `#${i + 1} [${r.role}] (${r.status}): ${r.result}`).join('\n\n');
   try {
-    const r = await llmService.chat([{ role: 'system', content: sys }, { role: 'user', content: user }], { temperature: 0.4, max_tokens: 1500 });
+    const r = await llmService.chat(
+      [{ role: 'system', content: sys }, { role: 'user', content: user }],
+      { temperature: 0.4, max_tokens: 1500, localPriority },
+    );
     return String(r.text || r.content || '').trim() || results.map(r => `[${r.role}] ${r.result}`).join('\n');
   } catch { return results.map(r => `[${r.role}] ${r.result}`).join('\n'); }
 }
 
 // MAIN: AVA leads — plan (if needed) -> spawn subagents (parallel, bounded) -> collect -> synthesize.
-async function orchestrate({ goal, subtasks, sharedContext, synthesize: doSynth = true } = {}) {
+async function orchestrate({ goal, subtasks, sharedContext, synthesize: doSynth = true, localPriority = 'background' } = {}) {
   const id = 'orch-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 5);
-  const raw = (Array.isArray(subtasks) && subtasks.length) ? subtasks : await planSubtasks(String(goal || ''));
+  const raw = (Array.isArray(subtasks) && subtasks.length) ? subtasks : await planSubtasks(String(goal || ''), localPriority);
   // Create + PERSIST any inline-DEFINED roles first, so brand-new subagent types are saved and reusable.
   const createdRoles = [];
   for (const s of (raw || [])) {
@@ -126,9 +134,9 @@ async function orchestrate({ goal, subtasks, sharedContext, synthesize: doSynth 
   logger.info('[subagents] lead spawning subagents', { id, count: subs.length, roles: subs.map(s => s.role), createdRoles });
   _emit('delegate', `Spinning up ${subs.length} subagent${subs.length > 1 ? 's' : ''}`, subs.map(s => s.role).join(', '), 'lead');
   const t0 = Date.now();
-  const results = await _runAll(subs, sharedContext);
+  const results = await _runAll(subs, sharedContext, localPriority);
   if (doSynth) _emit('synthesize', 'Combining subagent results', `${results.length} done`, 'lead');
-  const synthesis = doSynth ? await synthesize(String(goal || ''), results) : '';
+  const synthesis = doSynth ? await synthesize(String(goal || ''), results, localPriority) : '';
   const rec = { id, goal: String(goal || ''), createdAt: new Date().toISOString(), ms: Date.now() - t0, createdRoles, subagents: results, synthesis };
   _ring.push({ id, goal: rec.goal, count: results.length, at: rec.createdAt });
   if (_ring.length > 50) _ring.shift();

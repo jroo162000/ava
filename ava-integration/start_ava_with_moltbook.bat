@@ -1,19 +1,6 @@
 @echo off
 setlocal
-
-echo Starting AVA with Moltbook integration...
-cd /d "%~dp0"
-
-REM Disable autonomy in voice mode - scheduler and heartbeat will exit early
-set DISABLE_AUTONOMY=1
-echo [autonomy] disabled (voice mode) - DISABLE_AUTONOMY=1
-
-REM Run Moltbook heartbeat first (will skip due to DISABLE_AUTONOMY)
-echo [Moltbook] Running heartbeat check...
-python moltbook_heartbeat.py
-
-REM Start AVA voice (passes DISABLE_AUTONOMY to Node server via env)
-echo [AVA] Starting voice assistant...
-python ava_standalone_realtime.py
-
-pause
+set "SUPERVISOR=%~dp0..\docs\start_ava.ps1"
+echo Moltbook learning is part of the canonical AVa server and is not a separate runner.
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%SUPERVISOR%" -Action Start
+endlocal

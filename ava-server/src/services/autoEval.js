@@ -28,8 +28,9 @@ import path from 'path';
 import logger from '../utils/logger.js';
 import evolutionLog from './evolutionLog.js';
 import { pushAnnouncement } from './announceQueue.js';
+import avaPaths from '../utils/paths.js';
 
-const FILE = path.join(process.cwd(), 'data', 'auto-eval.json');
+const FILE = path.join(avaPaths.dataDir(), 'auto-eval.json');
 const MAX_HISTORY = 40;
 const BOOT_ID = `${process.pid}-${Date.now()}`;   // distinguishes "applied in THIS process" from a prior one
 

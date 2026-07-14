@@ -49,6 +49,32 @@ const AVA = ({
     return (import.meta.env.VITE_AVA_SERVER_URL || 'http://127.0.0.1:5051').replace(/\/$/, '');
   }, [serverUrl]);
 
+  const addMessage = useCallback((type, text, extra = {}) => {
+    const message = {
+      id: Date.now() + Math.random(),
+      type,
+      text,
+      timestamp: Date.now(),
+      ...extra
+    };
+    setMessages(prev => [...prev, message]);
+    return message;
+  }, []);
+
+  const loadChatHistory = useCallback(async () => {
+    if (!enableHistory) return;
+
+    try {
+      const response = await fetch(`${getBaseURL()}/api/history`);
+      const data = await response.json();
+      if (data.status === 'success') {
+        setChatHistory(data.sessions || []);
+      }
+    } catch (e) {
+      console.error('Failed to load chat history:', e);
+    }
+  }, [enableHistory, getBaseURL]);
+
   // Auto-scroll to bottom
   const scrollToBottom = useCallback(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -100,29 +126,14 @@ const AVA = ({
     };
 
     loadInitialData();
-  }, [enableVoice, enableHistory, memory, voice, getBaseURL]);
+  }, [enableVoice, enableHistory, memory, voice, getBaseURL, loadChatHistory]);
 
   // Handle voice transcript
   useEffect(() => {
     if (enableVoice && voice.transcript) {
       addMessage('bot', voice.transcript);
     }
-  }, [voice.transcript, enableVoice]);
-
-  // Load chat history
-  const loadChatHistory = async () => {
-    if (!enableHistory) return;
-    
-    try {
-      const response = await fetch(`${getBaseURL()}/api/history`);
-      const data = await response.json();
-      if (data.status === 'success') {
-        setChatHistory(data.sessions || []);
-      }
-    } catch (e) {
-      console.error('Failed to load chat history:', e);
-    }
-  };
+  }, [voice.transcript, enableVoice, addMessage]);
 
   // Search chat history
   const searchHistory = async (query) => {
@@ -145,19 +156,6 @@ const AVA = ({
       console.error('Failed to search history:', e);
     }
   };
-
-  // Add message helper
-  const addMessage = useCallback((type, text, extra = {}) => {
-    const message = {
-      id: Date.now() + Math.random(),
-      type,
-      text,
-      timestamp: Date.now(),
-      ...extra
-    };
-    setMessages(prev => [...prev, message]);
-    return message;
-  }, []);
 
   // Send message handler
   const handleSendMessage = async (text = inputText) => {

@@ -1,0 +1,110 @@
+﻿[
+    {
+        "file":  "ava-server\\src\\utils\\modelConfig.js",
+        "sha256":  "76D0C8018885E26C6EBB58C783BCF2AD7CD8ACDDCA76A803B2C5657D9D76A65C",
+        "length":  1924,
+        "lastWriteUtc":  "2026-07-14T08:50:26.3103293Z"
+    },
+    {
+        "file":  "ava-server\\tests\\modelConfig.test.js",
+        "sha256":  "1DB28A12E05F7F696C43B9F7C79A466B46FBADFEFAE8CF61BD0DDE7FD4F9AA43",
+        "length":  975,
+        "lastWriteUtc":  "2026-07-14T08:50:27.4372256Z"
+    },
+    {
+        "file":  "ava-server\\src\\services\\llm.js",
+        "sha256":  "0BFDE6A683EC33E33EFA26234EAC4AB6650D8885D7DD7564CB9734344B61BB3F",
+        "length":  49188,
+        "lastWriteUtc":  "2026-07-14T07:13:53.7300428Z"
+    },
+    {
+        "file":  "ava-server\\src\\services\\autonomyPolicy.js",
+        "sha256":  "DF5A5EC2B724C8DE9E31E21C568B677681C45A5520E446A299FFE23B57E1D7B2",
+        "length":  13544,
+        "lastWriteUtc":  "2026-07-10T03:07:53.2019026Z"
+    },
+    {
+        "file":  "ava-server\\tests\\autonomyPolicy.test.js",
+        "sha256":  "59A36AF5A01B486FE6A8ABB39646859BCEC25806E61C4E73B3B4C2A3C6F9EB93",
+        "length":  3059,
+        "lastWriteUtc":  "2026-06-27T12:10:52.0000000Z"
+    },
+    {
+        "file":  "ava-server\\src\\services\\agentLoop.js",
+        "sha256":  "C95F2EF37B25061780BEF9A4CE42797DB36F1144426AF815413D6FF09895DC4A",
+        "length":  91807,
+        "lastWriteUtc":  "2026-07-14T02:04:38.8011335Z"
+    },
+    {
+        "file":  "ava-server\\src\\services\\selfRestart.js",
+        "sha256":  "550EF570736A5A28BE268F3746945AD01D95B1BFCAB6815EB4BA9B31347418C8",
+        "length":  2078,
+        "lastWriteUtc":  "2026-07-10T03:07:45.7203525Z"
+    },
+    {
+        "file":  "ava-server\\src\\services\\pythonWorker.js",
+        "sha256":  "037A86A187A0E4EC67A4D648E54B69575CD839DBB933F50D54B1E87A7A3CB6D8",
+        "length":  9218,
+        "lastWriteUtc":  "2026-07-10T02:26:04.4767490Z"
+    },
+    {
+        "file":  "ava-server\\src\\routes\\learning.js",
+        "sha256":  "54131FD790B5DAE1CC4C03A43D2ABD6B08859A105B7F562258492FCCEFFB8272",
+        "length":  45863,
+        "lastWriteUtc":  "2026-07-14T07:58:10.4122029Z"
+    },
+    {
+        "file":  "ava-server\\src\\services\\selfModVoice.js",
+        "sha256":  "12D29C05337FAE426434C6A9BD04D4FE5959598D6ABF22EA750B85700635146A",
+        "length":  35559,
+        "lastWriteUtc":  "2026-07-10T03:09:20.4641131Z"
+    },
+    {
+        "file":  "ava-client\\src\\MinimalAVA.jsx",
+        "sha256":  "9AF31D9FB655C8A73BFD0178928D53BAE6D578C2AE080ED24FC7D928DAE029A1",
+        "length":  35078,
+        "lastWriteUtc":  "2026-07-10T03:03:47.8049044Z"
+    },
+    {
+        "file":  "ava-client\\src\\components\\Stage.jsx",
+        "sha256":  "F6963AD594253F8E70AA2AAC58D32670763B75C0F06C469343FEC69C4FEC368E",
+        "length":  55566,
+        "lastWriteUtc":  "2026-07-10T03:41:08.3311933Z"
+    },
+    {
+        "file":  "ava-integration\\.env",
+        "sha256":  "BA710A8A7AB1C736DFE7EBF8423BFC51834A4D2B7A40F7F5FF128D4D2A3AD72F",
+        "length":  1636,
+        "lastWriteUtc":  "2026-07-14T07:13:55.3052949Z"
+    },
+    {
+        "file":  "ava-server\\src\\services\\workflowEngine.js",
+        "sha256":  "8B1A02143BD1B916A174ACBA7130D9A0172D13EA35FBF41E6895786A4ACDDB94",
+        "length":  34386,
+        "lastWriteUtc":  "2026-07-14T08:00:17.7255251Z"
+    },
+    {
+        "file":  "ava-server\\tests\\longHorizon.test.js",
+        "sha256":  "8A1B31F7B5B6955F3DB01AF4847DBCA4FF4CFF5A2A79F2DA435CF128F32147D8",
+        "length":  6181,
+        "lastWriteUtc":  "2026-07-14T07:58:38.3658895Z"
+    },
+    {
+        "file":  "docs\\start_ava.ps1",
+        "sha256":  "0A40812EA121EE0516FDD01C519A970904694B3D23E44814F81572B20A4061DC",
+        "length":  8488,
+        "lastWriteUtc":  "2026-07-10T03:30:51.6390655Z"
+    },
+    {
+        "file":  "ava-server\\src\\services\\goalManager.js",
+        "sha256":  "2E050DF61D4F6AFA84548D88276D61E4DBF4A13F9D1829A12309069D7A033D62",
+        "length":  6765,
+        "lastWriteUtc":  "2026-07-14T07:58:02.0501592Z"
+    },
+    {
+        "file":  "ava-server\\src\\routes\\respond.js",
+        "sha256":  "D06B2D2800618F82F30712BCA30235CC583A9ECFC257BD2D2932B9570C449B49",
+        "length":  114810,
+        "lastWriteUtc":  "2026-07-14T05:42:48.6829440Z"
+    }
+]

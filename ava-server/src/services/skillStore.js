@@ -3,17 +3,38 @@
 // always-available INDEX. Maturity counter: a skill becomes "proven" after repeats.
 import fs from 'fs';
 import path from 'path';
-import os from 'os';
 import logger from '../utils/logger.js';
+import avaPaths from '../utils/paths.js';
 
 function integrationDir() {
-  const home = os.homedir();
-  return process.env.AVA_INTEGRATION_DIR || path.join(home, 'ava', 'ava-integration');
+  return process.env.AVA_INTEGRATION_DIR || avaPaths.integrationDir();
 }
 function skillsDir() { return path.join(integrationDir(), 'memory', 'skills'); }
+function consolidationPath() { return path.join(skillsDir(), 'CONSOLIDATION.json'); }
 function ensureDir() { try { fs.mkdirSync(skillsDir(), { recursive: true }); } catch { /* ignore */ } }
 function slug(t) {
   return String(t || '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '').slice(0, 60) || 'skill';
+}
+
+const SKILL_STOP = new Set(['a', 'an', 'and', 'as', 'at', 'by', 'for', 'from', 'in', 'of', 'on', 'or', 'the', 'to', 'using', 'with']);
+function skillTokens(text) {
+  return new Set(String(text || '').toLowerCase().split(/[^a-z0-9]+/).filter(t => t.length > 2 && !SKILL_STOP.has(t)));
+}
+function similarity(a, b) {
+  const aa = skillTokens(a); const bb = skillTokens(b);
+  if (!aa.size || !bb.size) return 0;
+  let common = 0;
+  for (const token of aa) if (bb.has(token)) common += 1;
+  return common / Math.max(aa.size, bb.size);
+}
+
+function similarSkill(title, when) {
+  const threshold = Math.min(0.95, Math.max(0.5, Number(process.env.AVA_SKILL_SIMILARITY) || 0.68));
+  const query = `${title || ''} ${when || ''}`;
+  return listSkills()
+    .map(skill => ({ skill, score: similarity(query, `${skill.title} ${skill.when}`) }))
+    .filter(x => x.score >= threshold)
+    .sort((a, b) => b.score - a.score)[0] || null;
 }
 
 function parse(file) {
@@ -32,7 +53,16 @@ function parse(file) {
   } catch { return null; }
 }
 
-export function listSkills() {
+function readConsolidation() {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(consolidationPath(), 'utf8'));
+    return parsed && typeof parsed.aliases === 'object' ? parsed : { aliases: {} };
+  } catch {
+    return { aliases: {} };
+  }
+}
+
+function readAllSkills() {
   ensureDir();
   let files = [];
   try { files = fs.readdirSync(skillsDir()).filter((f) => f.endsWith('.md') && f !== 'INDEX.md'); } catch { /* none */ }
@@ -47,32 +77,99 @@ export function listSkills() {
   }));
 }
 
+export function listSkills({ includeAliases = false } = {}) {
+  const skills = readAllSkills();
+  if (includeAliases) return skills;
+  const aliases = readConsolidation().aliases;
+  return skills.filter(skill => !aliases[skill.slug]);
+}
+
 export function getSkill(idOrTitle) {
   const s1 = slug(idOrTitle);
-  return listSkills().find((s) => s.slug === s1 || s.title.toLowerCase() === String(idOrTitle).toLowerCase()) || null;
+  const canonical = readConsolidation().aliases[s1] || s1;
+  return listSkills().find((s) => s.slug === canonical || s.title.toLowerCase() === String(idOrTitle).toLowerCase()) || null;
+}
+
+function skillRank(skill) {
+  return (Number(skill.proven) * 1000000) + (skill.uses * 10000) + Math.min(skill.body.length, 9999);
+}
+
+/** Build a reversible alias plan for genuinely overlapping learned procedures. */
+export function buildConsolidationPlan({ threshold } = {}) {
+  const similarityThreshold = Math.min(0.95, Math.max(0.5,
+    Number(threshold ?? process.env.AVA_SKILL_CONSOLIDATION_SIMILARITY) || 0.72));
+  const ranked = readAllSkills().sort((a, b) => skillRank(b) - skillRank(a));
+  const canonical = [];
+  const groups = new Map();
+  const aliases = {};
+
+  for (const candidate of ranked) {
+    const candidateText = `${candidate.title} ${candidate.when} ${candidate.tags}`;
+    const match = canonical
+      .map(skill => ({ skill, score: similarity(candidateText, `${skill.title} ${skill.when} ${skill.tags}`) }))
+      .filter(item => item.score >= similarityThreshold)
+      .sort((a, b) => b.score - a.score)[0];
+    if (!match) {
+      canonical.push(candidate);
+      groups.set(candidate.slug, []);
+      continue;
+    }
+    aliases[candidate.slug] = match.skill.slug;
+    groups.get(match.skill.slug).push({ slug: candidate.slug, similarity: Number(match.score.toFixed(3)) });
+  }
+
+  return {
+    version: 1,
+    generatedAt: new Date().toISOString(),
+    threshold: similarityThreshold,
+    totalSkills: ranked.length,
+    canonicalSkills: canonical.length,
+    aliasCount: Object.keys(aliases).length,
+    aliases,
+    groups: [...groups.entries()]
+      .filter(([, members]) => members.length)
+      .map(([canonicalSlug, members]) => ({ canonical: canonicalSlug, members })),
+  };
+}
+
+export function saveConsolidationPlan(plan) {
+  ensureDir();
+  const target = consolidationPath();
+  const temporary = `${target}.tmp-${process.pid}`;
+  fs.writeFileSync(temporary, `${JSON.stringify(plan, null, 2)}\n`, 'utf8');
+  fs.renameSync(temporary, target);
+  rebuildIndex();
+  return target;
 }
 
 export function saveSkill({ title, when, steps, tags, notes }) {
   ensureDir();
-  const s = slug(title);
+  const match = similarSkill(title, when);
+  if (match) title = match.skill.title;
+  const s = match ? match.skill.slug : slug(title);
   const p = path.join(skillsDir(), s + '.md');
   const existing = parse(p);
   let uses = 1, created = new Date().toISOString().slice(0, 10);
   if (existing) { uses = (parseInt(existing.meta.uses || '1', 10) || 1) + 1; created = existing.meta.created || created; }
   const proven = uses >= 3;
   const stepsArr = Array.isArray(steps) ? steps : String(steps || '').split('\n').filter(Boolean);
-  const body = [
+  const proposedBody = [
     `WHEN: ${when || ''}`,
     'STEPS:',
     ...stepsArr.map((st, i) => `${i + 1}. ${String(st).replace(/^\s*\d+[.)]\s*/, '')}`),
     notes ? `NOTES: ${notes}` : '',
   ].filter(Boolean).join('\n');
+  // Repeated captures prove an existing skill; they should not overwrite a
+  // mature procedure with a differently worded, lower-information variant.
+  const body = existing && existing.body.trim().length >= proposedBody.trim().length
+    ? existing.body.trim()
+    : proposedBody;
   const fm = `---\ntitle: ${title}\nslug: ${s}\nuses: ${uses}\nproven: ${proven}\n`
     + `tags: ${Array.isArray(tags) ? tags.join(', ') : (tags || '')}\ncreated: ${created}\nupdated: ${new Date().toISOString().slice(0, 10)}\n---\n`;
   fs.writeFileSync(p, fm + body + '\n', 'utf8');
   rebuildIndex();
   logger?.info?.('[skillStore] saved skill', { slug: s, uses, proven });
-  return { slug: s, uses, proven, created: !existing };
+  return { slug: s, uses, proven, created: !existing, mergedInto: match ? s : null };
 }
 
 export function rebuildIndex() {
@@ -107,4 +204,8 @@ export function searchSkills(query, terms) {
   return out;
 }
 
-export default { listSkills, getSkill, saveSkill, searchSkills, buildSkillsIndex, rebuildIndex, paths: { skillsDir } };
+export default {
+  listSkills, getSkill, saveSkill, searchSkills, buildSkillsIndex, rebuildIndex,
+  buildConsolidationPlan, saveConsolidationPlan,
+  paths: { skillsDir, consolidationPath },
+};

@@ -461,12 +461,12 @@ function AvatarScene({ stateRef, ampRef, visemeRef, gazeRef, poseRef, gestureRef
         else if (gst.name === 'lean_in') { gp -= 0.08 * env; lean = 0.07 * env; }
       }
     }
+    const tv = torsoRef ? torsoRef.current : null;
+    const tOn = Boolean(tv && performance.now() < tv.until);
     const tb = torsoBone.current;
     if (tb) {
       // Torso: her deliberate pose > gesture lean > breathing baseline. The
       // breath is body-life, not a decision — every living body has it.
-      const tv = torsoRef ? torsoRef.current : null;
-      const tOn = tv && performance.now() < tv.until;
       // Visible body life: breath + a slow weight-shift sway. (First cut was
       // 0.012 rad — sub-pixel at Stage size; "the torso is still frozen".)
       const breath = Math.sin(time * 0.85) * 0.03;

@@ -1,0 +1,232 @@
+{
+  "version": 1,
+  "generatedAt": "2026-07-10T01:57:51.406Z",
+  "threshold": 0.55,
+  "totalSkills": 84,
+  "canonicalSkills": 55,
+  "aliasCount": 29,
+  "aliases": {
+    "list-top-processes-by-rss": "list-top-processes-by-ram-using-sys-ops",
+    "list-top-processes-by-ram-with-sys-ops": "list-top-processes-by-memory-usage",
+    "categorize-memory-consuming-processes-as-user-or-system": "classify-top-memory-processes-as-user-vs-system-critical",
+    "classify-processes-as-user-or-system": "classify-top-memory-processes-as-user-vs-system-critical",
+    "classify-processes-as-system-critical-vs-user-apps": "classify-memory-consumers-as-user-apps-or-system-processes",
+    "classify-top-memory-consumers-as-safe-to-close-vs-system-cri": "classify-memory-consumers-as-user-apps-or-system-processes",
+    "list-top-processes-by-ram-usage-on-windows": "list-top-processes-by-ram-using-sys-ops",
+    "read-memory-usage-overview-with-sys-ops": "read-memory-usage-with-sys-ops",
+    "create-memory-pressure-investigation-report": "generate-concise-memory-pressure-report-with-safe-to-close-r",
+    "produce-final-memory-pressure-report": "compile-memory-pressure-findings-report",
+    "classify-top-memory-processes-as-user-apps-or-system-critica": "classify-processes-as-user-app-or-system-critical",
+    "generate-memory-consumption-report-with-safe-to-close-recomm": "generate-concise-memory-pressure-report-with-safe-to-close-r",
+    "report-top-memory-consumers-with-recovery-recommendations": "compile-memory-report-with-safe-to-close-recommendations",
+    "classify-top-memory-processes-as-user-app-vs-system-critical": "classify-top-memory-processes-as-user-vs-system-critical",
+    "read-memory-usage-and-top-processes": "read-current-memory-usage-with-sys-ops",
+    "use-sys-ops-to-list-top-processes-by-ram": "memory-hungry-process-list-top-memory-consumers",
+    "read-memory-usage-and-identify-top-processes": "read-memory-usage-with-sys-ops",
+    "get-top-processes-by-memory-on-windows": "list-top-processes-by-memory-usage",
+    "list-top-memory-consuming-processes": "get-top-ram-consuming-processes-on-any-os",
+    "list-top-ram-consuming-processes": "list-top-processes-by-ram-using-sys-ops",
+    "list-top-processes-by-ram-consumption": "read-memory-usage-with-sys-ops",
+    "list-top-memory-consuming-processes-on-linux": "list-top-processes-by-ram-using-sys-ops",
+    "check-ram-usage-using-sys-ops-tool": "read-current-memory-usage-with-sys-ops",
+    "read-overall-system-memory-usage-with-sys-ops": "read-current-memory-usage-with-sys-ops",
+    "check-memory-usage-with-sys-ops-tool": "read-total-memory-usage-via-sys-ops",
+    "list-top-processes-by-ram": "list-top-processes-by-ram-using-sys-ops",
+    "read-memory-stats-with-sys-ops": "collect-overall-memory-usage-with-sys-ops",
+    "get-top-memory-consumers": "list-top-processes-by-memory-usage",
+    "check-memory-usage-overview": "get-memory-overview-with-free-h"
+  },
+  "groups": [
+    {
+      "canonical": "list-top-processes-by-ram-using-sys-ops",
+      "members": [
+        {
+          "slug": "list-top-processes-by-rss",
+          "similarity": 0.571
+        },
+        {
+          "slug": "list-top-processes-by-ram-usage-on-windows",
+          "similarity": 0.6
+        },
+        {
+          "slug": "list-top-ram-consuming-processes",
+          "similarity": 0.615
+        },
+        {
+          "slug": "list-top-memory-consuming-processes-on-linux",
+          "similarity": 0.643
+        },
+        {
+          "slug": "list-top-processes-by-ram",
+          "similarity": 0.688
+        }
+      ]
+    },
+    {
+      "canonical": "read-current-memory-usage-with-sys-ops",
+      "members": [
+        {
+          "slug": "read-memory-usage-and-top-processes",
+          "similarity": 0.563
+        },
+        {
+          "slug": "check-ram-usage-using-sys-ops-tool",
+          "similarity": 0.563
+        },
+        {
+          "slug": "read-overall-system-memory-usage-with-sys-ops",
+          "similarity": 0.625
+        }
+      ]
+    },
+    {
+      "canonical": "read-total-memory-usage-via-sys-ops",
+      "members": [
+        {
+          "slug": "check-memory-usage-with-sys-ops-tool",
+          "similarity": 0.632
+        }
+      ]
+    },
+    {
+      "canonical": "list-top-processes-by-memory-usage",
+      "members": [
+        {
+          "slug": "list-top-processes-by-ram-with-sys-ops",
+          "similarity": 0.563
+        },
+        {
+          "slug": "get-top-processes-by-memory-on-windows",
+          "similarity": 0.6
+        },
+        {
+          "slug": "get-top-memory-consumers",
+          "similarity": 0.6
+        }
+      ]
+    },
+    {
+      "canonical": "read-memory-usage-with-sys-ops",
+      "members": [
+        {
+          "slug": "read-memory-usage-overview-with-sys-ops",
+          "similarity": 0.583
+        },
+        {
+          "slug": "read-memory-usage-and-identify-top-processes",
+          "similarity": 0.643
+        },
+        {
+          "slug": "list-top-processes-by-ram-consumption",
+          "similarity": 0.615
+        }
+      ]
+    },
+    {
+      "canonical": "classify-top-memory-processes-as-user-vs-system-critical",
+      "members": [
+        {
+          "slug": "categorize-memory-consuming-processes-as-user-or-system",
+          "similarity": 0.55
+        },
+        {
+          "slug": "classify-processes-as-user-or-system",
+          "similarity": 0.556
+        },
+        {
+          "slug": "classify-top-memory-processes-as-user-app-vs-system-critical",
+          "similarity": 0.556
+        }
+      ]
+    },
+    {
+      "canonical": "classify-memory-consumers-as-user-apps-or-system-processes",
+      "members": [
+        {
+          "slug": "classify-processes-as-system-critical-vs-user-apps",
+          "similarity": 0.714
+        },
+        {
+          "slug": "classify-top-memory-consumers-as-safe-to-close-vs-system-cri",
+          "similarity": 0.619
+        }
+      ]
+    },
+    {
+      "canonical": "classify-processes-as-user-app-or-system-critical",
+      "members": [
+        {
+          "slug": "classify-top-memory-processes-as-user-apps-or-system-critica",
+          "similarity": 0.6
+        }
+      ]
+    },
+    {
+      "canonical": "compile-memory-report-with-safe-to-close-recommendations",
+      "members": [
+        {
+          "slug": "report-top-memory-consumers-with-recovery-recommendations",
+          "similarity": 0.611
+        }
+      ]
+    },
+    {
+      "canonical": "generate-concise-memory-pressure-report-with-safe-to-close-r",
+      "members": [
+        {
+          "slug": "create-memory-pressure-investigation-report",
+          "similarity": 0.56
+        },
+        {
+          "slug": "generate-memory-consumption-report-with-safe-to-close-recomm",
+          "similarity": 0.56
+        }
+      ]
+    },
+    {
+      "canonical": "get-top-ram-consuming-processes-on-any-os",
+      "members": [
+        {
+          "slug": "list-top-memory-consuming-processes",
+          "similarity": 0.579
+        }
+      ]
+    },
+    {
+      "canonical": "compile-memory-pressure-findings-report",
+      "members": [
+        {
+          "slug": "produce-final-memory-pressure-report",
+          "similarity": 0.556
+        }
+      ]
+    },
+    {
+      "canonical": "memory-hungry-process-list-top-memory-consumers",
+      "members": [
+        {
+          "slug": "use-sys-ops-to-list-top-processes-by-ram",
+          "similarity": 0.619
+        }
+      ]
+    },
+    {
+      "canonical": "collect-overall-memory-usage-with-sys-ops",
+      "members": [
+        {
+          "slug": "read-memory-stats-with-sys-ops",
+          "similarity": 0.692
+        }
+      ]
+    },
+    {
+      "canonical": "get-memory-overview-with-free-h",
+      "members": [
+        {
+          "slug": "check-memory-usage-overview",
+          "similarity": 0.625
+        }
+      ]
+    }
+  ]
+}

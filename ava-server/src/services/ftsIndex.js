@@ -17,7 +17,7 @@ let DatabaseSync = null;
 try { ({ DatabaseSync } = await import('node:sqlite')); }
 catch (e) { try { logger.info('[fts] node:sqlite unavailable, FTS disabled', { error: e.message }); } catch { /* ignore */ } }
 
-const DB_PATH = path.join(process.cwd(), 'data', 'memory_fts.db');
+const DB_PATH = path.join(avaPaths.dataDir(), 'memory_fts.db');
 const OFFSET_MIN = parseInt(process.env.AVA_TZ_OFFSET_MIN || '-300', 10);
 const FRESH_CHECK_MS = 15000;   // don't re-stat sources more than this often
 

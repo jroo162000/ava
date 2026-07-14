@@ -2,6 +2,22 @@
 
 AVA is a comprehensive AI-powered virtual assistant system with a modular architecture consisting of three main components:
 
+## Canonical Runtime
+
+Run `START_AVA.bat` from the repository root. It starts and supervises exactly one backend,
+one Vite UI, and one `ava-integration/ava_local_voice.py` process. The same supervisor keeps
+Moltbook learning, proposals, workflows, and proactive autonomy in the backend; do not set
+`DISABLE_AUTONOMY` for normal voice use.
+
+Use `STOP_AVA.bat` to stop only those canonical processes, or run:
+
+```powershell
+powershell -File .\docs\start_ava.ps1 -Action Status
+```
+
+The `ava_standalone_realtime.py` launchers are retained only for historical diagnostics and are
+not the supported UI-connected voice runtime.
+
 ## 🏗️ Architecture
 
 ```
@@ -83,7 +99,7 @@ AVA is a comprehensive AI-powered virtual assistant system with a modular archit
    .venv\Scripts\activate  # Windows
    # source .venv/bin/activate  # Mac/Linux
    pip install -r requirements.txt
-   python ava_standalone_realtime.py
+   ..\START_AVA.bat
    ```
 
 ## 📁 Project Structure

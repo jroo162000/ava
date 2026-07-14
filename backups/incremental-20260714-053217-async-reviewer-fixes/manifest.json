@@ -1,0 +1,67 @@
+﻿[
+    {
+        "path":  "ava-server\\src\\services\\announceQueue.js",
+        "sha256":  "5B86785386710A3FA4C0BF56EA373993CDAA138AD5F6363F0F59E7A6C9796746",
+        "bytes":  922
+    },
+    {
+        "path":  "ava-server\\src\\services\\conversationLogger.js",
+        "sha256":  "A5E18E2ADC7F9283B18E2826320264A2AA437158729A5B1F6C5CE561152B19D9",
+        "bytes":  9551
+    },
+    {
+        "path":  "ava-server\\src\\services\\selfModVoice.js",
+        "sha256":  "B34FE64544FEC27139B685369CDDC0C572F6A717BC5028B645C8B3DE5F3368E2",
+        "bytes":  35552
+    },
+    {
+        "path":  "ava-server\\src\\routes\\respond.js",
+        "sha256":  "1A849E0AC2FD5CA2A63100F13F944872232474900FB7022C5DC8761D635E0428",
+        "bytes":  115513
+    },
+    {
+        "path":  "ava-server\\src\\services\\workflowEngine.js",
+        "sha256":  "EDA8D492ABC951EBF1370106632B2DBF55FE7A225F7C23FFC3F78A9157613AFA",
+        "bytes":  36581
+    },
+    {
+        "path":  "ava-server\\src\\routes\\learning.js",
+        "sha256":  "56809FD4DDD0B2D9080D71023B90FEA7CB271C2F053DCC6AECB92300FC604349",
+        "bytes":  46013
+    },
+    {
+        "path":  "ava-server\\src\\services\\selfModSandbox.js",
+        "sha256":  "2282C2BD0BB4B68249C5B6AB68204FEAC347FF8C14076EC6237A3F6C71820C37",
+        "bytes":  18655
+    },
+    {
+        "path":  "ava-server\\src\\services\\selfImprove.js",
+        "sha256":  "BB6B9BCBCAB9F09C6CB1A6B16947DFEF750C0B681B8B0E4853DEB84BD5E1E406",
+        "bytes":  98657
+    },
+    {
+        "path":  "ava-server\\src\\services\\llm.js",
+        "sha256":  "812DA72276E972DFA9088FC841764C524D749550AE6BC4805EDEAAECC87CD109",
+        "bytes":  56159
+    },
+    {
+        "path":  "ava-server\\src\\utils\\modelConfig.js",
+        "sha256":  "41CB3AD6A5A3242714F72F9A74121122BC8B569B729509A9C0BC130B56E1DE21",
+        "bytes":  2299
+    },
+    {
+        "path":  "ava-server\\tests\\modelConfig.test.js",
+        "sha256":  "2BAC10FEE541A61C37D5B1C85F85DA903B43C947A8F90EC04647125CDF65EA37",
+        "bytes":  1496
+    },
+    {
+        "path":  "ava-server\\tests\\selfImproveLessons.test.js",
+        "sha256":  "41C1049EBF9D61865457334BAC1DD7F3B69EB9B8815A6CDD8300718FFBF7E805",
+        "bytes":  14822
+    },
+    {
+        "path":  "ava-server\\tests\\longHorizon.test.js",
+        "sha256":  "68519C84F20A86C60A93DFEEA75353BA0B297076832A7FBA82D88D1BC80BE726",
+        "bytes":  7920
+    }
+]

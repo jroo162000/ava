@@ -8,10 +8,11 @@ import os from 'os';
 import { fileURLToPath } from 'url';
 import config from '../utils/config.js';
 import logger from '../utils/logger.js';
+import avaPaths from '../utils/paths.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-const DATA_DIR = path.join(__dirname, '..', '..', 'data');
+const DATA_DIR = avaPaths.dataDir();
 const VECTORS_PATH = path.join(DATA_DIR, 'vectors.jsonl');
 
 // Ensure data directory exists
@@ -30,6 +31,7 @@ const MemoryType = {
   WARNING: 'warning',            // Warnings from past mistakes
   CONVERSATION: 'conversation',  // Conversation context
   AGENT_ACTION: 'agent_action',  // Agent execution history
+  OBSERVATION: 'observation',    // External/community information not yet independently verified
   CREDENTIAL_HINT: 'credential_hint', // Non-sensitive credential hints
   SYSTEM: 'system'               // System-generated memories
 };
@@ -41,7 +43,8 @@ const MemorySource = {
   USER: 'user',           // Explicitly stated by user
   LEARNED: 'learned',     // Inferred from behavior
   SYSTEM: 'system',       // System-generated
-  CORRECTION: 'correction' // Learned from user corrections
+  CORRECTION: 'correction', // Learned from user corrections
+  COMMUNITY: 'community'  // Moltbook or other external-agent observations
 };
 
 // Simple hashed bag-of-words embedding
@@ -67,6 +70,16 @@ function hash(string) {
     h = Math.imul(h, 16777619);
   }
   return h >>> 0;
+}
+
+function normalizeMemoryText(text) {
+  return String(text || '').toLowerCase().replace(/[^a-z0-9\s]+/g, ' ').replace(/\s+/g, ' ').trim();
+}
+
+function memoryFingerprint(item) {
+  const material = `${item.type || MemoryType.CONVERSATION}|${item.source || MemorySource.SYSTEM}|${item.role || 'system'}|${normalizeMemoryText(item.text)}`;
+  const reverse = [...material].reverse().join('');
+  return `${hash(material).toString(36)}${hash(reverse).toString(36)}`;
 }
 
 function embedLocal(text) {
@@ -136,7 +149,7 @@ class MemoryService {
     this.memory = [];
     this.sqlite = null;
     this.db = null;
-    this.initializeStorage();
+    this.ready = this.initializeStorage();
 
     // Periodic forgetting: archive stale, low-value memories to the on-device cold vault.
     // Opt-out via AVA_MEMORY_FORGET_ENABLED=0. Conservative defaults (45-day TTL, priority<=2).
@@ -328,6 +341,7 @@ class MemoryService {
   }
 
   async embed(text) {
+    await this.ready;
     return config.EMBED_PROVIDER === 'openai' ? embedExternal(text) : embedLocal(text);
   }
 
@@ -335,6 +349,7 @@ class MemoryService {
    * Store a new memory item (Phase 5 enhanced)
    */
   async store(item) {
+    await this.ready;
     const now = Date.now();
     
     const record = {
@@ -352,7 +367,9 @@ class MemoryService {
       vec: Array.isArray(item.vec) ? item.vec : await this.embed(item.text || '')
     };
 
-    this.memory.push(record);
+    const existingIndex = this.memory.findIndex(memory => memory.id === record.id);
+    if (existingIndex >= 0) this.memory[existingIndex] = record;
+    else this.memory.push(record);
 
     try {
       if (this.db) {
@@ -385,15 +402,54 @@ class MemoryService {
     return record;
   }
 
-  // Alias for compatibility
+  // Merge equivalent memories instead of multiplying them on every scheduler
+  // pass. The fingerprint includes type/source/role so community observations,
+  // user constraints, and dialogue never overwrite one another.
   async upsert(item) {
-    return this.store(item);
+    await this.ready;
+    const text = String(item?.text || '').trim();
+    if (!text) return null;
+    const candidate = { ...item, text };
+    const fingerprint = memoryFingerprint(candidate);
+    const existing = this.memory.find(memory =>
+      memory.meta?.fingerprint === fingerprint || memoryFingerprint(memory) === fingerprint);
+    if (!existing) {
+      return this.store({
+        ...candidate,
+        id: candidate.id || `mem-${fingerprint}`,
+        meta: { ...(candidate.meta || {}), fingerprint, seenCount: 1, lastSeenAt: Date.now() },
+      });
+    }
+
+    existing.priority = Math.max(existing.priority || 1, candidate.priority || 1);
+    existing.tags = [...new Set([...(existing.tags || []), ...(candidate.tags || [])])];
+    existing.rating = Math.max(existing.rating || 0, candidate.rating || 0);
+    existing.last_used_at = candidate.last_used_at || existing.last_used_at;
+    existing.meta = {
+      ...(existing.meta || {}),
+      ...(candidate.meta || {}),
+      fingerprint,
+      seenCount: Math.max(1, Number(existing.meta?.seenCount) || 1) + 1,
+      lastSeenAt: Date.now(),
+    };
+    try {
+      if (this.db) {
+        this.db.prepare(`UPDATE mem SET priority = ?, last_used_at = ?, tags = ?, rating = ?, meta = ? WHERE id = ?`)
+          .run(existing.priority, existing.last_used_at, JSON.stringify(existing.tags), existing.rating, JSON.stringify(existing.meta), existing.id);
+      } else {
+        fs.writeFileSync(VECTORS_PATH, this.memory.map(memory => JSON.stringify(memory)).join('\n') + '\n');
+      }
+    } catch (error) {
+      logger.warn('[memory] upsert persistence failed', { error: error.message });
+    }
+    return existing;
   }
 
   /**
    * Update last_used_at timestamp for retrieved memories
    */
   async markUsed(ids) {
+    await this.ready;
     const now = Date.now();
     
     for (const id of ids) {
@@ -430,6 +486,7 @@ class MemoryService {
    * @param {string}  opts.vaultDir  override the on-device cold-vault directory
    */
   async forgetStale(opts = {}) {
+    await this.ready;
     const now = Date.now();
     const ttlDays = opts.ttlDays ?? parseInt(process.env.AVA_MEMORY_TTL_DAYS || '45', 10);
     const maxPriority = opts.maxPriority ?? parseInt(process.env.AVA_MEMORY_FORGET_MAX_PRIORITY || '2', 10);
@@ -499,6 +556,7 @@ class MemoryService {
    * prefs, or anything else. Returns { pruned, kept }.
    */
   async pruneSelfReflectionWarnings(keep = 25, opts = {}) {
+    await this.ready;
     const k = Math.max(0, keep | 0);
     const raws = this.memory
       .filter(m => m && m.type === MemoryType.WARNING && m.source === 'self-reflection')
@@ -529,16 +587,28 @@ class MemoryService {
    * Basic semantic search
    */
   async search(query, k = 5) {
+    await this.ready;
     if (this.memory.length === 0) {
       return [];
     }
 
     const queryVec = await this.embed(query);
+    const communityIntent = /\b(moltbook|community|other agents?|agent community|what (have|did) you learn)\b/i.test(String(query || ''));
+    const seen = new Set();
+    const trust = { user: 1.3, correction: 1.35, system: 1.1, learned: 0.95, community: 0.72 };
     const scored = this.memory
-      .filter(item => item.vec)
+      .filter(item => {
+        if (!item.vec) return false;
+        const isCommunity = item.source === MemorySource.COMMUNITY || (item.tags || []).includes('moltbook');
+        if (isCommunity && !communityIntent) return false;
+        const key = memoryFingerprint(item);
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      })
       .map(item => ({
         ...item,
-        score: cosine(queryVec, item.vec)
+        score: cosine(queryVec, item.vec) * (trust[item.source] || 1) * (1 + ((item.priority || 3) - 3) * 0.08)
       }))
       .sort((a, b) => b.score - a.score)
       .slice(0, k);
@@ -558,6 +628,7 @@ class MemoryService {
    * @param {string[]} filters.sources - Memory sources to include
    */
   async retrieveRelevant(query, k = 8, filters = {}) {
+    await this.ready;
     if (this.memory.length === 0) {
       logger.debug('[memory] retrieveRelevant: no memories');
       return [];
@@ -686,7 +757,7 @@ class MemoryService {
    * Store a learned preference
    */
   async learnPreference(text, source = MemorySource.LEARNED) {
-    return this.store({
+    return this.upsert({
       text,
       type: MemoryType.PREFERENCE,
       priority: 4,
@@ -699,7 +770,7 @@ class MemoryService {
    * Store a learned workflow
    */
   async learnWorkflow(text, tags = []) {
-    return this.store({
+    return this.upsert({
       text,
       type: MemoryType.WORKFLOW,
       priority: 4,
@@ -712,7 +783,7 @@ class MemoryService {
    * Store a constraint/warning
    */
   async learnConstraint(text, source = MemorySource.CORRECTION) {
-    return this.store({
+    return this.upsert({
       text,
       type: MemoryType.CONSTRAINT,
       priority: 5,
@@ -725,13 +796,62 @@ class MemoryService {
    * Store a fact about the user
    */
   async learnFact(text, source = MemorySource.USER) {
-    return this.store({
+    return this.upsert({
       text,
       type: MemoryType.FACT,
       priority: 4,
       source,
       tags: ['fact', 'user']
     });
+  }
+
+  /** Archive and remove exact semantic duplicates already accumulated on disk. */
+  async compactDuplicates({ dryRun = false } = {}) {
+    await this.ready;
+    const groups = new Map();
+    for (const memory of this.memory) {
+      const key = memoryFingerprint(memory);
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(memory);
+    }
+    const duplicateGroups = [...groups.entries()].filter(([, entries]) => entries.length > 1);
+    const duplicates = [];
+    const merged = [];
+    for (const [fingerprint, entries] of duplicateGroups) {
+      const keep = entries.slice().sort((a, b) =>
+        ((b.priority || 0) - (a.priority || 0)) || ((b.rating || 0) - (a.rating || 0)) || ((a.created_at || 0) - (b.created_at || 0)))[0];
+      const remove = entries.filter(entry => entry.id !== keep.id);
+      keep.tags = [...new Set(entries.flatMap(entry => entry.tags || []))];
+      keep.priority = Math.max(...entries.map(entry => entry.priority || 1));
+      keep.meta = {
+        ...(keep.meta || {}), fingerprint,
+        seenCount: entries.reduce((sum, entry) => sum + Math.max(1, Number(entry.meta?.seenCount) || 1), 0),
+        compactedAt: Date.now(),
+      };
+      duplicates.push(...remove);
+      merged.push(keep);
+    }
+    if (dryRun || !duplicates.length) return { groups: duplicateGroups.length, duplicates: duplicates.length, removed: 0 };
+
+    const archiveDir = path.join(DATA_DIR, 'archive');
+    fs.mkdirSync(archiveDir, { recursive: true });
+    const archivePath = path.join(archiveDir, `memory-duplicates-${new Date().toISOString().replace(/[:.]/g, '-')}.jsonl`);
+    fs.writeFileSync(archivePath, duplicates.map(memory => JSON.stringify(memory)).join('\n') + '\n');
+
+    const removeIds = new Set(duplicates.map(memory => memory.id));
+    if (this.db) {
+      const update = this.db.prepare('UPDATE mem SET priority = ?, tags = ?, meta = ? WHERE id = ?');
+      const remove = this.db.prepare('DELETE FROM mem WHERE id = ?');
+      const transaction = this.db.transaction(() => {
+        for (const memory of merged) update.run(memory.priority, JSON.stringify(memory.tags), JSON.stringify(memory.meta), memory.id);
+        for (const id of removeIds) remove.run(id);
+      });
+      transaction();
+    }
+    this.memory = this.memory.filter(memory => !removeIds.has(memory.id));
+    if (!this.db) fs.writeFileSync(VECTORS_PATH, this.memory.map(memory => JSON.stringify(memory)).join('\n') + '\n');
+    logger.info('[memory] compacted duplicates', { groups: duplicateGroups.length, removed: duplicates.length, archivePath });
+    return { groups: duplicateGroups.length, duplicates: duplicates.length, removed: duplicates.length, archivePath };
   }
 
   generatePersona() {
@@ -770,9 +890,11 @@ class MemoryService {
 
     return {
       count: this.memory.length,
+      total: this.memory.length,
       storage: this.db ? 'sqlite' : 'jsonl',
       embeddingProvider: config.EMBED_PROVIDER || 'local',
-      types: typeBreakdown
+      types: typeBreakdown,
+      byType: typeBreakdown,
     };
   }
 }

@@ -4,6 +4,7 @@
 import fs from 'fs';
 import path from 'path';
 import { execFile } from 'child_process';
+import avaPaths from './paths.js';
 
 export function verifyFileSyntax(file) {
   return new Promise((resolve) => {
@@ -20,7 +21,7 @@ export function verifyFileSyntax(file) {
           resolve(err ? { ok: false, error: pickErr(se || err.message) } : { ok: true });
         });
       } else if (ext === '.py') {
-        const venvPy = path.join(process.cwd(), '..', 'ava-integration', '.venv', 'Scripts', 'python.exe');
+        const venvPy = path.join(avaPaths.integrationDir(), '.venv', 'Scripts', 'python.exe');
         const py = fs.existsSync(venvPy) ? venvPy : (process.env.AVA_PYTHON || 'python');
         execFile(py, ['-m', 'py_compile', file], { timeout: 12000, windowsHide: true }, (err, _so, se) => {
           resolve(err ? { ok: false, error: pickErr(se || err.message) } : { ok: true });

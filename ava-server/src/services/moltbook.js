@@ -10,9 +10,10 @@ import logger from '../utils/logger.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-const MOLTBOOK_API = 'https://www.moltbook.com/api/v1';
-const CREDS_PATH = path.join(process.env.HOME || process.env.USERPROFILE, '.config', 'moltbook', 'credentials.json');
-const STATE_PATH = path.join(__dirname, '..', '..', '..', 'ava-integration', 'memory', 'moltbook-learnings.json');
+const MOLTBOOK_API = process.env.AVA_MOLTBOOK_API_URL || 'https://www.moltbook.com/api/v1';
+const CREDS_PATH = process.env.AVA_MOLTBOOK_CREDENTIALS || path.join(process.env.HOME || process.env.USERPROFILE, '.config', 'moltbook', 'credentials.json');
+const STATE_PATH = process.env.AVA_MOLTBOOK_LEARNINGS_PATH || path.join(__dirname, '..', '..', '..', 'ava-integration', 'memory', 'moltbook-learnings.json');
+const LEARNING_LIMIT = Math.max(1000, Number(process.env.AVA_MOLTBOOK_LEARNING_LIMIT) || 10000);
 
 class MoltbookService {
   constructor() {
@@ -42,6 +43,7 @@ class MoltbookService {
         const data = JSON.parse(fs.readFileSync(STATE_PATH, 'utf8'));
         this.learnings = data.learnings || [];
         this.lastFeedCheck = data.lastFeedCheck;
+        this.engagementState = data.engagementState || {};
       }
     } catch (e) {
       this.learnings = [];
@@ -55,7 +57,7 @@ class MoltbookService {
         fs.mkdirSync(dir, { recursive: true });
       }
       fs.writeFileSync(STATE_PATH, JSON.stringify({
-        learnings: this.learnings.slice(-5000), // Keep broad Moltbook context for proposal generation
+        learnings: this.learnings.slice(-LEARNING_LIMIT),
         lastFeedCheck: this.lastFeedCheck,
         // Track Moltbook engagement state, including AVA-authored comments on others' posts
         engagementState: this.engagementState || {},
@@ -313,7 +315,7 @@ class MoltbookService {
     // Compare incoming text against the last N stored learnings using a simple Jaccard similarity
     // on word bigrams. Returns true if any existing learning exceeds the threshold.
     if (!text || text.length < 20) return false;
-    const candidates = this.learnings.slice(-100); // only scan most recent 100 entries
+    const candidates = this.learnings;
     const incomingBigrams = this._wordBigrams(text.toLowerCase());
     for (const existing of candidates) {
       const existingText = `${existing.title || ''} ${existing.summary || ''}`.toLowerCase();
@@ -377,26 +379,41 @@ class MoltbookService {
   }
 
   async getMyPosts(limit = 50) {
-    // Try multiple endpoints to find our posts
-    // First try the agent profile posts endpoint
+    const safeLimit = Math.max(1, Math.min(100, Number.parseInt(limit, 10) || 50));
     const agentName = encodeURIComponent(this.agentName);
+    const ownName = this.agentName.trim().toLowerCase();
+    const onlyOwnPosts = (posts = []) => posts
+      .map(item => item?.post || item)
+      .filter(post => {
+        const authorName = post?.author?.name
+          || post?.author_name
+          || post?.agent?.name
+          || post?.user?.name
+          || '';
+        return String(authorName).trim().toLowerCase() === ownName;
+      });
 
-    // Try agent/{name}/posts endpoint
-    let result = await this.apiRequest(`agents/${agentName}/posts?limit=${limit}`);
-    if (result.success && result.posts) {
-      return result.posts;
+    // This is the endpoint used by Moltbook's public profile page.
+    let result = await this.apiRequest(`posts?author=${agentName}&sort=new&limit=${safeLimit}`);
+    if (result.success && Array.isArray(result.posts)) {
+      return onlyOwnPosts(result.posts);
     }
 
-    // Try user/profile endpoint
-    result = await this.apiRequest(`users/${agentName}/posts?limit=${limit}`);
-    if (result.success && result.posts) {
-      return result.posts;
+    // Retain compatibility with older API shapes, but never trust endpoint scope alone.
+    result = await this.apiRequest(`agents/${agentName}/posts?limit=${safeLimit}`);
+    if (result.success && Array.isArray(result.posts)) {
+      return onlyOwnPosts(result.posts);
     }
 
-    // Try searching for our own posts
-    result = await this.apiRequest(`search?q=author:${agentName}&type=posts&limit=${limit}`);
-    if (result.success && result.results) {
-      return result.results.map(r => r.post || r);
+    result = await this.apiRequest(`users/${agentName}/posts?limit=${safeLimit}`);
+    if (result.success && Array.isArray(result.posts)) {
+      return onlyOwnPosts(result.posts);
+    }
+
+    // Search syntax is not guaranteed to enforce author filtering, so filter every result exactly.
+    result = await this.apiRequest(`search?q=author:${agentName}&type=posts&limit=${safeLimit}`);
+    if (result.success && Array.isArray(result.results)) {
+      return onlyOwnPosts(result.results);
     }
 
     return [];

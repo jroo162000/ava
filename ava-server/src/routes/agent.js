@@ -23,7 +23,10 @@ router.post('/agent/run', async (req, res) => {
 
     logger.info('[agent-api] Starting new task', { goal: goal.slice(0, 100) });
     
-    const state = await agentLoop.runAgentLoop(goal, options);
+    const state = await agentLoop.runAgentLoop(goal, {
+      ...options,
+      localPriority: options.localPriority === 'background' ? 'background' : 'interactive',
+    });
     
     // Store for potential resume
     agentLoop.storeAgent(state);
@@ -214,7 +217,13 @@ router.post('/agent/orchestrate', async (req, res) => {
       return res.status(400).json({ ok: false, error: 'Provide a goal (and/or explicit subtasks).' });
     }
     logger.info('[agent-api] Orchestrating (lead + subagents)', { goal: String(goal || '').slice(0, 100), subtasks: Array.isArray(subtasks) ? subtasks.length : 'auto' });
-    res.json(await subagentOrchestrator.orchestrate({ goal, subtasks, sharedContext, synthesize: synthesize !== false }));
+    res.json(await subagentOrchestrator.orchestrate({
+      goal,
+      subtasks,
+      sharedContext,
+      synthesize: synthesize !== false,
+      localPriority: 'interactive',
+    }));
   } catch (error) {
     logger.error('[agent-api] Orchestrate failed', { error: error.message });
     res.status(500).json({ ok: false, error: error.message });

@@ -108,6 +108,14 @@ export function extract(text, execute) {
       return ' ';
     });
   }
+  // A model can be interrupted mid-directive or emit malformed JSON without a
+  // closing tag. Treat every remaining move-tag fragment as control-channel
+  // data, never user-facing text. Complete directives were already executed
+  // above; incomplete directives are intentionally dropped rather than guessed.
+  s = s
+    .replace(/<move\b[^>]*>[\s\S]*$/gi, ' ')
+    .replace(/<\/?move\b[^>]*>/gi, ' ')
+    .replace(/<\/?mov(?:e)?[^>]*$/gi, ' ');
   if (s.indexOf('*') >= 0) {
     const emotes = [];
     s = s.replace(EMOTE_RE, (m, pre, action) => {

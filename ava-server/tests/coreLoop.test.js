@@ -6,8 +6,22 @@
 import agentLoop from '../src/services/agentLoop.js';
 import contextBudget from '../src/utils/contextBudget.js';
 
-const { parseDecisionJson, isMultiStepGoal, mapNativeDecision, buildNativeTools, _toolAllowed } = agentLoop._internals;
+const {
+  parseDecisionJson, isMultiStepGoal, mapNativeDecision, buildNativeTools, _toolAllowed,
+  errorMessageForResult, normalizeRegisteredToolName, normalizeDecisionToolNames,
+  successfulHistoryResult, completedExplicitNamedToolResult, formatSuccessfulHistoryAnswer,
+} = agentLoop._internals;
 const { DecisionType } = agentLoop;
+
+describe('tool error normalization', () => {
+  it('uses a tool error field when message is absent', () => {
+    expect(errorMessageForResult({ status: 'error', error: 'access denied' }, 'ps_exec')).toBe('access denied');
+  });
+
+  it('never records an empty error message', () => {
+    expect(errorMessageForResult({ status: 'error' }, 'ps_exec')).toBe('ps_exec failed without an error message');
+  });
+});
 
 describe('decision parsing (legacy JSON path)', () => {
   it('parses a clean tool_call decision', () => {
@@ -60,6 +74,38 @@ describe('native tool-call mapping (Tier 1 #4)', () => {
     expect(d.args.path).toBe('a.txt');
   });
 
+  it('normalizes a provider-namespaced native call to a registered tool', () => {
+    const state = { canDelegate: true, toolset: [{ name: 'self_awareness' }] };
+    const d = mapNativeDecision(state, {
+      toolCalls: [{ name: 'functions.self_awareness', args: { action: 'diagnose_tool', tool: 'window_ops' } }],
+      text: '',
+    });
+    expect(d).toMatchObject({
+      decision: DecisionType.TOOL_CALL,
+      tool: 'self_awareness',
+      args: { action: 'diagnose_tool', tool: 'window_ops' },
+    });
+  });
+
+  it('executes an exact JSON tool envelope returned in the native text field', () => {
+    const state = { canDelegate: true, toolset: [{ name: 'self_awareness' }] };
+    const d = mapNativeDecision(state, {
+      toolCalls: [],
+      text: '{"decision":"tool_call","tool":"functions.self_awareness","args":{"action":"diagnose_tool","tool":"window_ops"}}',
+    });
+    expect(d).toMatchObject({
+      decision: DecisionType.TOOL_CALL,
+      tool: 'self_awareness',
+      args: { action: 'diagnose_tool', tool: 'window_ops' },
+    });
+  });
+
+  it('does not reinterpret ordinary prose containing a JSON example as an action', () => {
+    const text = 'For example, {"decision":"tool_call","tool":"self_awareness"} is the legacy shape.';
+    const d = mapNativeDecision(lead, { toolCalls: [], text });
+    expect(d).toMatchObject({ decision: DecisionType.STOP, result: text, success: true });
+  });
+
   it('maps multiple tool calls to a parallel fan-out', () => {
     const d = mapNativeDecision(lead, { toolCalls: [
       { name: 'memory_search', args: { query: 'x' } },
@@ -95,6 +141,72 @@ describe('native tool-call mapping (Tier 1 #4)', () => {
 
   it('returns null on an empty response (caller falls back to JSON path)', () => {
     expect(mapNativeDecision(lead, { toolCalls: [], text: '' })).toBeNull();
+  });
+});
+
+describe('provider tool-name normalization', () => {
+  const state = { toolset: [{ name: 'self_awareness' }, { name: 'sys_ops' }] };
+
+  it('strips only a known functions namespace', () => {
+    expect(normalizeRegisteredToolName(state, 'functions.self_awareness')).toBe('self_awareness');
+    expect(normalizeRegisteredToolName(state, 'functions.not_registered')).toBe('functions.not_registered');
+  });
+
+  it('normalizes JSON-path tool calls and fan-out entries', () => {
+    const decision = normalizeDecisionToolNames(state, {
+      decision: 'tool_call',
+      tool: 'functions.self_awareness',
+      tool_calls: [{ tool: 'functions.sys_ops', args: { action: 'info' } }],
+    });
+    expect(decision.tool).toBe('self_awareness');
+    expect(decision.tool_calls[0].tool).toBe('sys_ops');
+  });
+});
+
+describe('multi-tool anti-repeat completion evidence', () => {
+  it('keeps every successful receipt instead of falling back to the repeated first tool', () => {
+    const combined = successfulHistoryResult({
+      history: [
+        {
+          action: { tool: 'window_ops', args: { action: 'list' } },
+          result: { status: 'ok', message: 'Found 11 windows', count: 11 },
+        },
+        {
+          action: { tool: 'self_awareness', args: { action: 'diagnose_tool', tool: 'window_ops' } },
+          result: { status: 'ok', diagnosis: { registered: true, import_ok: true, dry_run_ok: true } },
+        },
+      ],
+    });
+    expect(combined.results).toHaveLength(2);
+    expect(combined.results[0].title).toBe('window_ops receipt');
+    expect(combined.results[1].title).toBe('self_awareness receipt');
+    expect(combined.results[1].content).toMatch(/"registered": true/);
+    const answer = formatSuccessfulHistoryAnswer(combined);
+    expect(answer).toMatch(/window_ops receipt/);
+    expect(answer).toMatch(/Found 11 windows/);
+    expect(answer).toMatch(/self_awareness receipt/);
+    expect(answer).toMatch(/"import_ok": true/);
+    expect(answer.length).toBeLessThan(1800);
+  });
+
+  it('leaves single-tool completion on the existing answer path', () => {
+    expect(successfulHistoryResult({
+      history: [{ action: { tool: 'window_ops', args: { action: 'list' } }, result: { status: 'ok', count: 2 } }],
+    })).toBeNull();
+  });
+
+  it('finishes an explicit named-tool verification as soon as every receipt succeeds', () => {
+    const state = {
+      goal: 'Use window_ops with action=list, then use self_awareness to diagnose window_ops.',
+      toolset: [{ name: 'window_ops' }, { name: 'self_awareness' }, { name: 'fs_read' }],
+      history: [
+        { action: { tool: 'window_ops', args: { action: 'list' } }, result: { status: 'ok', message: 'Found 11 windows' } },
+        { action: { tool: 'self_awareness', args: { action: 'diagnose_tool', tool: 'window_ops' } }, result: { status: 'ok', diagnosis: { import_ok: true } } },
+      ],
+    };
+    expect(completedExplicitNamedToolResult(state)?.results).toHaveLength(2);
+    state.history.pop();
+    expect(completedExplicitNamedToolResult(state)).toBeNull();
   });
 });
 

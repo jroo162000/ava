@@ -17,6 +17,8 @@ from unittest.mock import patch, MagicMock
 # Add parent directory to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+import ava_self_modification as self_mod_module
+
 from ava_self_modification import (
     CORE_FILES,
     BACKUP_DIR,
@@ -175,3 +177,32 @@ class TestSafetyChecks:
         assert isinstance(result, dict)
         # Should return error status since file doesn't exist
         assert result.get("status") == "error" or "error" in result
+
+    def test_rejection_records_verifier_reason_and_refuses_applied_changes(self):
+        pending = MagicMock()
+        pending.status = "pending"
+        pending.metadata = {}
+        applied = MagicMock()
+        applied.status = "applied"
+        applied.metadata = {}
+
+        with patch.dict(
+            self_mod_module._pending_modifications,
+            {"pending-test": pending, "applied-test": applied},
+            clear=True,
+        ), patch.object(self_mod_module, "_save_pending"):
+            result = self_mod_module.reject_modification(
+                "pending-test",
+                "The proposed API does not exist in the target module.",
+                "codex-task",
+                "gpt-5.5",
+            )
+            refused = self_mod_module.reject_modification("applied-test", "too late")
+
+        assert result["status"] == "success"
+        assert pending.status == "rejected"
+        assert pending.metadata["reviewRecommendation"] == "deny"
+        assert pending.metadata["rejectionReason"].startswith("The proposed API")
+        assert pending.metadata["reviewers"][-1]["reviewer"] == "codex-task"
+        assert refused["status"] == "error"
+        assert applied.status == "applied"

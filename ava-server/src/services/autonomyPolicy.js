@@ -1,6 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import { createRequire } from 'module';
+import avaPaths from '../utils/paths.js';
 
 export class AutonomyPolicyError extends Error {
   constructor(message, details) {
@@ -134,8 +135,8 @@ class BudgetTracker {
 export class AutonomyPolicy {
   constructor({ policyPath, schemaPath, logger } = {}) {
     this.logger = logger || console;
-    this.policyPath = policyPath || path.join(process.cwd(), 'policies', 'autonomy_policy.json');
-    this.schemaPath = schemaPath || path.join(process.cwd(), 'policies', 'autonomy_policy.schema.json');
+    this.policyPath = policyPath || path.join(avaPaths.serverDir(), 'policies', 'autonomy_policy.json');
+    this.schemaPath = schemaPath || path.join(avaPaths.serverDir(), 'policies', 'autonomy_policy.schema.json');
     this.policy = null;
     this.budgets = null;
   }
@@ -148,7 +149,10 @@ export class AutonomyPolicy {
     let ajvCtor = null;
     try {
       const require = createRequire(import.meta.url);
-      const mod = require('ajv');
+      // The policy schema declares draft 2020-12. The default Ajv export only
+      // registers draft-07, so compiling the schema with it disables autonomy
+      // governance at runtime. Load the matching Ajv build explicitly.
+      const mod = require('ajv/dist/2020');
       ajvCtor = (mod && mod.default) ? mod.default : mod;
     } catch {}
     const strict = process.env.NODE_ENV === 'production' || process.env.STRICT_POLICY === '1';
@@ -247,15 +251,17 @@ export class AutonomyPolicy {
         outcome = 'act_then_report';
       }
     }
+    const requiresApproval = this._requiresApproval(input);
+    // This policy also governs proactive work, but a direct user command is not a
+    // proactive interruption. Let it execute unless the normal write/high-risk
+    // approval rules apply; notification budgets must never suppress the action.
+    if (input.isUserInitiated === true && !requiresApproval) {
+      outcome = 'act_then_report';
+    }
     if (outcome === 'notify') {
       if (!budgets.canSpend('notifications', 1)) outcome = 'log_only';
     }
-    if (outcome === 'ask_permission' && input.isUserInitiated === true) {
-      if (!this._requiresApproval(input)) {
-        outcome = 'act_then_report';
-      }
-    }
-    if (this._requiresApproval(input)) {
+    if (requiresApproval) {
       outcome = 'ask_permission';
     }
     const canInterrupt = allowInterruptsNow && urgency >= policy.thresholds.interrupt_urgency_threshold && budgets.canSpend('interrupts', 1);

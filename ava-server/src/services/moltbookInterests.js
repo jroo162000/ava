@@ -6,11 +6,12 @@ import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
 import logger from '../utils/logger.js';
+import avaPaths from '../utils/paths.js';
 
-const FILE = path.join(process.cwd(), 'data', 'moltbook-interests.json');
+const FILE = path.join(avaPaths.dataDir(), 'moltbook-interests.json');
 const MAX = 40;
 const REJECTION_MAX = 100;
-const REJECTION_DB = path.join(process.cwd(), 'data', 'moltbook-rejections.json');
+const REJECTION_DB = path.join(avaPaths.dataDir(), 'moltbook-rejections.json');
 
 // Seed: deliberately broad + identity-flavored, so she starts with range, not one topic.
 const SEED = [
@@ -44,7 +45,18 @@ function _save(interests) {
   } catch (e) { try { logger.warn('[moltbookInterests] save failed', { error: e.message }); } catch { /* ignore */ } }
 }
 
-export function list() { return _load(); }
+let _cachedInterests = null;
+
+function _ensureLoaded() {
+  if (!_cachedInterests) _cachedInterests = _load();
+  return _cachedInterests;
+}
+
+function _flush() {
+  _save(_cachedInterests);
+}
+
+export function list() { return _ensureLoaded(); }
 
 // A few interests to riff on — weighted toward the ones she keeps coming back to, but shuffled so
 // she doesn't fixate on a single topic.
@@ -60,11 +72,11 @@ export function top(n = 5) {
 
 // Reinforce an existing interest or pick up a new one. Weakest interest is displaced once full,
 // so her interests genuinely shift over time rather than only accumulating.
-export function note(topic, delta = 1) {
+export function addInterest(topic, delta = 1) {
   if (!topic) return;
   topic = String(topic).trim().replace(/^["'\s]+|["'\s.]+$/g, '').slice(0, 160);
   if (topic.length < 6) return;
-  const items = _load();
+  const items = _ensureLoaded();
   const hit = items.find(x => x.topic.toLowerCase() === topic.toLowerCase());
   if (hit) {
     hit.weight = (hit.weight || 1) + delta;
@@ -75,8 +87,11 @@ export function note(topic, delta = 1) {
     items.sort((a, b) => (a.weight || 1) - (b.weight || 1));
     if ((items[0].weight || 1) < 2) items[0] = { topic, weight: 1, added: Date.now() };
   }
-  _save(items);
+  _flush();
 }
+
+// Alias backward compatibility
+export { addInterest as note };
 
 // Persistently stores a rejection lesson as a reusable governance rule.
 // Deduplicates by SHA-256 hash of the lesson text. Bounded to REJECTION_MAX entries.
@@ -132,4 +147,17 @@ export function listRejectedLessons() {
   return [];
 }
 
-export default { list, top, note, retainRejectedLesson, listRejectedLessons };
+export function removeInterest(topic) {
+  if (!topic) return;
+  const items = _ensureLoaded();
+  const idx = items.findIndex(x => x.topic.toLowerCase() === String(topic).toLowerCase());
+  if (idx === -1) return;
+  items.splice(idx, 1);
+  _flush();
+}
+
+export function getActiveInterests() {
+  return _ensureLoaded().slice().sort((a, b) => (b.weight || 1) - (a.weight || 1));
+}
+
+export default { list, top, addInterest, removeInterest, getActiveInterests, note: addInterest, retainRejectedLesson, listRejectedLessons };

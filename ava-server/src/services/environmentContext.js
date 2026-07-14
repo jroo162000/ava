@@ -5,11 +5,14 @@
 // reality instead of a guess. Heavy bits (psutil CPU, window list) refresh in the BACKGROUND
 // so they never add latency to a reply. Toggle off with AVA_ENV_AWARENESS_OFF=1.
 import os from 'os';
+import path from 'path';
 import { execFile } from 'child_process';
 import toolsService from './tools.js';
+import pythonWorker from './pythonWorker.js';
 import artifactMemory from './artifactMemory.js';
 import actionHistory from './actionHistory.js';
 import logger from '../utils/logger.js';
+import avaPaths from '../utils/paths.js';
 
 let _cache = { ts: 0, cpu: '', window: '', disk: '' };
 let _refreshing = false;
@@ -23,7 +26,7 @@ function _refreshCode() {
   if (_codeRefreshing) return;
   if (_codeCache.text && Date.now() - _codeCache.ts < 300000) return;
   _codeRefreshing = true;
-  const dir = process.cwd();
+  const dir = avaPaths.repoRoot();
   const gitArgs = ['-C', dir, 'log', '-n', '6', '--pretty=format:%h %ad %s', '--date=short'];
   const opts = { timeout: 6000, windowsHide: true };
   const finish = (out) => {
@@ -33,7 +36,9 @@ function _refreshCode() {
   };
   execFile('git', gitArgs, opts, (err, stdout) => {
     if (!err && stdout) return finish(stdout);
-    execFile('C:\\Program Files\\Git\\cmd\\git.exe', gitArgs, opts, (e2, out2) => {
+    const programFiles = process.env.ProgramFiles || process.env.PROGRAMFILES || '';
+    const fallbackGit = programFiles ? path.join(programFiles, 'Git', 'cmd', 'git.exe') : 'git';
+    execFile(fallbackGit, gitArgs, opts, (e2, out2) => {
       if (!e2 && out2) return finish(out2);
       _codeCache = { ts: Date.now(), text: _codeCache.text };
       _codeRefreshing = false;
@@ -45,15 +50,26 @@ async function _refresh() {
   if (_refreshing) return;
   _refreshing = true;
   try {
+    // window_ops and sys_ops are dynamic Python tools. During the brief worker warm-up,
+    // attempting them produces a misleading "Tool not found" event that can launch a bogus
+    // self-repair workflow. The Node-side RAM/network context remains available meanwhile.
+    if (!pythonWorker.isReady()) {
+      _cache.ts = Date.now();
+      return;
+    }
     try {
-      const r = await toolsService.executeTool('window_ops', { action: 'list' }, false, { source: 'env', bypassIdempotency: true });
+      const r = await toolsService.executeTool('window_ops', { action: 'list' }, false, {
+        source: 'env', bypassIdempotency: true, recordIdempotency: false,
+      });
       const inner = (r && (r.result || r)) || {};
       const wins = inner.windows || (inner.result && inner.result.windows) || [];
       const act = Array.isArray(wins) ? wins.find(w => w && w.active && w.title) : null;
       _cache.window = act ? String(act.title).slice(0, 140) : (_cache.window || '');
     } catch { /* best effort */ }
     try {
-      const r = await toolsService.executeTool('sys_ops', { action: 'info' }, false, { source: 'env', bypassIdempotency: true });
+      const r = await toolsService.executeTool('sys_ops', { action: 'info' }, false, {
+        source: 'env', bypassIdempotency: true, recordIdempotency: false,
+      });
       const inner = (r && (r.result || r)) || {};
       const si = inner.system_info || inner;
       if (si && si.cpu && si.cpu.cpu_usage) _cache.cpu = String(si.cpu.cpu_usage);

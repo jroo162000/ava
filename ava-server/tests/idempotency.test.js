@@ -230,6 +230,19 @@ describe('Idempotency Cache Tests', () => {
       expect(res.body.ok).toBe(true);
     });
 
+    it('should not let a non-recording background observation suppress foreground work', async () => {
+      await toolsService.executeTool('status', {}, false, {
+        source: 'env',
+        bypassIdempotency: true,
+        recordIdempotency: false,
+      });
+      expect(toolsService.getIdempotencyCacheStats().size).toBe(0);
+
+      const result = await toolsService.executeTool('status', {}, false, { source: 'test' });
+      expect(result.ok).toBe(true);
+      expect(result.duplicate_suppressed).not.toBe(true);
+    });
+
     it('should not block dry_run executions', async () => {
       // Clear cache first
       await request(app).post('/tools/idempotency/clear');

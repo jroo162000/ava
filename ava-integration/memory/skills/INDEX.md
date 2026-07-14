@@ -1,11 +1,70 @@
 # AVA Skills Index
 
+- List top processes by RAM using sys_ops (proven) — needing to see which processes are using the most resident memory
+- List top processes by memory usage — Need to identify heaviest memory consumers (PID, name, RSS) for troubleshooting
+- Read current memory usage with sys_ops — on any Linux/macOS system to check memory pressure before troubleshooting
+- Read memory usage with sys_ops — When investigating memory pressure on a Linux system
+- Read total memory usage via sys_ops — when you need to check overall system memory statistics without modifying anything
 - Send an email by voice — when you need to send an email to a contact using voice commands
+- Analyze top memory consumers from process list — need to identify heaviest RAM-using processes for memory optimization
 - Append a line to an existing text file — Need to add a new line to an existing text file without overwriting existing content
+- Capture memory usage snapshot with sys_ops — When analyzing memory pressure on a Linux system without interactive access
+- Categorize memory-heavy processes as safe-to-close vs system-critical — When analyzing top memory consumers to identify which can be safely closed to free up RAM
 - Check CPU and RAM usage — Need to retrieve current system resource utilization
-- Check RAM usage using sys_ops tool — needing to report current memory stats on this system
+- Check event logs for system errors near a timestamp — When you need to manually inspect system-level event logs around a specific failure timestamp because automatic tool access is unavailable or re
+- Check tool prerequisites from documentation — Need to verify required imports, credentials, or dependencies for a tool before diagnosing failures
+- Check Windows System event log for recent errors/warnings — Investigating stability issues or failures related to window operations or system components
+- Classify each top memory process — after retrieving a list of top memory-consuming processes
+- Classify memory consumers and recommend safe closures — After retrieving memory usage data, to prioritize which user apps can be safely closed
+- Classify memory consumers as user apps or system processes — After listing processes by memory to decide which are safe to close under memory pressure
+- Classify memory-heavy processes as user or system — Analyzing memory pressure to identify safe-to-close apps
+- Classify processes as user-app or system-critical for memory recovery — Analyzing a process list to determine which memory-heavy processes are safe to close vs. must stay for system stability
+- Classify processes as user app or system-critical — analyzing a process list to decide which heavy memory consumers can be safely closed
+- Classify top memory processes as safe or critical — after collecting memory usage data and listing top memory consumers
+- Classify top memory processes as user vs system-critical — analyzing memory pressure after listing top processes by RAM
+- Classify top processes by category — When investigating memory pressure and needing to distinguish user apps from system services among top RAM consumers
+- Close Arc browser tabs and quit — when a prompt asks to close Arc browser tabs, then quit entirely
+- Collect overall memory usage with sys_ops — need to read current system memory statistics
+- Collect passive window_ops failure information — When diagnosing a window_ops failure without running live tools
+- Compile memory-pressure findings report — after reading memory usage and listing top processes in a memory-pressure investigation
+- Compile memory report with safe-to-close recommendations — when you need to produce a final finding from memory/process data in a read-only investigation
 - Create and Open a Text File — When you need to create a list and open it for review
 - Create self backup snapshot — When you need to create a versioned backup snapshot of the current AI/code configuration for later restoration or comparison
+- Diagnose blocked tool via read-only alternatives — When a tool call that would take a real action is blocked by an approval requirement, but you need the same diagnostic information
+- Diagnose window_ops health from self_awareness report — When investigating window_ops failures and needing a self-awareness diagnostic report
+- Document knowledge base search results for window_ops — Before diagnosing a tool registration issue, check existing documentation first
+- Edit a 3D image using vision tools — User asks to make changes to a 3D image (or any image) by uploading an original and requesting edits
+- Extract error details from self_awareness.diagnose_tool failure history — A previous self_awareness.diagnose_tool call failed with a blocked/approval error, and you need to capture the exact error m
+- Extract workflow metadata from environment — need to find root-cause error signature for a failed workflow before making system calls
+- Find and load newest 3D model from a specific folder — Given a folder path and a request to open the newest 3D hologram/holographic model
+- Formulate Memory Pressure Remediation Report — After collecting memory usage data via sys_ops, need to compile findings and recommendations
+- Generate concise memory pressure report with safe-to-close recommendations — After gathering memory usage and top processes by RAM, produce a brief actionable finding without closing anything
+- Generate memory pressure investigation report — After reading memory usage and categorizing top consumers, produce a concise finding without taking action
+- Get memory overview with free -h — Need to check total, used, and available memory in human-readable format
+- Get top RAM-consuming processes on any OS — Need to quickly identify processes using the most memory for troubleshooting or optimization analysis
+- Halt and report missing environment variables — detecting import/credential/registration errors for window_ops
+- List top memory-hogging processes — Investigating high memory usage and need to find which processes to consider closing
+- List top processes by RAM usage — Investigating memory pressure to identify heaviest processes
+- Locate and select holographic tab — User asks to find and select a 'holographic' tab in a UI
+- Memory-hungry process list (top memory consumers) — A machine is under memory pressure and you need to see which processes use the most RAM
+- Navigate to a specific 'tail' after screenshot and analysis — When a user asks you to scan the screen and then navigate to a specific area or UI element (called a 'tail' in the transcript) after tak
+- Open newest 3D hologram model and place on panel — when you need to find and display the latest .glb file in an ava models folder
+- Play designated audio file by ordinal from downloads — User asks to play a specific audio file by ordinal (e.g., 'first', 'sixth') from a directory containing multiple audio files
+- Produce memory-consumer findings with closure recommendations — After reading total memory usage, listing top processes by RAM, and classifying each as user or system, produce a concise summary.
+- Produce memory pressure report with safe-to-close recommendations — When you have completed reading memory usage, listing top processes by RAM, and categorizing them, and need to compile a concise f
 - Read clipboard content via PowerShell — A user asks what is currently stored on the system clipboard
+- Read current memory usage — When you need to get an overview of system memory consumption and pressure
+- Read memory and top processes with sys_ops — Collecting system memory usage and identifying top RAM consumers for diagnostic analysis
+- Read memory usage overview via sys_ops — When you need to gather total, used, and available RAM plus swap usage and OOM status
+- Read overall system memory usage — to check total, used, free, and available memory on the machine
+- Remember visible display and tabs — User says 'baby', 'display open', or mentions holographic tabs
+- Retrieve memory usage and top processes — After restart, need to get current memory metrics
+- Search for "hollow" spelled as "holo" — when the user says 'hollow' but means the spelling 'h o l o' not 'h o l o w'
+- Search memory for self_awareness recommendation — Looking for previously stored recommendations or notes about tool diagnostics
+- Simulate window_ops tool diagnosis from workflow failure metadata — When you need to diagnose a window_ops pipeline failure but cannot call self_awareness.diagnose_tool directly — use workflow failu
+- Take screenshot and scan it for review — User asks to screenshot and visually inspect an open interface element
+- Use sys_ops tool directly for process listing — When you need to list processes sorted by memory on a system equipped with the sys_ops tool
+- Write a concise memory-pressure remediation report — when you need to finalize a read-only memory investigation by producing a clear, actionable summary with process categories and safe-close recomm
 - Write a file with specific content — need to create or overwrite a text file
 - Write a haiku to a file in Downloads using Notepad — need to create a text file with a haiku or short poem in the Downloads folder
+- Write memory-pressure investigation final report — After collecting total memory, top processes, and process classifications in a memory-pressure investigation

@@ -5,9 +5,10 @@
 // agent turn's tool history; in-memory ring + JSONL persistence.
 import fs from 'fs';
 import path from 'path';
+import avaPaths from '../utils/paths.js';
 import logger from '../utils/logger.js';
 
-const DATA_DIR = path.join(process.cwd(), 'data');
+const DATA_DIR = avaPaths.dataDir();
 const LOG = path.join(DATA_DIR, 'action-history.jsonl');
 const RING_MAX = 200;
 let _ring = [];
@@ -67,9 +68,11 @@ export function recordTurn(sessionId, state) {
       const tool = h && h.action && (h.action.tool || h.action.type);
       if (!tool || ['final', 'answer', 'clarify', 'respond'].includes(String(tool))) continue;
       const status = String((h && h.result && h.result.status) || 'ok');
-      if (/error|fail|denied|needs_|blocked/i.test(status)) continue;  // only things she actually did
+      const durationMs = ((h && h.result && h.result.durationMs) || 0);
+      if (!h.result || /error|fail|denied|needs_|blocked/i.test(status)) continue;  // only successful, evidenced actions
       const summary = _summarize(tool, h.action && h.action.args);
-      if (summary) added.push({ ts, sessionId, tool, summary, status });
+      const args = h.action && h.action.args ? JSON.stringify(h.action.args).slice(0, 200) : '';
+      if (summary) added.push({ ts, sessionId, tool, summary, status, durationMs, args });
     }
     if (!added.length) return;
     _ring.push(...added);
@@ -118,4 +121,17 @@ export function prune() {
   return pruneByAge(24 * 60 * 60 * 1000, 5);
 }
 
-export default { recordTurn, recent, summarize, pruneByAge, prune };
+// Retrieve the last N actions with full details (command, args, timestamp, result status, duration).
+export function getRecentActions(count = 10) {
+  _load();
+  return _ring.slice(-Math.max(1, count)).map(a => ({
+    command: a.tool,
+    args: a.args || '',
+    timestamp: a.ts,
+    status: a.status,
+    durationMs: a.durationMs || 0,
+    summary: a.summary
+  }));
+}
+
+export default { recordTurn, recent, summarize, pruneByAge, prune, getRecentActions };

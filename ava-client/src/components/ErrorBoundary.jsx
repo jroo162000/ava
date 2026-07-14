@@ -7,7 +7,7 @@ class ErrorBoundary extends React.Component {
     this.state = { hasError: false, error: null, errorInfo: null };
   }
 
-  static getDerivedStateFromError(error) {
+  static getDerivedStateFromError() {
     return { hasError: true };
   }
 
@@ -18,7 +18,7 @@ class ErrorBoundary extends React.Component {
     });
     
     // Log error to console in development
-    if (process.env.NODE_ENV === 'development') {
+    if (import.meta.env.DEV) {
       console.error('ErrorBoundary caught an error:', error, errorInfo);
     }
   }
@@ -32,7 +32,7 @@ class ErrorBoundary extends React.Component {
             <h2>Something went wrong</h2>
             <p>AVA encountered an unexpected error. Please try refreshing the page.</p>
             
-            {process.env.NODE_ENV === 'development' && (
+            {import.meta.env.DEV && (
               <details className="error-details">
                 <summary>Error details (development mode)</summary>
                 <pre>

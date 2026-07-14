@@ -70,10 +70,24 @@ describe('AutonomyPolicy', () => {
     expect(res.outcome).toBe('ask_permission');
   });
 
+  test('a direct user command is executed instead of being suppressed as proactive work', () => {
+    const ap = new AutonomyPolicy({ policyPath, schemaPath, logger: { info: () => {} } });
+    ap.load();
+    const res = ap.decide({
+      domain: 'personal_assistant',
+      trigger: null,
+      signal: { impact: 0, timeSensitivity: 0, confidence: 0, disruptionCost: 1 },
+      risk: { toolRisk: 'medium' },
+      requiresWrite: false,
+      isUserInitiated: true
+    });
+
+    expect(res.outcome).toBe('act_then_report');
+  });
+
   test('estimateUrgency is bounded 0..10', () => {
     const u = estimateUrgency({ triggerBase: 5, impact: 10, timeSensitivity: 10, confidence: 10, disruptionCost: -2 });
     expect(u).toBeLessThanOrEqual(10);
     expect(u).toBeGreaterThanOrEqual(0);
   });
 });
-

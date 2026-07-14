@@ -5,11 +5,12 @@
 // She reflects on these via a compact context block, and they're queryable at /self/evolution.
 import fs from 'fs';
 import path from 'path';
-import { fileURLToPath } from 'url';
 import logger from '../utils/logger.js';
+import avaPaths from '../utils/paths.js';
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const LOG_PATH = process.env.AVA_EVOLUTION_LOG || path.join(__dirname, '..', '..', '..', 'ava-integration', 'memory', 'evolution_log.jsonl');
+const LOG_PATH = process.env.AVA_EVOLUTION_LOG || (process.env.NODE_ENV === 'test'
+  ? path.join(avaPaths.dataDir(), 'evolution_log.jsonl')
+  : path.join(avaPaths.integrationDir(), 'memory', 'evolution_log.jsonl'));
 const MAX_LINES = 500;
 
 function _readLines() {

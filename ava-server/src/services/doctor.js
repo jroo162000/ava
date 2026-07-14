@@ -12,8 +12,9 @@ import llmService from './llm.js';
 import logger from '../utils/logger.js';
 import config from '../utils/config.js';
 import pythonWorker from './pythonWorker.js';
+import avaPaths from '../utils/paths.js';
 
-const DATA_DIR = path.join(process.cwd(), 'data');
+const DATA_DIR = avaPaths.dataDir();
 const MAINT_DIR = path.join(DATA_DIR, 'maintenance');
 const REPORTS_DIR = path.join(MAINT_DIR, 'reports');
 const PROPOSALS_DIR = path.join(MAINT_DIR, 'proposals');
@@ -38,7 +39,7 @@ function writeJsonSafe(p, obj) {
 function summarizeLogs() {
   // Lightweight log summary from conversation logs (if any)
   try {
-    const convDir = path.join(process.cwd(), 'logs', 'conversations');
+    const convDir = avaPaths.conversationLogsDir();
     if (!fs.existsSync(convDir)) return { files: 0, recent: 0 };
     const files = fs.readdirSync(convDir).filter(f => f.endsWith('.jsonl'));
     let recentLines = 0;
@@ -160,7 +161,7 @@ function runJestTests(cwd) {
 }
 
 async function applyProposalsWithRollback(proposals) {
-  const serverDir = process.cwd();
+  const serverDir = avaPaths.serverDir();
   let appliedCount = 0;
   let rolledBack = false;
 

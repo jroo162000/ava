@@ -11,6 +11,7 @@ import { verifyFileSyntax } from '../utils/verifyFileSyntax.js';
 import selfModSandbox from './selfModSandbox.js';           // Tier 2 #13: worktree + test gate
 import { pushAnnouncement } from './announceQueue.js';      // spoken result of async approvals
 import conversationLogger from './conversationLogger.js';   // bare-affirm context check
+import avaPaths from '../utils/paths.js';
 
 function isSelfSnapshotRequest(text = '') {
   const t = String(text || '').toLowerCase();
@@ -48,7 +49,7 @@ function copySnapshotFile(repoRoot, snapshotDir, rel, files) {
 }
 
 function createSelfSnapshot(userText = '') {
-  const repoRoot = path.resolve(process.cwd(), '..');
+  const repoRoot = avaPaths.repoRoot();
   const stamp = new Date().toISOString()
     .replace(/[-:]/g, '')
     .replace(/\..+$/, '')
@@ -119,13 +120,77 @@ function createSelfSnapshot(userText = '') {
   return manifest;
 }
 
+function extractProposalIdCandidate(text = '') {
+  const raw = String(text || '').toLowerCase();
+  const contiguous = raw.match(/\b([0-9a-f]{6,8})\b/i);
+  if (contiguous) return contiguous[1].toLowerCase();
+
+  // Speech recognition commonly inserts spaces inside a displayed hexadecimal ID,
+  // for example "637 7a 424". Reassemble only a run of 2+ hex chunks near an
+  // explicit proposal action; ordinary numbers elsewhere in a sentence are ignored.
+  const intent = raw.match(/\b(?:approve(?:d|al)?|apply|reject(?:ed)?|proposal|change|modification|id)\b/i);
+  if (!intent) return '';
+  const tail = raw.slice((intent.index || 0) + intent[0].length, (intent.index || 0) + intent[0].length + 80);
+  const spaced = tail.match(/(?:\b(?:proposal|change|modification|number|id)\b[\s:#-]*)*((?:\b[0-9a-f]{1,4}\b[\s,.-]*){2,6})/i);
+  if (!spaced) return '';
+  const joined = (spaced[1].match(/\b[0-9a-f]{1,4}\b/gi) || []).join('').toLowerCase();
+  return joined.length >= 6 && joined.length <= 8 && /\d/.test(joined) ? joined : '';
+}
+
+function findProposalById(proposals, candidate) {
+  const wanted = String(candidate || '').toLowerCase();
+  if (!wanted) return null;
+  const rows = Array.isArray(proposals) ? proposals : [];
+  const exact = rows.find(item => String(item?.id || '').toLowerCase() === wanted);
+  if (exact) return exact;
+  if (wanted.length < 6) return null;
+  const prefix = rows.filter(item => String(item?.id || '').toLowerCase().startsWith(wanted));
+  return prefix.length === 1 ? prefix[0] : null;
+}
+
+function isProposalDecisionDiscussion(text = '') {
+  const t = String(text || '').toLowerCase().replace(/\s+/g, ' ').trim();
+  if (!t) return false;
+  const mentionsDecision = /\b(?:approve(?:d|al)?|apply|applied|accept(?:ed|ance)?|confirm(?:ed|ation)?|greenlight|green light|reject(?:ed|ion)?|decline(?:d)?|discard(?:ed)?|cancel(?:led|ed)?|deny|denied)\b/.test(t);
+  if (!mentionsDecision) return false;
+
+  return /\b(?:how|why|what|when|where|who|which)\b/.test(t)
+    || /\b(?:did|does|is|are|was|were|has|have)\s+(?:(?:the|that|this|my|your)\s+)?(?:i|we|you|it|proposal|change|modification|fix|one)\b/.test(t)
+    || /\bshould\s+(?:i|we|you)\b/.test(t)
+    || /\b(?:tell me|show me|explain|review|discuss|look at|check|question)\b/.test(t)
+    || /\b(?:the|that|this|last|latest|previous|recent)\s+(?:approved|rejected|denied|declined|discarded|applied)\s+(?:proposal|change|modification|fix|one)\b/.test(t)
+    || /\b(?:proposal|change|modification|fix)\b[\s\S]{0,24}\b(?:was|were|is|got|has been|had been)\s+(?:approved|rejected|denied|declined|discarded|applied)\b/.test(t);
+}
+
+function isProposalRecommendationQuestion(text = '') {
+  const t = String(text || '').toLowerCase().replace(/\s+/g, ' ').trim();
+  const asksForGuidance = /\b(?:recommendation|recommendations|recommend|suggestion|suggestions|suggest|advice)\b/.test(t)
+    || /\bhow\b[\s\S]{0,60}\b(?:fix(?:ed|ing)?|repair(?:ed|ing)?|rework(?:ed|ing)?|redo|improve(?:d|ing)?|approach)\b/.test(t)
+    || /\bwhat\b[\s\S]{0,45}\b(?:do|fix|repair|rework|redo|improve|change)\b[\s\S]{0,45}\b(?:rejected|denied|declined|discarded)\b/.test(t);
+  const proposalContext = /\b(?:change|changes|modification|modifications|code change|code fix|proposal|proposals|self.?mod|improvement|improvements|rejection|rejected|denied|that one|that change)\b/.test(t)
+    || Boolean(extractProposalIdCandidate(t));
+  return asksForGuidance && proposalContext;
+}
+
 // Spoken approval/rejection/listing of AVA's proposed self-modifications. Returns a reply
 // string when the utterance is a self-mod intent, otherwise null (so /respond continues).
 // All actions go through the same worker store the UI panel reads, so voice + UI stay in sync.
 // verifyFileSyntax is shared with the /self_mod (UI) approve path — see utils/verifyFileSyntax.js.
 
-async function handleSelfModVoice(userText) {
+async function handleSelfModVoice(userText, { sessionId, workflowWaiting = false } = {}) {
   const t = String(userText || '').toLowerCase();
+  // Workflow permission belongs to the durable workflow router, not the code-proposal
+  // queue. This must run before generic approval detection because phrases such as
+  // "both workflows are approved to move forward" otherwise look like proposal approval.
+  const namesWorkflow = /\bworkflows?\b/.test(t);
+  const namesProposal = /\b(?:proposals?|proposed changes?|code changes?|modifications?|self.?mods?|pending changes?|change\s+[0-9a-f]{6,8})\b/.test(t)
+    || Boolean(extractProposalIdCandidate(userText));
+  if (namesWorkflow && !namesProposal) return null;
+  // A workflow permission prompt can be followed by an unrelated background proposal result.
+  // In that interleaving, the workflow checkpoint is still the live question; do not let a
+  // generic "I approve the action" mutate proposal state. Explicit proposal words/IDs still win.
+  const answersWaitingAction = /\b(?:yes|no|approve|approved|deny|denied|reject|rejected|decline|declined|proceed|continue|permission)\b|\b(?:go ahead|move forward)\b/.test(t);
+  if (workflowWaiting && answersWaitingAction && !namesProposal) return null;
   // CODE INTROSPECTION ≠ PROPOSAL QUEUE. "read your actual code", "have you been modified/upgraded
   // lately", "what changed in your code", "run a self-diagnostic" are about her REAL source on disk —
   // they must reach the agent (which has the self_diagnostics tool), NOT the canned "no proposed code
@@ -148,7 +213,8 @@ async function handleSelfModVoice(userText) {
   const wantsCreativeBuild = /\b(build|create|make|draw|design|generate|render|model|turn (it|that|this)|do|go ahead|proceed with|handle|finish|complete|work on)\b/.test(t)
     && /\b(hologram|holographic|avatar|image|images|picture|portrait|photo|3 ?d|three.?d|scene|environment|model|website|web ?page|web ?site|\bui\b|interface|video|art|graphic|logo|render)\b/.test(t);
   if (wantsCreativeBuild && !mentionsMod) return null;
-  const idMatch = userText.match(/\b([0-9a-f]{6,8})\b/);
+  const idCandidate = extractProposalIdCandidate(userText);
+  const idMatch = idCandidate ? [idCandidate, idCandidate] : null;
   const wantsCreateProposal = /\b(make|create|draft|generate|queue|run|do)\b[\s\S]{0,60}\b(proposal|proposed change|code change|fix|self.?mod|improvement)\b/.test(t)
     || /\b(proposal|proposed change|code change|fix|self.?mod|improvement)\b[\s\S]{0,60}\b(for|from|about|based on)\b/.test(t);
   const wantsList = (/\b(what|which|any|list|show|pending|outstanding|waiting|review)\b/.test(t) && mentionsMod)
@@ -156,8 +222,12 @@ async function handleSelfModVoice(userText) {
     || /\banything (to|i need to|that needs) (approve|review|look at)\b/.test(t);
   const approvesDisplayedProposal = /\b(approve|approved|approval|apply|accept|go ahead|confirm|greenlight|green light)\b[\s\S]{0,40}\b(proposal|change|modification|code change|fix)\b/.test(t)
     || /\b(proposal|change|modification|code change|fix)\b[\s\S]{0,40}\b(approved|accepted|confirmed)\b/.test(t);
-  const wantsApprove = /\b(approve|approved|approval|apply|accept|go ahead|confirm|greenlight|green light)\b/.test(t);
-  const wantsReject = /\b(reject|decline|discard|cancel|don'?t apply|do not apply|throw (it|that) out)\b/.test(t);
+  // Questions and historical references must never mutate proposal state. Words such as
+  // "rejected" and "approved" are descriptions in "how will we fix the last rejected
+  // proposal?", not commands. Explicit requests like "reject proposal 75cc35e1" remain actions.
+  const decisionDiscussion = isProposalDecisionDiscussion(t);
+  const wantsApprove = !decisionDiscussion && /\b(approve|approved|approval|apply|accept|go ahead|confirm|greenlight|green light)\b/.test(t);
+  const wantsReject = !decisionDiscussion && /\b(reject|decline|discard|cancel|don'?t apply|do not apply|throw (it|that) out)\b/.test(t);
   // UNDO/REVERT is distinct from reject: reject drops a still-PENDING proposal; undo reverses a
   // change that was ALREADY APPLIED (restores the file to its pre-change state).
   const wantsUndo = /\b(undo|revert|roll ?back|reverse|put (it|that) back|take (it|that) back|restore (it|that|the change))\b/.test(t);
@@ -171,14 +241,15 @@ async function handleSelfModVoice(userText) {
   // recommend", "do a proposal based on your recommendation".
   const wantsReproposeFromRec = /\b(do|make|create|draft|generate|build|run|write|turn)\b[\s\S]{0,50}\b(proposal|change|fix|patch|it)\b/.test(t)
     && /\b(based on|from|using|out of|on)\b[\s\S]{0,30}\b(recommendation|recommendations|suggestion|suggestions|advice|that|your|the same)\b/.test(t);
-  const wantsRecommendations = /\b(recommendation|recommendations|recommend|suggestion|suggestions|suggest|advice|how (would |to )?(you )?(fix|rework|redo|improve|approach))\b/.test(t)
-    && (mentionsMod || !!idMatch || /\b(rejection|rejected|proposal|that one|that change)\b/.test(t));
+  const wantsRecommendations = isProposalRecommendationQuestion(t);
   const hasObject = mentionsMod || !!idMatch || /\b(it|that|this one|the change|all of them|all|them)\b/.test(t);
   // Unambiguous verbs that need no object — a bare "I approve" / "approved" / "apply it" / "reject".
-  const clearApprove = /\bapprove(d|al)?\b/.test(t)
+  const clearApprove = !decisionDiscussion && (/\bapprove(d|al)?\b/.test(t)
     || /\bapply (it|that|this|the (change|proposal|patch|fix|edit))\b/.test(t)
-    || /\bgo ahead and apply\b/.test(t) || /\bgreenlight\b/.test(t);
-  const clearReject = /\breject(ed)?\b/.test(t) || /\b(decline|discard) (it|that|the (change|proposal))\b/.test(t);
+    || /\bgo ahead and apply\b/.test(t) || /\bgreenlight\b/.test(t));
+  const clearReject = !decisionDiscussion && (/\breject(ed)?\b/.test(t) || /\b(decline|discard) (it|that|the (change|proposal))\b/.test(t));
+  const approvalCorrection = /\b(?:did not|didn't|have not|haven't|failed to)\b[\s\S]{0,60}\bapprove\b/.test(t)
+    || /\bapproved?\b[\s\S]{0,35}\bwrong\b/.test(t);
   // A bare affirmation — only treated as approval when exactly one change is pending, AND the
   // utterance is essentially JUST the affirmation. A longer sentence that happens to contain
   // "yes" is answering something ELSE: "yes use the most recent one and put it on the panel"
@@ -197,8 +268,18 @@ async function handleSelfModVoice(userText) {
   let lp;
   try { lp = await pythonWorker.selfMod({ action: 'list_pending' }); } catch { return null; }
   const raw = (lp && (lp.pending || (lp.result && lp.result.pending))) || [];
-  const pending = (Array.isArray(raw) ? raw : []).filter(m => (m.status || 'pending') === 'pending');
+  const pending = (Array.isArray(raw) ? raw : []).filter(m =>
+    (m.status || 'pending') === 'pending'
+    && (m.external_review_status || m.metadata?.externalReviewStatus) !== 'pending');
   const base = (f) => String(f || '').split(/[\\/]/).pop();
+
+  // A complaint about a missed/wrong approval is not a fresh approval command. Never
+  // resolve it to the newest proposal; surface the exact pending IDs for correction.
+  if (approvalCorrection) {
+    if (!pending.length) return "You're right to flag that. I do not have a pending proposal to approve now, so I did not apply anything else.";
+    const ids = pending.map(item => item.id).filter(Boolean).join(', ');
+    return `You're right to flag that. I did not treat this sentence as a new approval, because I will not guess which code change you meant. The pending proposal id${pending.length === 1 ? ' is' : 's are'} ${ids}. Say the exact id and I will use only that one.`;
+  }
 
   // Bare "yes/do it" with no explicit verb: only act when exactly one change is pending AND her
   // own LAST message was about that proposal (the heads-up / "want me to apply it?"). Without the
@@ -213,7 +294,7 @@ async function handleSelfModVoice(userText) {
         if (e && (e.direction || e.role) === 'assistant') { _lastAssistant = String(e.content || ''); break; }
       }
     } catch { /* context optional */ }
-    if (!/\b(proposal|code change|self.?mod|pending change|approve|sandbox|change [0-9a-f]{6,8})\b/i.test(_lastAssistant)) return null;
+    if (!/\b(proposal|code change|self.?mod|pending change|sandbox(?:ed)? (?:change|proposal)|change [0-9a-f]{6,8})\b/i.test(_lastAssistant)) return null;
   }
 
   // Garbled STT can yield BOTH "approve" and "reject" in one utterance (this really happened:
@@ -232,7 +313,20 @@ async function handleSelfModVoice(userText) {
     let all = [];
     try { const la = await pythonWorker.selfMod({ action: 'list_all' }); all = (la && (la.all || (la.result && la.result.all))) || []; } catch { /* fall through */ }
     all = Array.isArray(all) ? all : [];
-    const byRecent = (a, b) => new Date(b.applied_at || b.updated_at || b.created || 0) - new Date(a.applied_at || a.updated_at || a.created || 0);
+    const activityTime = (mod = {}) => {
+      const value = mod.rejected_at
+        || mod.rejectedAt
+        || mod.metadata?.rejectedAt
+        || mod.updated_at
+        || mod.updatedAt
+        || mod.applied_at
+        || mod.appliedAt
+        || mod.created
+        || 0;
+      const parsed = new Date(value).getTime();
+      return Number.isFinite(parsed) ? parsed : 0;
+    };
+    const byRecent = (a, b) => activityTime(b) - activityTime(a);
     let mod = null;
     if (idMatch) mod = all.find(m => m.id === idMatch[1] || String(m.id).startsWith(idMatch[1]));
     if (!mod) { const rej = all.filter(m => /reject/i.test(String(m.status || ''))).sort(byRecent); mod = rej[0]; }
@@ -275,11 +369,11 @@ async function handleSelfModVoice(userText) {
       let r; try { r = await pythonWorker.selfMod({ action: 'undo', modification_id: undoId }); } catch (e) { r = { status: 'error', message: e.message }; }
       r = (r && (r.result || r)) || {};
       if (r.status === 'success') {
-        const restart = selfRestart.scheduleServerRestart({ reason: `voice undo ${undoId}` });
-        const restartText = restart.scheduled
-          ? ' I am refreshing my server so the revert loads; the voice runner stays up.'
-          : ' Restart me when you are ready and the revert takes effect.';
-        return `Okay — I undid that change (${base(r.file) || ('id ' + undoId)}) and put the file back the way it was before I applied it.${restartText}`;
+        const activation = await selfRestart.activateAppliedChanges({
+          files: [r.file || r.file_path],
+          reason: `voice undo ${undoId}`,
+        });
+        return `Okay — I undid that change (${base(r.file) || ('id ' + undoId)}) and put the file back the way it was before I applied it. ${selfRestart.describeActivation(activation)}`;
       }
       if (r.status === 'denied') return `I can't undo that one — ${r.message}`;
       return `I wasn't able to undo that — ${r.message || 'unknown error'}.`;
@@ -377,7 +471,13 @@ async function handleSelfModVoice(userText) {
   // Pick targets
   let targets = [];
   if (/\ball\b/.test(t)) targets = pending.map(m => m.id);
-  else if (idMatch) { const hit = pending.find(m => m.id === idMatch[1] || m.id.startsWith(idMatch[1])); if (hit) targets = [hit.id]; }
+  else if (idMatch) {
+    const hit = findProposalById(pending, idCandidate);
+    if (hit) targets = [hit.id];
+    else {
+      return `I heard proposal id ${idCandidate}, but it does not exactly match a pending change. I did not approve or reject anything. The pending id${pending.length === 1 ? ' is' : 's are'} ${pending.map(item => item.id).join(', ')}.`;
+    }
+  }
   if (!targets.length) {
     const numMatch = t.match(/\b(?:number|change|#)\s*(\d{1,2})\b/) || t.match(/\b(\d{1,2})\b/);
     if (numMatch) { const idx = parseInt(numMatch[1], 10) - 1; if (pending[idx]) targets = [pending[idx].id]; }
@@ -409,8 +509,12 @@ async function handleSelfModVoice(userText) {
     const ids = targets.slice();
     const files = { ...fileById };
     setTimeout(() => {
-      approveThroughSandbox(ids, files).catch((e) => {
-        try { pushAnnouncement(`I hit an error while sandbox-testing a code change: ${e.message}. Nothing was applied.`); } catch { /* best effort */ }
+      approveThroughSandbox(ids, files, { sessionId }).catch((e) => {
+        try {
+          pushAnnouncement(`I hit an error while sandbox-testing a code change: ${e.message}. Nothing was applied.`, {
+            responseType: 'self-mod-sandbox-result', source: 'self-mod', sessionId,
+          });
+        } catch { /* best effort */ }
       });
     }, 10);
     return ids.length === 1
@@ -450,11 +554,11 @@ async function handleSelfModVoice(userText) {
       return `I applied ${reverted.length === 1 ? 'the change' : `${reverted.length} changes`}, but ${reverted.length === 1 ? 'it' : 'they'} failed a syntax check, so I reverted ${reverted.length === 1 ? 'it' : 'them'} — I won't say it's done when the code is broken.${r0 && r0.error ? ` (${r0.file}: ${r0.error})` : ''}${tail}`;
     }
     const revTail = reverted.length ? ` I also reverted ${reverted.length} that didn't pass a syntax check (${reverted.map(r => r.file).join(', ')}) rather than leave broken code in place.` : '';
-    const restart = selfRestart.scheduleServerRestart({ reason: `voice approved proposal ${ok.join(', ')}` });
-    const restartText = restart.scheduled
-      ? ' I am refreshing my server now so the change can load; the voice runner stays up.'
-      : ' Restart me when you are ready and the change will take effect.';
-    return `Done — I applied ${ok.length} change${ok.length > 1 ? 's' : ''} (${ok.join(', ')}), backed up the original, and verified ${ok.length > 1 ? 'they parse' : 'it parses'} cleanly.${revTail}${tail}${restartText}`;
+    const activation = await selfRestart.activateAppliedChanges({
+      files: ok.map(id => fileById[id]).filter(Boolean),
+      reason: `voice approved proposal ${ok.join(', ')}`,
+    });
+    return `Done — I applied ${ok.length} change${ok.length > 1 ? 's' : ''} (${ok.join(', ')}), backed up the original, and verified ${ok.length > 1 ? 'they parse' : 'it parses'} cleanly.${revTail}${tail} ${selfRestart.describeActivation(activation)}`;
   }
   const ok = results.filter(x => x.r.status === 'success').map(x => x.id);
   // Tier 2 #15: push the updated pending queue to the UI (no client polling).
@@ -466,15 +570,21 @@ async function handleSelfModVoice(userText) {
 // apply only on pass, post-apply syntax-verify (with undo), then announce the outcome aloud.
 // Any scheduled restart is delayed past the runner's ~8s announcement poll so the spoken
 // result is never lost to the restart. (Restarts are a no-op when AVA_SELF_RESTART_OFF=1.)
-async function approveThroughSandbox(ids, fileById) {
+async function approveThroughSandbox(ids, fileById, { sessionId } = {}) {
   const baseName = (f) => String(f || '').split(/[\\/]/).pop();
   for (const id of ids) {
+    const announcementMeta = {
+      responseType: 'self-mod-sandbox-result',
+      source: 'self-mod',
+      sessionId,
+      modificationId: id,
+    };
     let gate;
     try { gate = await selfModSandbox.validateProposal(id); }
     catch (e) { gate = { ok: true, skipped: `gate error: ${e.message}`, warning: true }; }
 
     if (!gate.ok) {
-      pushAnnouncement(`I did not apply change ${id} — ${selfModSandbox.describeGate(gate)}. It's still in the queue if you want to look at it.`);
+      pushAnnouncement(`I did not apply change ${id} — ${selfModSandbox.describeGate(gate)}. It's still in the queue if you want to look at it.`, announcementMeta);
       continue;
     }
 
@@ -484,7 +594,7 @@ async function approveThroughSandbox(ids, fileById) {
       r = (resp && (resp.result || resp)) || {};
     } catch (e) { r = { status: 'error', message: e.message }; }
     if (r.status !== 'success') {
-      pushAnnouncement(`Change ${id} passed the sandbox but failed to apply: ${r.message || 'unknown error'}. It's still in the queue.`);
+      pushAnnouncement(`Change ${id} passed the sandbox but failed to apply: ${r.message || 'unknown error'}. It's still in the queue.`, announcementMeta);
       continue;
     }
 
@@ -492,7 +602,7 @@ async function approveThroughSandbox(ids, fileById) {
     const v = await verifyFileSyntax(f);
     if (!v.ok) {
       try { await pythonWorker.selfMod({ action: 'undo', modification_id: id }); } catch { /* best effort */ }
-      pushAnnouncement(`I applied change ${id}, but it failed the post-apply syntax check, so I reverted it — I won't leave broken code in place. (${baseName(f)}: ${v.error})`);
+      pushAnnouncement(`I applied change ${id}, but it failed the post-apply syntax check, so I reverted it — I won't leave broken code in place. (${baseName(f)}: ${v.error})`, announcementMeta);
       continue;
     }
 
@@ -509,9 +619,20 @@ async function approveThroughSandbox(ids, fileById) {
     const gateNote = gate.tests && gate.tests.ran
       ? ` It passed the sandbox first — ${gate.tests.passed} tests, no new failures.`
       : (gate.skipped ? ` Heads up: the sandbox step was skipped (${gate.skipped}), so it only had the syntax checks.` : '');
-    pushAnnouncement(`Change ${id} is applied and verified.${gateNote}`);
-    setTimeout(() => {
-      try { selfRestart.scheduleServerRestart({ reason: `voice approved proposal ${id} (sandbox-validated)` }); } catch { /* best effort */ }
+    pushAnnouncement(`Change ${id} is applied and verified.${gateNote}`, announcementMeta);
+    setTimeout(async () => {
+      try {
+        const activation = await selfRestart.activateAppliedChanges({
+          files: [f],
+          reason: `voice approved proposal ${id} (sandbox-validated)`,
+        });
+        if (activation.mode !== 'server_restart') {
+          pushAnnouncement(selfRestart.describeActivation(activation), {
+            ...announcementMeta,
+            responseType: 'self-mod-activation',
+          });
+        }
+      } catch { /* best effort */ }
     }, 12000);
   }
   // Tier 2 #15: whatever happened above (applied / blocked / reverted), the pending queue may
@@ -524,4 +645,8 @@ export {
   isManualProposalRequest,
   createSelfSnapshot,
   handleSelfModVoice,
+  extractProposalIdCandidate,
+  findProposalById,
+  isProposalDecisionDiscussion,
+  isProposalRecommendationQuestion,
 };

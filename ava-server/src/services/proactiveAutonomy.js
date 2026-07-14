@@ -29,8 +29,10 @@ import workflowEngine from './workflowEngine.js';
 import proactiveEngine from './proactiveEngine.js';
 import { pushAnnouncement } from './announceQueue.js';
 import { emitVoiceEvent } from './voiceBus.js';
+import capabilityRegistry from './capabilityRegistry.js';
+import avaPaths from '../utils/paths.js';
 
-const FILE = path.join(process.cwd(), 'data', 'proactive-initiatives.json');
+const FILE = path.join(avaPaths.dataDir(), 'proactive-initiatives.json');
 const MAX_STORED = 40;
 
 function _on() { return process.env.AVA_PROACTIVE_AUTONOMY !== '0'; }
@@ -54,35 +56,31 @@ function _save(list) {
   } catch (e) { try { logger.warn('[proactive-auto] save failed', { error: e.message }); } catch { /* ignore */ } }
 }
 
-// Which openings are worth an autonomous READ-ONLY investigation, and the concrete read-only
-// goal to hand the workflow. Openings not listed here (e.g. evergreen reflections, a simple
-// uptime nudge) are left to the conversational proactive layer — this engine only takes on
-// things where real legwork produces a better, evidence-backed recommendation.
-function investigationFor(nudge) {
+// Decide from the live registry whether a new observation warrants autonomous
+// read-only legwork; no environment kind is permanently hard-wired here.
+async function investigationFor(nudge, dependencies = {}) {
   if (!nudge || !nudge.key) return null;
-  if (nudge.key === 'env:ram') {
-    return {
-      goal: [
-        'READ-ONLY investigation (take NO action, change nothing): the machine is under memory pressure.',
-        'Use sys_ops to read current memory usage and the top processes by RAM. Identify which heavy',
-        'processes are ordinary user apps that would be safe to close versus system-critical ones that',
-        'must stay. Produce a concise finding: the top 3-5 memory consumers with their RAM, and a clear',
-        'recommendation of which specific apps could be closed to recover memory. Do NOT close anything.',
-      ].join(' '),
-    };
+  const registry = dependencies.registry || capabilityRegistry;
+  const chat = dependencies.chat || ((messages, options) => llmService.chat(messages, options));
+  await registry.refresh().catch(() => null);
+  const matches = registry.find(`${nudge.text || ''} ${nudge.capability || ''}`, 12);
+  const system = [
+    'Decide whether this proactive observation warrants a read-only investigation.',
+    registry.promptBlock(),
+    'Use only registered read capabilities. Gather current evidence and recommend an action without changing anything.',
+    'Return JSON only: {"investigate":true|false,"goal":"specific read-only evidence-gathering goal","done_when":"observable evidence required"}.',
+  ].join('\n');
+  try {
+    const result = await chat([{ role: 'system', content: system }, { role: 'user', content: JSON.stringify({ nudge, relevantCapabilities: matches }) }], { temperature: 0.1, max_tokens: 500 });
+    const match = String(result.text || result.content || '').match(/\{[\s\S]*\}/);
+    const plan = match ? JSON.parse(match[0]) : null;
+    if (plan?.investigate && plan.goal) return { goal: String(plan.goal).slice(0, 2400), doneWhen: String(plan.done_when || '').slice(0, 600) };
+    return null;
+  } catch (error) {
+    logger.warn('[proactive-auto] investigation planning failed', { error: error.message });
+    if (!matches.length) return null;
+    return { goal: `READ-ONLY investigation: ${nudge.text}. Use the relevant registered read tools to gather current evidence, then provide a specific recommendation. Change nothing.`, doneWhen: 'Current evidence supports or disproves the observation.' };
   }
-  if (nudge.key === 'env:downloads') {
-    return {
-      goal: [
-        'READ-ONLY investigation (take NO action, change nothing): the Downloads folder has piled up.',
-        'Use fs_ops to list the Downloads folder and characterize it — how many items, rough breakdown by',
-        'type (installers, images, documents, archives, etc.), and how many look old or large. Produce a',
-        'concise finding and a specific cleanup recommendation (what to archive or delete). Do NOT move or',
-        'delete anything.',
-      ].join(' '),
-    };
-  }
-  return null;
 }
 
 // Distill a finished read-only workflow into { finding, recommendation, action } — the evidence
@@ -111,7 +109,7 @@ function _emit(list) {
   if (process.env.AVA_PROACTIVE_EVENTS === '0') return;
   try {
     const awaiting = list.filter(i => i.status === 'awaiting_approval')
-      .map(i => ({ id: i.id, title: i.nudgeText, finding: i.finding, recommendation: i.recommendation }));
+      .map(i => ({ id: i.id, title: i.nudgeText, finding: i.finding, recommendation: i.recommendation, action: i.action, capability: i.capability, status: i.status }));
     emitVoiceEvent('proactive.initiatives', { pending: awaiting }, 'proactive');
   } catch { /* ui push best-effort */ }
 }
@@ -157,15 +155,34 @@ async function tickOnce() {
     dirty = true;
   }
 
+  // Follow actions the user explicitly approved through the same verified,
+  // resumable workflow machinery.
+  for (const i of list) {
+    if (i.status !== 'executing' || !i.executionWfId) continue;
+    const wf = workflowEngine.get(i.executionWfId);
+    if (!wf || ['running', 'planning'].includes(wf.status)) continue;
+    i.updatedAt = now;
+    if (wf.status === 'done') {
+      i.status = 'completed';
+      i.executionResult = String(wf.result || '').slice(0, 2000);
+      pushAnnouncement(`I completed the approved initiative: ${i.nudgeText || i.recommendation}`.slice(0, 500));
+    } else {
+      i.status = 'failed';
+      i.error = String(wf.error || `execution ${wf.status}`).slice(0, 800);
+      pushAnnouncement(`The approved initiative did not complete: ${i.error}`.slice(0, 500));
+    }
+    dirty = true;
+  }
+
   // 2) Maybe open a new investigation (respect the concurrency cap).
   const active = list.filter(i => i.status === 'investigating').length;
   if (active < _maxActive()) {
     let nudge = null;
     try { nudge = proactiveEngine.nextNudge(); } catch { nudge = null; }
-    const inv = investigationFor(nudge);
+    const inv = await investigationFor(nudge);
     if (nudge && inv) {
       try {
-        const started = await workflowEngine.start(inv.goal, { readOnly: true, origin: `proactive:${nudge.key}` });
+        const started = await workflowEngine.start(inv.goal, { readOnly: true, origin: `proactive:${nudge.key}`, acceptanceCriteria: inv.doneWhen ? [inv.doneWhen] : [] });
         if (started && started.ok) {
           proactiveEngine.markSurfaced(nudge.key);  // cooldown: don't re-investigate the same thing
           list.push({
@@ -187,6 +204,7 @@ async function tickOnce() {
 let _timer = null;
 function start() {
   if (_timer || !_on()) { if (!_on()) logger.info('[proactive-auto] disabled (AVA_PROACTIVE_AUTONOMY=0)'); return; }
+  proactiveEngine.start?.();
   // A first pass shortly after boot (let the worker/tools warm up), then on the cadence.
   setTimeout(() => { tickOnce().catch(e => logger.warn('[proactive-auto] first tick failed', { error: e.message })); }, 90000);
   _timer = setInterval(() => { tickOnce().catch(e => logger.warn('[proactive-auto] tick failed', { error: e.message })); }, _tickMs());
@@ -196,14 +214,46 @@ function start() {
 
 function list() { return _load(); }
 function pending() { return _load().filter(i => i.status === 'awaiting_approval'); }
-function dismiss(id) {
+async function approve(id) {
   const all = _load();
-  const i = all.find(x => x.id === id);
-  if (!i) return { ok: false, error: 'not found' };
-  i.status = 'closed'; i.updatedAt = Date.now();
+  const initiative = all.find(item => item.id === id);
+  if (!initiative) return { ok: false, error: 'not found' };
+  if (initiative.status !== 'awaiting_approval') return { ok: false, error: `initiative is ${initiative.status}` };
+  const action = String(initiative.action || initiative.recommendation || '').trim();
+  if (!action) return { ok: false, error: 'initiative has no concrete action' };
+  const approvalId = `approval-${id}-${Date.now().toString(36)}`;
+  const started = await workflowEngine.start(action, {
+    origin: `proactive-approved:${id}`,
+    preapproved: true,
+    approvalId,
+    acceptanceCriteria: initiative.recommendation ? [initiative.recommendation] : [],
+  });
+  if (!started.ok) return started;
+  initiative.status = 'executing';
+  initiative.approvedAt = Date.now();
+  initiative.approvalId = approvalId;
+  initiative.executionWfId = started.id;
+  initiative.updatedAt = Date.now();
   _save(all); _emit(all);
-  return { ok: true, id, status: 'closed' };
+  emitVoiceEvent('proactive.approved', { id, approvalId, workflowId: started.id, action }, 'proactive');
+  return { ok: true, id, status: initiative.status, approvalId, workflow: started };
 }
 
-export { start, tickOnce, list, pending, dismiss };
-export default { start, tickOnce, list, pending, dismiss, _internals: { investigationFor, _distill } };
+function reject(id, reason = '') {
+  const all = _load();
+  const initiative = all.find(item => item.id === id);
+  if (!initiative) return { ok: false, error: 'not found' };
+  initiative.status = 'closed';
+  initiative.rejectedAt = Date.now();
+  initiative.rejectionReason = String(reason || '').slice(0, 500);
+  initiative.updatedAt = Date.now();
+  _save(all); _emit(all);
+  emitVoiceEvent('proactive.rejected', { id, reason: initiative.rejectionReason }, 'proactive');
+  return { ok: true, id, status: 'closed' };
+}
+function dismiss(id) {
+  return reject(id, 'dismissed');
+}
+
+export { start, tickOnce, list, pending, approve, reject, dismiss };
+export default { start, tickOnce, list, pending, approve, reject, dismiss, _internals: { investigationFor, _distill } };

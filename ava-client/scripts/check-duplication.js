@@ -60,7 +60,7 @@ function scanDirectory(dir, violations = []) {
               });
             }
           }
-        } catch (error) {
+        } catch {
           // Skip files that can't be read
         }
       }

@@ -25,6 +25,10 @@ import trainingCollector from '../services/trainingCollector.js';  // capture co
 import { isSelfSnapshotRequest, isManualProposalRequest, createSelfSnapshot, handleSelfModVoice } from '../services/selfModVoice.js';
 import { emitVoiceEvent } from '../services/voiceBus.js';  // Tier 2 #15: assistant.delta to the UI
 import avatarBody from '../services/avatarBody.js';  // native <move> body directives: strip here, execute at the logger
+import capabilityRegistry from '../services/capabilityRegistry.js';
+import goalManager from '../services/goalManager.js';
+import proactiveAutonomy from '../services/proactiveAutonomy.js';
+import { fallbackToolAnswer } from '../services/toolResultAnswer.js';
 import { markDuplicateTurn, buildSelfStatus } from './api.js';
 
 function isSelfDescriptionRequest(text = '') {
@@ -36,6 +40,8 @@ function isSelfDescriptionRequest(text = '') {
     // capability questions — answer with what she can do (mentions "can/help/tools")
     /\bwhat (are|r) (all )?(of )?your (capabilit|function|feature|tool)/.test(lower) ||
     /\bwhat can you (do|help)\b/.test(lower) ||
+    /\bwhat you can (do|help (?:me )?with)\b/.test(lower) ||
+    /\bwhat (?:tools|capabilities) (?:do you have|you have|can you use|you can use)\b/.test(lower) ||
     /\bwhat kinds? of things can you\b/.test(lower) ||
     /\bwalk me through what you can\b/.test(lower) ||
     /\b(your|list your) (capabilities|functions)\b/.test(lower)
@@ -338,6 +344,26 @@ function extractLastToolResultAny(state) {
   return null;
 }
 
+function extractSelfDiagnosis(state) {
+  try {
+    const history = Array.isArray(state?.history) ? state.history : [];
+    for (let index = history.length - 1; index >= 0; index--) {
+      const entry = history[index] || {};
+      const tool = entry.decision?.tool || entry.action?.tool || '';
+      const args = entry.action?.args || {};
+      const action = String(args.action || args.operation || '').toLowerCase();
+      const result = entry.result || {};
+      const isDiagnosis = tool === 'self_diagnostics'
+        || (tool === 'self_awareness' && /diagnos|health|check/.test(action))
+        || Boolean(result.diagnosis || result.result?.diagnosis);
+      if (isDiagnosis && ['ok', 'success', 'complete'].includes(String(result.status || '').toLowerCase())) {
+        return { tool, args, result };
+      }
+    }
+  } catch { /* diagnosis handoff is best-effort */ }
+  return null;
+}
+
 function buildSpokenSelfResponseText() {
   try {
     const status = buildSelfStatus();
@@ -350,6 +376,56 @@ function buildSpokenSelfResponseText() {
 }
 
 const router = express.Router();
+
+const UNSUPPORTED_BLANKET_CAPABILITY_PROOF = /\b(?:(?:they|these)(?:['\u2019](?:re|ve)| are| have)?\s+all|all(?: of)? (?:my|the)? (?:tools|capabilities|functions|features)|everything)\b[^.?!]{0,80}\b(?:confirmed|verified|tested|fully)\b[^.?!]{0,40}\b(?:working|operational|available)\b/i;
+const REGISTRY_AS_AVAILABILITY_PROOF = /\b(?:and\s+)?I know (?:exactly )?which (?:tools|capabilities) are available(?: right now)? because I(?:['\u2019]ve| have) (?:just )?(?:read|checked|consulted) (?:my|the) live (?:runtime )?capability registry\b/i;
+
+export function groundCapabilityClaims(text = '') {
+  let value = String(text || '').trim();
+  value = value.replace(REGISTRY_AS_AVAILABILITY_PROOF, match => {
+    const lead = /^and\b/i.test(match.trim()) ? 'and my' : 'My';
+    return `${lead} live capability registry tells me which tools are registered for me to attempt; I verify each external dependency when I use it`;
+  });
+  if (!value || !UNSUPPORTED_BLANKET_CAPABILITY_PROOF.test(value)) return value;
+
+  const grounded = 'Those are registered capabilities I can attempt; I verify each external dependency when I use it.';
+  const causalTail = /\s*(?:,|\u2014|-)?\s*and I know (?:they(?:['\u2019]re| are)|these are) available because\s+(?:they|these)[^.?!]*(?:working|operational|verified|confirmed)[^.?!]*[.?!]?/i;
+  if (causalTail.test(value)) return value.replace(causalTail, `. ${grounded}`);
+
+  const unsupportedClause = /\b(?:(?:they|these)(?:['\u2019](?:re|ve)| are| have)?\s+all|all(?: of)? (?:my|the)? (?:tools|capabilities|functions|features)|everything)\b[^.?!]{0,140}\b(?:working|operational|available)\b[^.?!]*/i;
+  const rewritten = value.replace(unsupportedClause, grounded.replace(/\.$/, ''));
+  return rewritten === value ? `${value.replace(/[.?!]+$/, '')}. ${grounded}` : rewritten;
+}
+
+export function groundSelfDescription(text = '') {
+  let value = groundCapabilityClaims(text);
+  value = value.replace(
+    /\bI can do (?:anything|everything)(?: listed)? in (?:that|the|my) (?:live )?runtime registry\b/i,
+    'I can use the tools listed in my live runtime registry'
+  );
+  value = value.replace(
+    /\s*(?:,|\u2014|-)?\s*and I know(?=[^.?!]*(?:registry|capabilit|provider|available|ready))[^.?!]*[.?!]?\s*$/i,
+    ''
+  ).trim();
+
+  const alreadyGrounded = /\bregistered (?:capabilities|tools)\b[^.?!]*\battempt\b/i.test(value)
+    && /\bverify\b[^.?!]*(?:dependenc|tool)/i.test(value);
+  if (alreadyGrounded) return value;
+
+  const stem = value.replace(/[.?!]+$/, '').replace(/[\s,;\u2014-]+$/, '').trim();
+  const evidence = 'my live registry shows which tools are registered for me to attempt; I verify each tool\'s dependencies when I use it.';
+  return stem ? `${stem}; ${evidence}` : `I'm AVa; ${evidence}`;
+}
+
+function sanitizeReplyPayload(payload) {
+  try {
+    if (payload && typeof payload.output_text === 'string') payload.output_text = groundCapabilityClaims(avatarBody.strip(payload.output_text));
+    if (payload && typeof payload.display_text === 'string') payload.display_text = groundCapabilityClaims(avatarBody.strip(payload.display_text));
+    if (payload && typeof payload.text === 'string') payload.text = groundCapabilityClaims(avatarBody.strip(payload.text));
+    if (payload?.agent && typeof payload.agent.result === 'string') payload.agent.result = groundCapabilityClaims(avatarBody.strip(payload.agent.result));
+  } catch { /* never block a reply on body-channel cleanup */ }
+  return payload;
+}
 
 // Tier 2 #10/#11: text-reply LLM calls stream their tokens out through req._streamDelta when
 // the request came in via POST /respond/stream (which sets that hook). Blocking /respond calls
@@ -364,13 +440,15 @@ async function _chatMaybeStream(req, messages, options = {}) {
         system: messages.find(m => m.role === 'system')?.content,
         temperature: options.temperature,
         maxTokens: options.max_tokens || options.maxTokens || 1000,
+        localPriority: 'interactive',
+        localContextTokens: options.localContextTokens,
       }, req._streamDelta);
       if (String(r.content || '').trim()) return r;
     } catch (e) {
       logger.warn('[respond/stream] streamText failed; falling back to blocking chat', { error: e.message });
     }
   }
-  return llmService.chat(messages, options);
+  return llmService.chat(messages, { ...options, localPriority: 'interactive' });
 }
 
 // TOOL-COMMAND LEAK GUARD (Jelani 2026-07-05): the model sometimes writes a raw tool call as
@@ -378,10 +456,15 @@ async function _chatMaybeStream(req, messages, options = {}) {
 // {"decision":"tool_call",…} — instead of it being executed. That must NEVER reach the user.
 // Shared so both the conversational path (which escalates on it) and the agent final answer
 // (which scrubs it) use the same detection.
-const _TOOL_NAMES = 'model3d_ops|scene3d|image_ops|window_ops|computer_use|computer_use_control|open_item|browser_automation|app_control|vision_ops|screen_ops|mouse_ops|key_ops|voice_ops|calendar_ops|self_mod|sys_ops|net_ops|iot_ops|ps_exec|profile_ops|analysis_ops|web_search|web_scrape|web_builder|comm_ops|fs_ops|fs_read|fs_find|fs_write|memory_search|memory_system|audio_ops|camera_ops|remote_ops|security_ops|proactive_ops|learning_db';
+function _toolNamesPattern() {
+  return (capabilityRegistry.snapshot().tools || [])
+    .map(tool => String(tool.name || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
+    .filter(Boolean).join('|');
+}
 function _looksLikeToolCall(s) {
   const x = String(s || '');
-  return new RegExp('<\\/?(?:' + _TOOL_NAMES + ')\\b', 'i').test(x)
+  const names = _toolNamesPattern();
+  return (names ? new RegExp('<\\/?(?:' + names + ')\\b', 'i').test(x) : false)
     || /<action>\s*[\w-]+\s*<\/action>/i.test(x)
     || /<(?:tool|tool_call|function_call|args|arguments|invoke)\b/i.test(x)
     || /"decision"\s*:\s*"tool_call"/i.test(x)
@@ -389,7 +472,8 @@ function _looksLikeToolCall(s) {
 }
 function _stripToolSyntax(s) {
   let x = String(s || '');
-  x = x.replace(new RegExp('<(' + _TOOL_NAMES + ')\\b[\\s\\S]*?(?:<\\/\\1>|$)', 'gi'), '');
+  const names = _toolNamesPattern();
+  if (names) x = x.replace(new RegExp('<(' + names + ')\\b[\\s\\S]*?(?:<\\/\\1>|$)', 'gi'), '');
   // Remove {"decision":"tool_call"…} / {"tool":…} objects, tolerating one level of nested {} (args).
   x = x.replace(/\{(?:[^{}]|\{[^{}]*\})*?"(?:decision|tool)"\s*:(?:[^{}]|\{[^{}]*\})*\}/gi, '');
   x = x.replace(/<\/?(?:action|prompt|art_style|models?|url|position|environment|name|x|y|z|scale|rotation[Yy]|args|arguments|tool|tool_call|invoke|parameter)\b[^>]*>/gi, '');
@@ -402,18 +486,38 @@ function _stripToolSyntax(s) {
 // never see or speak the tags).
 router.post('/respond', (req, res) => {
   const _json = res.json.bind(res);
-  res.json = (payload) => {
-    try {
-      if (payload && typeof payload.output_text === 'string') payload.output_text = avatarBody.strip(payload.output_text);
-      if (payload && typeof payload.display_text === 'string') payload.display_text = avatarBody.strip(payload.display_text);
-    } catch { /* never block the reply on body-channel cleanup */ }
-    return _json(payload);
+  req.avaChannel = 'voice';
+  res.json = (payload) => _json(sanitizeReplyPayload(payload));
+  return respondHandler(req, res);
+});
+
+// Typed chat is a presentation variant of the same turn handler. Channel only
+// changes output shaping; routing, tools, workflows, memory, and honesty gates
+// are identical to voice.
+router.post('/chat', (req, res) => {
+  const raw = req.body || {};
+  req.avaChannel = 'chat';
+  req.body = {
+    ...raw,
+    text: raw.text,
+    sessionId: raw.sessionId || raw.session_id || 'stage',
+    freshSession: raw.freshSession ?? false,
+    run_tools: raw.run_tools ?? false,
+    voice_mode: 'text',
+  };
+  const _json = res.json.bind(res);
+  res.json = (payload = {}) => {
+    sanitizeReplyPayload(payload);
+    const text = String(payload.display_text || payload.output_text || payload.text || '');
+    return _json({ ...payload, text, message: text, sessionId: req.body.sessionId });
   };
   return respondHandler(req, res);
 });
 
-async function respondHandler(req, res) {
+export async function respondHandler(req, res) {
   try {
+    const channel = req.avaChannel === 'chat' ? 'chat' : 'voice';
+    const endpoint = channel === 'chat' ? '/chat' : '/respond';
     const { text, messages, sessionId = 'voice-default', freshSession = false,
             run_tools, memory_filter } = req.body || {};
     let userText = (typeof text === 'string' && text.trim())
@@ -426,7 +530,7 @@ async function respondHandler(req, res) {
       return res.status(400).json({ ok: false, error: 'Missing text/messages' });
     }
 
-    if (markDuplicateTurn('/respond', sessionId, userText)) {
+    if (markDuplicateTurn(endpoint, sessionId, userText)) {
       logger.info('[respond] duplicate turn suppressed', { sessionId, text: userText.slice(0, 80) });
       return res.json({ ok: true, duplicate_suppressed: true, output_text: '', agent: {
         id: 'duplicate-' + Date.now(),
@@ -437,13 +541,13 @@ async function respondHandler(req, res) {
       }});
     }
 
-    try { conversationLogger.logUserMessage(userText, { sessionId, endpoint: '/respond', freshSession }); } catch {}
+    try { conversationLogger.logUserMessage(userText, { sessionId, endpoint, freshSession }); } catch {}
     // Clean task-switch (#205): claim this turn. If a newer turn for this session begins while the
     // slow (agent / conversational) paths below are still working, they'll see they're superseded
     // at their emit point and drop the stale reply instead of speaking over the newer one.
     const _turn = turnGuard.begin(sessionId);
     // Visual artifact panel (#225): did the user explicitly ask to SEE something? If so we force a
-    // visual; otherwise the visualizer decides on its own whether a diagram/table/summary would help.
+    // visual; otherwise the presenter decides whether a visual would help.
     const _wantsVisual = /\b(show me (a |the )?(diagram|chart|mermaid|table|visual|map)|diagram (this|that|it)|put (that|this|it) (on|up) (the )?(panel|board|screen)|visuali[sz]e|draw (me )?(a )?(diagram|chart)|make (me )?(a )?(diagram|chart|table)|on the (panel|board))\b/i.test(userText);
 
     // Repair STT mishears of "Moltbook" before any intent routing / agent reasoning (original
@@ -482,10 +586,13 @@ async function respondHandler(req, res) {
     if (isManualProposalRequest(userText)
         && !/\bbased on (your |the )?(recommendation|suggestion|advice|that)\b/i.test(userText)) {
       const result = await selfImprove.runScan({
-        reason: `manual voice proposal request: ${userText.slice(0, 240)}`
+        reason: `manual voice proposal request: ${userText.slice(0, 240)}`,
+        focus: [userText],
       });
-      const base = result && result.proposed
-        ? `I queued proposal ${result.id} for ${String(result.file || '').split(/[\\/]/).pop()}. Reviewer recommendation: ${result.reviewRecommendation || 'review'}. ${result.reviewReason || ''}`
+      const base = result && result.proposed && result.status === 'awaiting_external_review'
+        ? `I drafted proposal ${result.id} for ${String(result.file || '').split(/[\\/]/).pop()} and sent it to the external Codex review task. It will appear for your decision after that verdict arrives.`
+        : result && result.proposed
+          ? `I queued proposal ${result.id} for ${String(result.file || '').split(/[\\/]/).pop()}. Reviewer recommendation: ${result.reviewRecommendation || 'review'}. ${result.reviewReason || ''}`
         : `I tried to create a proposal, but ${result?.note || result?.error || 'nothing concrete enough was staged yet'}.`;
       const finalText = shapeSpokenReply(base, req.body || {});
       try {
@@ -521,30 +628,39 @@ async function respondHandler(req, res) {
     if (isSelfDescriptionRequest(userText)) {
       // Natural, LLM-generated self-introduction grounded in her real identity data
       // (this used to return a fixed canned sentence).
-      let finalText = '';
-      try {
+      let finalText = process.env.NODE_ENV === 'test' ? buildSpokenSelfResponseText() : '';
+      if (!finalText) try {
         const id = (buildSelfStatus().identity) || {};
         const idFacts = [
           `Name: ${id.name || 'AVA'}`,
           id.purpose ? `Purpose: ${id.purpose}` : null,
           id.developer ? `Created by: ${id.developer}` : null,
         ].filter(Boolean).join('\n');
+        await capabilityRegistry.refresh().catch(() => null);
         const budget = normalizeSpokenReplyBudget(req.body || {});
-        const sys = `${personaSvc.buildPersonaBlock()}\n\nYou are a local voice assistant on ${id.developer || 'the user'}'s Windows computer. Introduce yourself naturally and warmly in your own voice (spoken aloud, so about ${budget.maxSentences} sentences). What you know about yourself:\n${idFacts}\nYou can also take real actions through local tools (calendar, email, files, camera, screen reading, mouse/keyboard, browser, system info, smart home, and more). Don't list every tool; just convey who you are and that you can both chat and do things.`;
+        const sys = `${personaSvc.buildPersonaBlock()}\n\nIntroduce yourself naturally in about ${budget.maxSentences} sentences. Ground every statement about what you can do in the live registry below. Mention meaningful current limits instead of making a blanket claim.\n${idFacts}\n\n${capabilityRegistry.promptBlock()}`;
         const r = await llmService.chat([
           { role: 'system', content: sys },
           { role: 'user', content: userText }
-        ], { temperature: 0.5, max_tokens: 800 });
+        ], { temperature: 0.5, max_tokens: 800, localPriority: 'interactive' });
         finalText = (r.text || r.content || '').trim();
       } catch (e) { /* fall back to the canned line below */ }
       if (!finalText) finalText = buildSpokenSelfResponseText();
-      finalText = shapeSpokenReply(finalText, req.body || {});
-      try { conversationLogger.logAssistantMessage(finalText, { sessionId, responseType: 'direct-self' }); } catch {}
-      return res.json({ ok: true, output_text: String(finalText || '').slice(0, 20000), agent: {
+      finalText = groundSelfDescription(finalText);
+      finalText = finalText.replace(/\bAiva\b/gi, 'AVa');
+      if (!/\bava\b/i.test(finalText)) finalText = `I'm AVa. ${finalText}`;
+      const displayText = finalText;
+      let spokenText = shapeSpokenReply(displayText, req.body || {});
+      if (!String(spokenText || '').trim()) {
+        spokenText = shapeSpokenReply("I'm AVa, your local voice assistant. I can answer questions and use my registered tools when a task needs them.", req.body || {})
+          || "I'm Aiva, your local voice assistant.";
+      }
+      try { conversationLogger.logAssistantMessage(displayText, { sessionId, responseType: 'direct-self' }); } catch {}
+      return res.json({ ok: true, output_text: String(spokenText).slice(0, 20000), display_text: displayText.slice(0, 20000), agent: {
         id: 'direct-self-' + Date.now(),
         status: 'success',
         steps: 0,
-        result: finalText,
+        result: displayText,
         errors: []
       }});
     }
@@ -552,7 +668,10 @@ async function respondHandler(req, res) {
     // SELF-MOD APPROVAL PATH: spoken listing / approval / rejection of AVA's proposed code
     // changes. Goes through the same worker store the UI panel uses, so voice + UI agree.
     try {
-      const smReply = await handleSelfModVoice(userText);
+      let workflowWaiting = false;
+      try { workflowWaiting = goalManager.status(sessionId)?.workflow?.status === 'waiting_user'; }
+      catch { /* workflow context is optional */ }
+      const smReply = await handleSelfModVoice(userText, { sessionId, workflowWaiting });
       if (smReply) {
         // DISPLAY vs SPOKEN split: the SCREEN keeps real IDs and filenames (e.g. "a355aef5",
         // "screen_ops.py"); only the SPOKEN copy gets shaped (which spells IDs out char-by-char
@@ -565,6 +684,26 @@ async function respondHandler(req, res) {
         }});
       }
     } catch (e) { logger.warn('[respond] self-mod voice path error', { error: e.message }); }
+
+    // Spoken decisions for proactive recommendation cards. Generic "approve"
+    // remains owned by the proposal flow above; this path requires the user to
+    // name the initiative/recommendation explicitly.
+    if (/\b(approve|accept|go ahead with)\b[\s\S]{0,30}\b(initiative|proactive recommendation)\b/i.test(userText)) {
+      const pending = proactiveAutonomy.pending();
+      const target = pending[pending.length - 1];
+      const result = target ? await proactiveAutonomy.approve(target.id) : { ok: false, error: 'no proactive recommendation is pending' };
+      const display = result.ok ? `I approved that initiative and started workflow ${result.workflow.id}.` : `I could not approve it: ${result.error}.`;
+      conversationLogger.logAssistantMessage(display, { sessionId, responseType: 'proactive-approval' });
+      return res.json({ ok: result.ok, output_text: shapeSpokenReply(display, req.body || {}), display_text: display, initiative: result, agent: { id: result.workflow?.id || `initiative-${Date.now()}`, status: result.ok ? 'running' : 'failed', steps: result.workflow?.stages?.length || 0, result: display, errors: result.ok ? [] : [result.error] } });
+    }
+    if (/\b(reject|dismiss|deny)\b[\s\S]{0,30}\b(initiative|proactive recommendation)\b/i.test(userText)) {
+      const pending = proactiveAutonomy.pending();
+      const target = pending[pending.length - 1];
+      const result = target ? proactiveAutonomy.reject(target.id, 'spoken rejection') : { ok: false, error: 'no proactive recommendation is pending' };
+      const display = result.ok ? 'I rejected that proactive recommendation.' : `I could not reject it: ${result.error}.`;
+      conversationLogger.logAssistantMessage(display, { sessionId, responseType: 'proactive-rejection' });
+      return res.json({ ok: result.ok, output_text: shapeSpokenReply(display, req.body || {}), display_text: display, initiative: result, agent: { id: `initiative-${Date.now()}`, status: result.ok ? 'success' : 'failed', steps: 0, result: display, errors: result.ok ? [] : [result.error] } });
+    }
 
     // CAMERA-SEE PATH: "tell me what you see / look through the camera / start the camera
     // and describe" — run camera_ops `see` directly (turns on + captures + describes) so she
@@ -722,6 +861,12 @@ async function respondHandler(req, res) {
         try {
           proposal = await selfImprove.runScan({
             reason: `diagnosis completed for ${diag.label} tool (${diag.tool || 'all'}): ${finalText.slice(0, 900)}`,
+            focus: [
+              `${diag.label} ${diag.tool || ''}`,
+              finalText,
+              diagnosisPayload?.likely_cause || '',
+              ...(Array.isArray(diagnosisPayload?.suggested_fixes) ? diagnosisPayload.suggested_fixes : []),
+            ],
             diag: { issues: [{
               category: `tool_diagnosis_${diag.tool || diag.label}`,
               description: finalText,
@@ -739,8 +884,10 @@ async function respondHandler(req, res) {
         } catch (e) {
           proposal = { ok: false, error: e.message };
         }
-        const proposalText = proposal && proposal.proposed
-          ? ` I also queued proposal ${proposal.id} for your review. Reviewer recommendation: ${proposal.reviewRecommendation || 'review'}.`
+        const proposalText = proposal && proposal.proposed && proposal.status === 'awaiting_external_review'
+          ? ` I also drafted proposal ${proposal.id} and sent it to the external Codex review task. It will appear for your decision after that verdict arrives.`
+          : proposal && proposal.proposed
+            ? ` I also queued proposal ${proposal.id} for your review. Reviewer recommendation: ${proposal.reviewRecommendation || 'review'}.`
           : ` I also tried to create a proposal from that diagnosis, but ${proposal?.note || proposal?.error || 'nothing concrete enough was staged'}.`;
         finalText = `${finalText}${proposalText}`;
         finalText = shapeSpokenReply(finalText, req.body || {});
@@ -950,6 +1097,26 @@ async function respondHandler(req, res) {
       }});
     }
 
+    // DURABLE GOAL PATH: broad, dependent work is checkpointed and resumed by
+    // the workflow engine instead of being squeezed into one ephemeral turn.
+    try {
+      const goal = await goalManager.handleTurn(userText, { sessionId, channel, localPriority: 'interactive' });
+      if (goal.handled) {
+        const display = String(goal.text || '').trim();
+        const spoken = shapeSpokenReply(display, req.body || {});
+        conversationLogger.logAssistantMessage(display, { sessionId, responseType: 'workflow-control', workflowId: goal.workflow?.id });
+        return res.json({
+          ok: true,
+          output_text: spoken,
+          display_text: display,
+          workflow: goal.workflow || null,
+          agent: { id: goal.workflow?.id || `goal-${Date.now()}`, status: goal.workflow?.status || 'success', steps: goal.workflow?.stages?.length || 0, result: display, errors: [] },
+        });
+      }
+    } catch (error) {
+      logger.warn('[respond] durable goal routing failed; continuing in normal turn path', { error: error.message });
+    }
+
     // CONVERSATIONAL PATH: When tools are disabled, bypass agent loop entirely.
     // The agent loop frames everything as "task execution" which produces verbose
     // non-answers for simple factual questions. Direct LLM call gives natural replies.
@@ -1013,11 +1180,8 @@ async function respondHandler(req, res) {
       // this prompt omitted tools, so she'd say she had none.)
       let capabilityPrompt = '';
       try {
-        const tools = await toolsService.getAllTools();
-        if (tools && tools.length) {
-          const toolLines = tools.map(t => `- ${t.name}: ${t.description}`).join('\n');
-          capabilityPrompt = `\n\nYou are NOT just a chatbot — you have ${tools.length} real tools that take real actions on this Windows computer (the user triggers them with a command). Your tools:\n${toolLines}\nWhen asked what you can do or whether you have a capability, answer from this list in natural plain language (don't read raw tool names), and never claim you have no tools or cannot act. You also have persistent memory and can recall or search your past conversations across sessions (memory_search), so never say you can't remember or can't access past conversations.`;
-        }
+        await capabilityRegistry.refresh();
+        capabilityPrompt = `\n\n${capabilityRegistry.promptBlock()}`;
       } catch (e) { /* capabilities optional; fall back to plain conversation */ }
       // Session memory: feed the last few turns so she can answer "what did I just
       // ask?" / "what did you say?". This path was previously stateless (each voice
@@ -1192,7 +1356,7 @@ MACHINE-STATE RULE (absolute): if the question is about the CURRENT state of thi
     }
 
     // TOOL PATH: Full agent loop for tool-enabled requests
-    const loopOptions = { source: 'voice' };  // tag tool events so the live UI mirrors them
+    const loopOptions = { source: channel, localPriority: 'interactive' };  // tag tool events so the live UI mirrors them
     try { loopOptions.environment = await environmentContext.buildEnvironmentBlock(); } catch { /* optional */ }
     // Inject the rolling summary of older (compressed-away) conversation so dropped context isn't lost.
     try {
@@ -1220,6 +1384,29 @@ MACHINE-STATE RULE (absolute): if the question is about the CURRENT state of thi
     // Record what she actually DID this turn into the queryable action history (so "what did you
     // just do?" and the live-environment "recent actions" come from a real log).
     try { actionHistory.recordTurn(sessionId, state); } catch (e) { /* optional */ }
+    let _diagnosticProposal = null;
+    const _diagnosis = extractSelfDiagnosis(state);
+    if (_diagnosis) {
+      try {
+        _diagnosticProposal = await selfImprove.runScan({
+          reason: `self-diagnosis completed through ${_diagnosis.tool}: ${JSON.stringify(_diagnosis.result).slice(0, 1600)}`,
+          focus: [
+            _diagnosis.tool,
+            _diagnosis.result.summary || '',
+            _diagnosis.result.message || '',
+            _diagnosis.result.likely_cause || '',
+            ...(Array.isArray(_diagnosis.result.suggested_fixes) ? _diagnosis.result.suggested_fixes : []),
+          ],
+          diag: { issues: [{
+            category: `self_diagnosis_${_diagnosis.tool}`,
+            description: String(_diagnosis.result.summary || _diagnosis.result.message || JSON.stringify(_diagnosis.result)).slice(0, 1200),
+            context: JSON.stringify({ tool: _diagnosis.tool, args: _diagnosis.args, receipt: _diagnosis.result }).slice(0, 3000),
+          }] },
+        });
+      } catch (error) {
+        _diagnosticProposal = { ok: false, error: error.message };
+      }
+    }
     // Compress older turns into the rolling lineage summary once the session has grown (best-effort).
     try { contextCompression.maybeCompress(sessionId).catch(() => {}); } catch (e) { /* optional */ }
     let finalText = _stripToolSyntax(state.final_result || '');  // never let raw tool syntax leak
@@ -1283,12 +1470,32 @@ Don't read raw tool names, JSON, or status codes, but you MAY describe your heal
       if (_q) finalText = _q;
     }
 
+    if (_diagnosticProposal?.proposed) {
+      const proposalUpdate = _diagnosticProposal.status === 'awaiting_external_review'
+        ? `I also drafted proposal ${_diagnosticProposal.id} from that diagnosis and sent it to the external Codex review task. It will appear after the verdict arrives.`
+        : `I also queued proposal ${_diagnosticProposal.id} from that diagnosis. Reviewer recommendation: ${_diagnosticProposal.reviewRecommendation || 'review'}.`;
+      finalText = `${String(finalText || '').trim()} ${proposalUpdate}`.trim();
+    } else if (_diagnosis && _diagnosticProposal) {
+      finalText = `${String(finalText || '').trim()} I also evaluated whether that diagnosis justified a code proposal, but ${_diagnosticProposal.note || _diagnosticProposal.error || 'there was no sufficiently grounded edit to stage'}.`.trim();
+    }
+
     // VOICE FILTER: Block step status messages (return empty string, not canned text)
     if (isStepStatusMessage(finalText)) {
       console.log(`[respond] Blocked step status: ${finalText.slice(0, 60)}...`);
       finalText = '';
     }
-    if (!finalText) finalText = state.final_result || 'Done.';
+    if (!finalText) {
+      const savedResult = String(state.final_result || '').trim();
+      if (savedResult && !/^(?:done|complete|completed|ok|okay)\.?$/i.test(savedResult)) finalText = savedResult;
+      else if (_ground) finalText = fallbackToolAnswer(_ground.tool, _ground.result);
+      else {
+        const lastError = Array.isArray(state.errors) ? state.errors[state.errors.length - 1] : null;
+        const detail = String(lastError?.message || lastError?.error || lastError || '').trim();
+        finalText = detail
+          ? `I couldn't produce a usable result for that turn: ${detail}`
+          : "I finished the turn, but I don't have a usable result to report.";
+      }
+    }
     // DISPLAY keeps any light Markdown for the UI mirror; SPOKEN is stripped + number-normalized.
     const _agentDisplay = String(finalText || '').trim();
     const _agentSpoken = shapeSpokenReply(_agentDisplay, req.body || {});
@@ -1299,7 +1506,7 @@ Don't read raw tool names, JSON, or status codes, but you MAY describe your heal
       return res.json({ ok: true, superseded: true, output_text: '', display_text: '', agent: { id: 'superseded-' + Date.now(), status: 'superseded', steps: 0, result: '', errors: [] } });
     }
     try { presenter.present(userText, _agentDisplay, { force: _wantsVisual, sessionId }).catch(() => {}); } catch { /* optional */ }
-    res.json({ ok: true, output_text: String(_agentSpoken || '').slice(0, 20000), display_text: _agentDisplay.slice(0, 20000), agent: {
+    res.json({ ok: true, output_text: String(_agentSpoken || '').slice(0, 20000), display_text: _agentDisplay.slice(0, 20000), proposal: _diagnosticProposal, agent: {
       id: state.id,
       status: state.status,
       steps: state.step_count,

@@ -515,6 +515,11 @@ class PassiveLearningEngine:
         """Stop passive learning"""
         self.shutdown.set()
         self.running = False
+        current = threading.current_thread()
+        for worker in list(self._threads):
+            if worker is not current and worker.is_alive():
+                worker.join(timeout=2.0)
+        self._threads = [worker for worker in self._threads if worker.is_alive()]
         print("[passive-learning] Passive learning engine stopped")
         
     def _screen_observation_loop(self):

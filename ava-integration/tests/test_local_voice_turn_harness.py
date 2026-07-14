@@ -25,10 +25,15 @@ def test_deterministic_local_voice_turn_harness_passes_acceptance_script():
     )
 
     assert result.ok
-    assert result.server_commands == ["why is the sky blue"]
+    assert result.server_commands == [
+        "what time is it",
+        "what is today",
+        "what time is it",
+        "who are you",
+        "why is the sky blue",
+    ]
     assert any(text == "I'm listening." for text in result.spoken)
-    assert any(text.startswith("Today is ") for text in result.spoken)
-    assert sum(1 for text in result.spoken if text.startswith("It's ") and ":" in text) >= 2
+    assert sum(1 for text in result.spoken if text.startswith("Blue light scatters")) == 5
 
 
 def test_deterministic_local_voice_turn_harness_fails_missing_server_reply():
@@ -38,4 +43,4 @@ def test_deterministic_local_voice_turn_harness_fails_missing_server_reply():
 
     assert not result.ok
     assert "server_reply_spoken" in result.failed_checks
-    assert "general_question_routed_to_server" in result.passed_checks
+    assert "all_accepted_commands_routed_to_server" in result.passed_checks

@@ -2,7 +2,7 @@
 
 This intentionally stays separate from the always-listening runner. It records a
 short sample, uses local ASR, resolves the command without requiring a wake word,
-routes through AVA's local reply path, and optionally speaks with Piper.
+routes through AVA's shared server brain, and optionally speaks with Piper.
 """
 
 from __future__ import annotations
@@ -27,7 +27,6 @@ from ava_local_voice import (  # noqa: E402
     CHANNELS,
     FORMAT,
     _load_config,
-    _local_fact_reply,
     _normalize,
     _resample_pcm16,
     _server_respond,
@@ -120,9 +119,6 @@ def resolve_command(vosk_text: str, whisper_text: str, metrics: dict[str, Any] |
 
 
 def reply_for_command(command: str, config: dict[str, Any]) -> tuple[str, str]:
-    local = _local_fact_reply(command)
-    if local:
-        return local, "local_fact"
     reply = _server_respond(command, config) if command else ""
     if reply:
         return reply, "server"

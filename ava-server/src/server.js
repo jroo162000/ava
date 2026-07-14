@@ -33,10 +33,14 @@ import embodimentDriver from './services/embodimentDriver.js';
 import selfReflection from './services/selfReflection.js';
 import environmentContext from './services/environmentContext.js';   // Tier 3 #18: vitals source
 import { emitVoiceEvent } from './services/voiceBus.js';             // Tier 3 #18: sys.stats broadcast
+import capabilityRegistry from './services/capabilityRegistry.js';
+import commitments from './services/commitments.js';
+import externalProposalReview from './services/externalProposalReview.js';
+import avaPaths from './utils/paths.js';
 
 // Phase 7: Security audit at startup
 const isProd = process.env.NODE_ENV === 'production';
-const securityAudit = security.auditSecrets(process.cwd(), isProd);
+const securityAudit = security.auditSecrets(avaPaths.serverDir(), isProd);
 if (!securityAudit.ok) {
   console.error('\n❌ Security audit failed in production mode!');
   console.error(securityAudit.errors.join('\n'));
@@ -169,6 +173,8 @@ server.listen(PORT, HOST, () => {
     console.log(`   ⚠️  Warnings:    ${securityAudit.insecureFiles.length} plaintext key file(s)`);
   }
   console.log('');
+  capabilityRegistry.start();
+  commitments.startDeadlineChecker();
   // Guard: skip all schedulers when voice mode is active
   if (process.env.DISABLE_AUTONOMY === '1') {
     logger.info('[autonomy] disabled (voice mode) — all schedulers skipped (doctor, digest, moltbook)');
@@ -196,6 +202,7 @@ server.listen(PORT, HOST, () => {
   // Self-improvement loop: queues proposed code changes for the user's approval (UI/voice).
   // Runs even in voice mode (lightweight, infrequent) — gated by its own AVA_SELF_IMPROVE_OFF.
   try {
+    externalProposalReview.start();
     selfImprove.start();
   } catch (e) {
     logger.warn('Failed to start self-improvement loop', { error: e.message });

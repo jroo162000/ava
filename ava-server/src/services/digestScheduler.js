@@ -1,52 +1,59 @@
-// Digest Scheduler - auto-flush digest at quiet-hours digest time
+// Deliver queued proactive findings at the policy-defined digest time.
 import digestQueue from './digestQueue.js';
 import autonomyLib from './autonomyPolicy.js';
+import { pushAnnouncement } from './announceQueue.js';
+import { emitVoiceEvent } from './voiceBus.js';
 import logger from '../utils/logger.js';
 
 function hhmm(date = new Date()) {
-  const hh = String(date.getHours()).padStart(2, '0');
-  const mm = String(date.getMinutes()).padStart(2, '0');
-  return `${hh}:${mm}`;
+  return `${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}`;
 }
 
-function isDigestTime() {
+function digestTime() {
   try {
-    const { getAutonomy } = autonomyLib; const autonomy = getAutonomy(logger);
-    const policy = autonomy.getPolicy();
-    const qh = policy.quiet_hours || {};
-    const digest = (qh.during_quiet_hours && qh.during_quiet_hours.digest_time) || '07:15';
-    return hhmm() === digest;
-  } catch { return false; }
+    const policy = autonomyLib.getAutonomy().getPolicy();
+    return policy.quiet_hours?.during_quiet_hours?.digest_time || '07:15';
+  } catch {
+    return '07:15';
+  }
 }
 
-let _timer = null;
-let _lastMinute = '';
+function deliver(items) {
+  if (!items.length) return;
+  digestQueue.setLastDelivered(items);
+  const highlights = items.slice(0, 3).map(item => item.title || item.summary).filter(Boolean);
+  const extra = Math.max(0, items.length - highlights.length);
+  const message = `I have ${items.length} proactive ${items.length === 1 ? 'finding' : 'findings'} for you. ${highlights.join('; ')}${extra ? `; plus ${extra} more` : ''}`.slice(0, 700);
+  pushAnnouncement(message);
+  emitVoiceEvent('digest.delivered', { count: items.length, items }, 'digest');
+  logger.info('[digest] delivered', { count: items.length });
+}
+
+let timer = null;
+let lastMinute = '';
 
 export function startDigestScheduler() {
-  // Guard: skip scheduler when voice mode is active
-  if (process.env.DISABLE_AUTONOMY === '1') {
-    logger.info('[autonomy] disabled (voice mode) — digest scheduler will not start');
-    return;
-  }
-  if (_timer) return;
-  _timer = setInterval(() => {
+  if (process.env.DISABLE_AUTONOMY === '1' || timer) return false;
+  const checkMs = Math.max(5000, Number(process.env.AVA_DIGEST_CHECK_MS) || 30000);
+  const check = () => {
     try {
-      const nowMinute = hhmm();
-      if (nowMinute !== _lastMinute) {
-        _lastMinute = nowMinute;
-        if (isDigestTime()) {
-          const items = digestQueue.flush();
-          if (items.length > 0) {
-            digestQueue.setLastDelivered(items);
-            logger.info(`[digest] Auto-delivered ${items.length} item(s) at digest time.`);
-          }
-        }
-      }
-    } catch (e) {
-      logger.warn('[digest] scheduler error', { error: e.message });
+      const minute = hhmm();
+      if (minute !== digestTime() || minute === lastMinute) return;
+      lastMinute = minute;
+      deliver(digestQueue.flush());
+    } catch (error) {
+      logger.warn('[digest] scheduler error', { error: error.message });
     }
-  }, 30 * 1000);
+  };
+  timer = setInterval(check, checkMs);
+  if (timer.unref) timer.unref();
+  check();
+  return true;
 }
 
-export default { startDigestScheduler };
+export function stopDigestScheduler() {
+  if (timer) clearInterval(timer);
+  timer = null;
+}
 
+export default { startDigestScheduler, stopDigestScheduler };

@@ -99,7 +99,7 @@ export function useWebSocket(options = {}) {
       setError(error.message);
       setConnectionState('error');
     }
-  }, [WS_BASE, maxReconnectAttempts, reconnectInterval, onOpen, onClose, onMessage, onError]);
+  }, [maxReconnectAttempts, reconnectInterval, onOpen, onClose, onMessage, onError]);
 
   // Disconnect from WebSocket
   const disconnect = useCallback(() => {

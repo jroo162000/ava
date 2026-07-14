@@ -205,11 +205,14 @@ export default function Stage() {
   const [connected, setConnected] = useState(false);
   const [turns, setTurns] = useState([]);            // {id, who:'user'|'ava', text, ts, via}
   const [liveText, setLiveText] = useState('');      // assistant.delta accumulator
+  const liveTextRef = useRef('');
   const [historyOpen, setHistoryOpen] = useState(false);
   const [input, setInput] = useState('');
   const [sending, setSending] = useState(false);
   const [pendingMods, setPendingMods] = useState([]);
   const [pendingVerifs, setPendingVerifs] = useState([]);
+  const [pendingInitiatives, setPendingInitiatives] = useState([]);
+  const [trayOpen, setTrayOpen] = useState(false);
   const [verifAnswers, setVerifAnswers] = useState({});
   const [verifError, setVerifError] = useState('');
   const [busyId, setBusyId] = useState('');
@@ -238,7 +241,7 @@ export default function Stage() {
   const [vitals, setVitals] = useState(null);        // #18: sys.stats machine vitals
   const [workflows, setWorkflows] = useState([]);    // #18: live workflow pipelines
 
-  const attention = pendingMods.length + pendingVerifs.length;
+  const attention = pendingMods.length + pendingVerifs.length + pendingInitiatives.length;
 
   // ---- echo dedupe for typed turns (WS mirrors them back) ----
   const recentKeys = useRef(new Map());
@@ -287,14 +290,20 @@ export default function Stage() {
           core.onUserTurn();
           break;
         case 'assistant.delta':
-          setLiveText(prev => prev + String(d.text || ''));
+          liveTextRef.current += String(d.text || '');
+          setLiveText(liveTextRef.current);
           core.onDelta();
           break;
-        case 'assistant.final':
-          addTurn('ava', d.text);
+        case 'assistant.final': {
+          const finalText = String(d.text || '').trim();
+          const streamedText = liveTextRef.current.trim();
+          const genericFinal = /^(done|complete|completed|ok|okay)\.?$/i.test(finalText);
+          addTurn('ava', streamedText && (!finalText || genericFinal) ? streamedText : finalText);
+          liveTextRef.current = '';
           setLiveText('');
           core.onFinal();
           break;
+        }
         case 'agent.state':
           if (d.state === 'working.start') core.onWorking(true, d.goal);
           else if (d.state === 'working.end') core.onWorking(false);
@@ -379,6 +388,9 @@ export default function Stage() {
           }
           break;
         }
+        case 'proactive.initiatives':
+          setPendingInitiatives(Array.isArray(d.pending) ? d.pending : []);
+          break;
         case 'tool.start':
           dock.spawn({ kind: 'tool', callId: d.callId || '', title: d.tool || 'tool', detail: argHint(d.args), skin: toolSkin(d.tool, d.args), state: 'active' });
           break;
@@ -449,7 +461,10 @@ export default function Stage() {
     let stop = false;
     const applyList = (list) => {
       if (stop) return;
-      setPendingMods(Array.isArray(list) ? list.filter(m => (m.status || 'pending') === 'pending' && !actedMods.current.has(m.id)) : []);
+      setPendingMods(Array.isArray(list) ? list.filter(m =>
+        (m.status || 'pending') === 'pending'
+        && (m.external_review_status || m.metadata?.externalReviewStatus) !== 'pending'
+        && !actedMods.current.has(m.id)) : []);
     };
     const fetchPending = async () => {
       try {
@@ -473,6 +488,31 @@ export default function Stage() {
     try {
       await fetch(`${API_BASE}/self_mod`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action, modification_id: id }) });
     } catch { /* reconciles via events */ } finally { setBusyId(''); }
+  };
+
+  // ---- proactive initiatives: evidence -> recommendation -> user decision -> verified workflow ----
+  useEffect(() => {
+    let stop = false;
+    const apply = (items) => { if (!stop) setPendingInitiatives(Array.isArray(items) ? items : []); };
+    const fetchPending = async () => {
+      try { const j = await fetch(`${API_BASE}/proactive/pending`).then(r => r.json()); apply(j && j.pending); } catch { /* restarting */ }
+    };
+    fetchPending();
+    const un = subscribe((ev) => {
+      if (ev.type === 'proactive.initiatives') apply(ev.data && ev.data.pending);
+      else if (ev.type === 'ws.open') fetchPending();
+    });
+    return () => { stop = true; un(); };
+  }, []);
+
+  const actOnInitiative = async (id, action) => {
+    setBusyId(id);
+    try {
+      const result = await fetch(`${API_BASE}/proactive/${encodeURIComponent(id)}/${action}`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}'
+      }).then(r => r.json());
+      if (result?.ok) setPendingInitiatives(prev => prev.filter(item => item.id !== id));
+    } catch { /* reconciles on the next event/reconnect */ } finally { setBusyId(''); }
   };
 
   // ---- Moltbook verifications ----
@@ -675,16 +715,43 @@ export default function Stage() {
       </div>
 
       {/* bottom-left: attention tray (never auto-dismisses; drives core ATTENTION) */}
-      {(pendingMods.length > 0 || pendingVerifs.length > 0) && (
-        <div className="st-tray">
+      {(pendingMods.length > 0 || pendingVerifs.length > 0 || pendingInitiatives.length > 0) && (
+        <>
+        <button type="button" className="st-traytoggle" aria-expanded={trayOpen} aria-controls="st-review-tray" onClick={() => setTrayOpen(true)}>
+          Review {attention}
+        </button>
+        {trayOpen && <button type="button" className="st-traybackdrop" aria-label="Close pending reviews" onClick={() => setTrayOpen(false)} />}
+        <div id="st-review-tray" className={`st-tray ${trayOpen ? 'open' : ''}`}>
+          <div className="st-trayhead">
+            <span>Pending reviews <span className="st-dim">{attention}</span></span>
+            <button type="button" className="st-ghost" onClick={() => setTrayOpen(false)}>Close</button>
+          </div>
+          {pendingInitiatives.map((initiative) => (
+            <div key={initiative.id} className="st-attn">
+              <div className="st-attnhead">Proactive recommendation <span className="st-dim">#{initiative.id}</span></div>
+              {initiative.finding && <div className="st-attnreason"><strong>Found:</strong> {initiative.finding}</div>}
+              {initiative.recommendation && <div className="st-attnreason"><strong>Recommendation:</strong> {initiative.recommendation}</div>}
+              {initiative.action && <div className="st-attnreason"><strong>Approved action:</strong> {initiative.action}</div>}
+              <div className="st-btnrow">
+                <button className="st-btn ok" disabled={busyId === initiative.id} onClick={() => actOnInitiative(initiative.id, 'approve')}>{busyId === initiative.id ? '...' : 'Approve'}</button>
+                <button className="st-btn no" disabled={busyId === initiative.id} onClick={() => actOnInitiative(initiative.id, 'reject')}>Reject</button>
+              </div>
+            </div>
+          ))}
           {pendingMods.map((m) => {
             const fname = String(m.file || '').split(/[\\/]/).pop();
             const rec = m.review_recommendation || m.reviewRecommendation || m.metadata?.reviewRecommendation;
             const recReason = m.review_reason || m.reviewReason || m.metadata?.reviewReason;
+            const decisionModel = m.decision_model || m.metadata?.decisionModel || m.edit_model || m.plan_model;
+            const reviewers = m.reviewers || m.metadata?.reviewers || [];
+            const externalStatus = m.external_review_status || m.metadata?.externalReviewStatus;
             return (
               <div key={m.id} className="st-attn">
                 <div className="st-attnhead">🛠 <span className="st-mono">{fname}</span> <span className="st-dim">#{m.id}</span></div>
                 {m.reason && <div className="st-attnreason">{m.reason}</div>}
+                {decisionModel && <div className="st-attnreason"><strong>Generated by:</strong> {decisionModel}</div>}
+                {reviewers.length > 0 && <div className="st-attnreason"><strong>Reviewed by:</strong> {reviewers.map(r => `${r.reviewer}${r.model ? ` (${r.model})` : ''}: ${String(r.recommendation || 'review').toUpperCase()}`).join(' | ')}</div>}
+                {externalStatus && <div className="st-attnreason"><strong>External review:</strong> {String(externalStatus).replaceAll('_', ' ')}</div>}
                 {rec && <div className={`st-rec ${rec}`}>reviewer: {String(rec).toUpperCase()}{recReason ? ` — ${recReason}` : ''}</div>}
                 {m.diff && <Diff text={m.diff} />}
                 <div className="st-btnrow">
@@ -710,6 +777,7 @@ export default function Stage() {
             </div>
           ))}
         </div>
+        </>
       )}
 
       {/* bottom: command line */}
@@ -860,6 +928,7 @@ body { background: #000204; }
 .st-verr { color: #fca5a5; font-size: 11.5px; margin-top: 5px; }
 .st-mono { font-family: ui-monospace, monospace; }
 .st-dim { color: #5b6577; font-weight: 400; font-size: 11px; }
+.st-traytoggle, .st-traybackdrop, .st-trayhead { display: none; }
 
 .st-cmdwrap { position: absolute; left: 50%; transform: translateX(-50%); bottom: 26px; width: min(720px, 86vw); display: flex; align-items: center; gap: 10px; background: rgba(10,14,26,0.9); border: 1px solid rgba(139,92,246,0.3); border-radius: 14px; padding: 12px 16px; z-index: 30; backdrop-filter: blur(8px); }
 .st-prompt { color: var(--ava-accent); font-family: ui-monospace, monospace; }
@@ -868,6 +937,19 @@ body { background: #000204; }
 
 .st-history { position: fixed; inset: 0; background: rgba(0,2,4,0.8); z-index: 60; display: flex; align-items: center; justify-content: center; backdrop-filter: blur(4px); }
 .st-historybox { width: min(760px, 92vw); height: min(80vh, 900px); overflow-y: auto; background: rgba(8,12,22,0.98); border: 1px solid rgba(139,92,246,0.35); border-radius: 16px; padding: 18px 22px; display: flex; flex-direction: column; gap: 12px; }
+
+@media (max-width: 700px) {
+  .st-tray { display: none; }
+  .st-tray.open { display: flex; position: absolute; left: 0; right: 0; top: 44px; bottom: 70px; width: auto; max-height: none; padding: 12px; background: rgba(0,2,4,0.98); border-top: 1px solid rgba(245,158,11,0.3); border-bottom: 1px solid rgba(245,158,11,0.3); z-index: 45; }
+  .st-trayhead { position: sticky; top: -12px; z-index: 2; display: flex; align-items: center; justify-content: space-between; min-height: 36px; padding: 8px 2px; background: #000204; color: #fbbf24; font-size: 12.5px; font-weight: 700; }
+  .st-traytoggle { position: absolute; left: 12px; bottom: 82px; z-index: 34; display: inline-flex; align-items: center; min-height: 34px; padding: 7px 12px; border: 1px solid rgba(245,158,11,0.45); border-radius: 8px; background: rgba(20,15,3,0.96); color: #fbbf24; font-size: 12px; font-weight: 700; cursor: pointer; }
+  .st-traybackdrop { position: absolute; inset: 0; z-index: 40; display: block; border: 0; background: rgba(0,2,4,0.65); }
+  .st-attn { flex: 0 0 auto; border-radius: 8px; }
+  .st-core3d { width: min(96vw, 440px); height: min(96vw, 440px); }
+  .st-dock { left: 44px; right: 16px; width: auto; max-height: 122px; }
+  .st-ticker { left: 12px; right: 12px; top: 180px; bottom: 140px; width: auto; }
+  .st-cmdwrap { width: calc(100vw - 20px); box-sizing: border-box; bottom: 25px; }
+}
 
 @keyframes stIn { from { transform: scale(0.94) translateY(6px); opacity: 0; } to { transform: none; opacity: 1; } }
 @keyframes stPulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }

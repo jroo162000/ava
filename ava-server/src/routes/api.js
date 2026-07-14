@@ -1,5 +1,5 @@
-// Main API routes — thin aggregator (Tier 2 split): /respond, /chat, and /train/* live in
-// their own route files (routes/respond.js, routes/chat.js, routes/train.js); spoken-reply
+// Main API routes: /respond and /chat share routes/respond.js; /train/*
+// lives in routes/train.js. Spoken-reply
 // shaping is services/speech.js and the self-mod voice flow is services/selfModVoice.js.
 import express from 'express';
 import fs from 'fs';
@@ -22,8 +22,8 @@ import os from 'os';
 import moltbookService from '../services/moltbook.js';
 import moltbookScheduler from '../services/moltbookScheduler.js';
 import respondRoutes from './respond.js';
-import chatRoutes from './chat.js';
 import trainRoutes from './train.js';
+import avaPaths from '../utils/paths.js';
 
 const recentTurnKeys = new Map();
 const DUPLICATE_TURN_MS = Math.max(500, parseInt(process.env.AVA_DUPLICATE_TURN_MS || '3000', 10));
@@ -77,17 +77,11 @@ function markDuplicateTurn(endpoint, sessionId, text) {
 // LLM composition helpers
 async function composeLLM({ system, user }, fallbackText){
   try {
-    const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-    if (!OPENAI_API_KEY) return fallbackText;
-    const model = process.env.CHAT_MODEL || 'gpt-4o-mini';
-    const r = await fetch('https://api.openai.com/v1/chat/completions', {
-      method: 'POST',
-      headers: { 'Authorization': `Bearer ${OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model, messages: [ { role:'system', content: system }, { role:'user', content: user } ], temperature: 0.7 })
-    });
-    if (!r.ok) return fallbackText;
-    const j = await r.json().catch(()=>null);
-    return (j?.choices?.[0]?.message?.content || fallbackText);
+    const response = await llmService.chat([
+      { role: 'system', content: system },
+      { role: 'user', content: user },
+    ], { temperature: 0.7, max_tokens: 900, localPriority: 'interactive' });
+    return response?.content || response?.text || fallbackText;
   } catch { return fallbackText }
 }
 
@@ -144,13 +138,12 @@ const router = express.Router();
 // Split-out route modules (Tier 2): the voice /respond turn handler, the typed /chat
 // endpoint, and the /train/* trainer endpoints. Paths are unchanged.
 router.use(respondRoutes);
-router.use(chatRoutes);
 router.use(trainRoutes);
 
 // Resolve user directories safely
 function userPath(which){
   const base = os.homedir();
-  if (!base) return process.cwd();
+  if (!base) return avaPaths.repoRoot();
   if (which === 'downloads') return path.join(base, 'Downloads');
   if (which === 'documents') return path.join(base, 'Documents');
   return base;
@@ -585,32 +578,14 @@ router.get('/persona', (_req, res) => {
   }
 });
 
-// Tools endpoint placeholder
+// Compatibility alias backed by the canonical runtime tool registry.
 router.get('/ava/tools', async (_req, res) => {
   try {
-    // Check if cmp-use API is available
-    const response = await fetch(`${config.CMPUSE_API_URL}/tools`).catch(() => null);
-
-    if (response && response.ok) {
-      const tools = await response.json();
-      return res.json(tools);
-    }
-
-    // Return basic built-in tools
-    res.json({
-      ok: true,
-      tools: [
-        { name: 'memory_search', description: 'Search through conversation memory' },
-        { name: 'persona_info', description: 'Get user persona and preferences' },
-        { name: 'chat', description: 'Have a conversation with the assistant' }
-      ]
-    });
+    const tools = await toolsService.getAllTools();
+    res.json({ ok: true, tools });
   } catch (error) {
     logger.error('Tools fetch failed', { error: error.message });
-    res.status(500).json({
-      ok: false,
-      error: 'Tools service unavailable. Start cmpuse API on 127.0.0.1:8000.'
-    });
+    res.status(503).json({ ok: false, error: error.message });
   }
 });
 
@@ -769,7 +744,7 @@ router.get('/moltbook/stats', (req, res) => {
   }
 });
 
-// Shared with the split-out route files (routes/respond.js, routes/chat.js): the duplicate-turn
+// Shared with routes/respond.js: the duplicate-turn
 // state lives ONLY in this module, and buildSelfStatus also backs /self/status + /self/summary.
 export { markDuplicateTurn, buildSelfStatus };
 

@@ -43,7 +43,10 @@ class HarnessResult:
 
 def _build_runner(spoken: list[str]) -> ava_local_voice.LocalVoiceRunner:
     runner = ava_local_voice.LocalVoiceRunner.__new__(ava_local_voice.LocalVoiceRunner)
-    runner.config = {"validation_mode": {"followup_window_sec": 10.0}}
+    runner.config = {
+        "validation_mode": {"followup_window_sec": 10.0},
+        "streaming": {"enabled": False},
+    }
     runner.followup_until = 0.0
     runner.no_wake_streak = 0
     runner.wake_gate_after_no_wake = 1
@@ -93,12 +96,16 @@ def _score(result: HarnessResult) -> None:
     def check(name: str, ok: bool) -> None:
         (result.passed_checks if ok else result.failed_checks).append(name)
 
-    joined = "\n".join(result.spoken).lower()
+    expected_commands = [
+        "what time is it",
+        "what is today",
+        "what time is it",
+        "who are you",
+        "why is the sky blue",
+    ]
     check("wake_only_acknowledged", any(text == "I'm listening." for text in result.spoken))
-    check("date_answered_locally", any(text.startswith("Today is ") for text in result.spoken))
-    check("time_answered_twice", sum(1 for text in result.spoken if text.startswith("It's ") and ":" in text) >= 2)
-    check("identity_answered_locally", "i'm ava" in joined and "local voice assistant" in joined)
-    check("general_question_routed_to_server", result.server_commands == ["why is the sky blue"])
+    check("all_accepted_commands_routed_to_server", result.server_commands == expected_commands)
+    check("one_spoken_reply_per_accepted_command", len(result.spoken) == len(expected_commands) + 1)
     check("server_reply_spoken", any("blue light scatters" in text.lower() for text in result.spoken))
     check("silence_does_not_reply", any(e.transcript == "" and e.spoken_after == e.spoken_before for e in result.events))
     check("followup_without_wake_allowed_after_wake_only", any(

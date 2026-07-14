@@ -1,17 +1,14 @@
 // Real-time conversation logging service
 import fs from 'fs';
 import path from 'path';
-import { fileURLToPath } from 'url';
 import logger from '../utils/logger.js';
+import avaPaths from '../utils/paths.js';
 import { emitVoiceEvent } from './voiceBus.js';
 import avatarBody from './avatarBody.js';
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-
 class ConversationLogger {
   constructor() {
-    this.logsDir = path.join(__dirname, '..', '..', 'logs', 'conversations');
+    this.logsDir = avaPaths.conversationLogsDir();
     this.ensureLogsDirectory();
     this.currentSession = null;
     this.sessionStartTime = null;
@@ -49,11 +46,15 @@ class ConversationLogger {
 
   logMessage(direction, content, metadata = {}) {
     if (!this.currentSession) {
-      this.startSession();
+      this.startSession(metadata.sessionId || null);
     }
 
+    // An asynchronous workflow can finish after another turn has become current.
+    // Preserve the initiating session when the caller supplies it.
+    const sessionId = metadata.sessionId || this.currentSession;
+
     const logEntry = {
-      sessionId: this.currentSession,
+      sessionId,
       timestamp: new Date().toISOString(),
       unixTime: Date.now(),
       type: 'message',
@@ -190,7 +191,7 @@ class ConversationLogger {
     };
   }
 
-  // Read recent conversation history
+  // Read recent conversation history from the daily JSONL file
   getRecentHistory(limit = 50) {
     try {
       const filename = this.getLogFilename();
@@ -211,6 +212,28 @@ class ConversationLogger {
         .filter(entry => entry && entry.type === 'message');
     } catch (error) {
       logger.error('Failed to read conversation history', { error: error.message });
+      return [];
+    }
+  }
+
+  // Read the last n conversation turns (user/assistant messages) from the daily JSONL file.
+  // Each turn is returned as { timestamp, role, text } where role is 'user' or 'assistant'.
+  getConversationTurns(n = 10) {
+    try {
+      const messages = this.getRecentHistory(n);
+      const turns = [];
+      for (const entry of messages) {
+        if (entry.type === 'message' && entry.direction && entry.content) {
+          turns.push({
+            timestamp: entry.timestamp || entry.unixTime || null,
+            role: entry.direction === 'user' ? 'user' : 'assistant',
+            text: String(entry.content)
+          });
+        }
+      }
+      return turns.slice(-n);
+    } catch (error) {
+      logger.error('Failed to get conversation turns', { error: error.message });
       return [];
     }
   }
@@ -280,3 +303,4 @@ class ConversationLogger {
 // Export singleton instance
 const conversationLogger = new ConversationLogger();
 export default conversationLogger;
+export const getConversationTurns = (n = 10) => conversationLogger.getConversationTurns(n);

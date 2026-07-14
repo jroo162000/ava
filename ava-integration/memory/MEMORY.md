@@ -1,19 +1,12 @@
-ChromeDriver must match Chrome browser version  
-Navigate to URL, verify load, retry on failure  
-Prefer direct action over repeated clarification  
-Retry with available tools before declining capability  
-Wait for elements visible, enabled, clickable  
-Confirm task completion before proceeding  
-On failure, review error, check element state, retry navigation  
-On OpenAI 429 error, check billing and quota before retry  
-Process and summarize large result sets by day or topic  
-AVA voice uses Piper TTS locally, ElevenLabs Vella as cloud fallback  
-User expects AVA to recognize and adapt when corrected mid-conversation  
-Ensure absolute Windows paths work with "list" operation and `confirmed=true`  
-Analyze specific changes before applying; user may test and reject  
-Stage UI: orb pulses in sync with voice output; user plans upgrades  
-User prefers holographic head as Black American woman to match AVA’s identity
-HolographicHead successfully ported to Stage UI under performance budget; speech amplitude drives Stage core UI.
-Lesson: When web_search fails with "query required", ensure the query string is a non-empty string and not null or empty quotes.
-When user asks 'tell me about yourself', respond by stating your name as 'Aiva' and proceed with the task at hand.
-For insurance quotes, return summarized key information (cost ranges, requirements) instead of raw search links.
+- Analyze .glb models by browser screenshot + vision; for holographic tabs, use second-pass vision.
+- Store holographic tabs in Edge; check "holographic" labels first; "select the tab" switches to existing tab, not new window.
+- Multi-monitor: Edge on secondary monitor; describe_image always needs valid image_path (file, not screenshot).
+- Re-check screen content with fresh vision on user query; use "3d hollow" reference photo only for 3D hologram generation.
+- Post-upgrade: continuous hearing, initiates actions; vision task-triggered. Confirm listening mode with "conversation" during ambient audio.
+- Verify thoroughly if user insists log record is missing; verify file paths, don't assume defaults.
+- To control Edge tab, bring to front via window_ops, then use computer use; try partial match or Edge windows before reporting failure.
+- New 3D models: generate with model3d_ops, then scene3d create immediately; saved to ava_models, open in viewer, no re-download.
+- If user statement isn't for you, listen silently; for read-only code review, report limitation, don't approve/reject; flag undefined API calls.
+- For "open my latest 3D model": check ava_models, ask if multiple same-date files, then open chosen file without confirmation loops.
+- Gaze tracking active; AVA's movement locks to user motion until intentionally overridden.
+- Avoid duplicate actions: one source per tool; don't re-describe unconfirmed screen content.

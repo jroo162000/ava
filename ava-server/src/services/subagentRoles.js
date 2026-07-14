@@ -9,6 +9,7 @@
 import fs from 'fs';
 import path from 'path';
 import logger from '../utils/logger.js';
+import avaPaths from '../utils/paths.js';
 
 const BUILTIN = {
   researcher: {
@@ -54,7 +55,7 @@ const BUILTIN = {
 };
 
 const DEFAULT_ROLE = 'general';
-const CUSTOM_FILE = path.join(process.cwd(), 'data', 'subagent-roles.json');
+const CUSTOM_FILE = path.join(avaPaths.dataDir(), 'subagent-roles.json');
 
 function _loadCustom() {
   try { if (fs.existsSync(CUSTOM_FILE)) { const j = JSON.parse(fs.readFileSync(CUSTOM_FILE, 'utf8')); if (j && typeof j === 'object') return j; } } catch { /* ignore */ }

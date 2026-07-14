@@ -875,6 +875,10 @@ class PendingModification:
             "review_recommendation": self.metadata.get("reviewRecommendation", ""),
             "review_reason": self.metadata.get("reviewReason", ""),
             "reviewers": self.metadata.get("reviewers", []),
+            "external_review_status": self.metadata.get("externalReviewStatus", ""),
+            "external_review_request_id": self.metadata.get("externalReviewRequestId", ""),
+            "rejection_reason": self.metadata.get("rejectionReason", ""),
+            "rejected_at": self.metadata.get("rejectedAt", ""),
         }
 
 # Store pending modifications (persisted to ~/.cmpuse/pending_mods.json so they survive a
@@ -992,6 +996,43 @@ def list_pending_modifications() -> List[Dict[str, Any]]:
     """List all pending modifications"""
     return [mod.to_dict() for mod in _pending_modifications.values() if mod.status == "pending"]
 
+
+def update_proposal_review(mod_id: str, review: Dict[str, Any], external_status: str = "complete") -> Dict[str, Any]:
+    """Attach a reviewer receipt without changing proposal content or approval state."""
+    mod = _pending_modifications.get(mod_id)
+    if mod is None:
+        return {"status": "error", "message": f"Modification {mod_id} not found"}
+    if mod.status != "pending":
+        return {"status": "error", "message": f"Modification already {mod.status}"}
+    if not isinstance(review, dict):
+        return {"status": "error", "message": "Review must be an object"}
+
+    reviewer_name = str(review.get("reviewer") or "external-reviewer")
+    recommendation = str(review.get("recommendation") or "review").lower()
+    if recommendation not in ("approve", "deny", "review", "unavailable"):
+        return {"status": "error", "message": "Review recommendation is invalid"}
+
+    reviewers = [
+        item for item in (mod.metadata.get("reviewers") or [])
+        if str(item.get("reviewer") or "") != reviewer_name
+    ]
+    reviewers.append(review)
+    available = [item for item in reviewers if str(item.get("recommendation") or "").lower() != "unavailable"]
+    denied = [item for item in available if str(item.get("recommendation") or "").lower() == "deny"]
+    approved = [item for item in available if str(item.get("recommendation") or "").lower() == "approve"]
+    relevant = denied or approved or available
+
+    mod.metadata["reviewers"] = reviewers
+    mod.metadata["reviewRecommendation"] = "deny" if denied else ("approve" if approved else "review")
+    mod.metadata["reviewReason"] = " | ".join(
+        f"{item.get('reviewer', 'reviewer')}: {item.get('reason', '')}" for item in relevant
+    )[:2000]
+    mod.metadata["externalReviewStatus"] = external_status
+    mod.metadata["externalReviewRequestId"] = str(review.get("requestId") or mod.metadata.get("externalReviewRequestId") or "")
+    mod.metadata["externalReviewedAt"] = str(review.get("reviewedAt") or datetime.now().isoformat())
+    _save_pending()
+    return {"status": "ok", "modification": mod.to_dict()}
+
 def approve_modification(mod_id: str) -> Dict[str, Any]:
     """Approve and apply a pending modification"""
     if mod_id not in _pending_modifications:
@@ -1032,12 +1073,39 @@ def approve_modification(mod_id: str) -> Dict[str, Any]:
             "modification_id": mod_id
         }
 
-def reject_modification(mod_id: str) -> Dict[str, Any]:
+def reject_modification(
+    mod_id: str,
+    reason: str = "",
+    reviewer: str = "user",
+    model: str = "",
+) -> Dict[str, Any]:
     """Reject a pending modification"""
     if mod_id not in _pending_modifications:
         return {"status": "error", "message": f"Modification {mod_id} not found"}
 
     mod = _pending_modifications[mod_id]
+    if mod.status != "pending":
+        return {"status": "error", "message": f"Modification already {mod.status}"}
+
+    rejection_reason = str(reason or "").strip()[:2000]
+    reviewer_name = str(reviewer or "user").strip()[:80] or "user"
+    if rejection_reason:
+        receipt = {
+            "reviewer": reviewer_name,
+            "model": str(model or "").strip()[:120],
+            "recommendation": "deny",
+            "reason": rejection_reason,
+            "reviewedAt": datetime.now().isoformat(),
+        }
+        prior = [
+            item for item in (mod.metadata.get("reviewers") or [])
+            if str(item.get("reviewer") or "") != reviewer_name
+        ]
+        mod.metadata["reviewers"] = prior + [receipt]
+        mod.metadata["reviewRecommendation"] = "deny"
+        mod.metadata["reviewReason"] = f"{reviewer_name}: {rejection_reason}"[:2000]
+        mod.metadata["rejectionReason"] = rejection_reason
+    mod.metadata["rejectedAt"] = datetime.now().isoformat()
     mod.status = "rejected"
     _save_pending()
     return {
@@ -1218,6 +1286,13 @@ def self_mod_tool_handler(args: Dict[str, Any]) -> Dict[str, Any]:
     elif action == "list_pending":
         return {"status": "ok", "pending": list_pending_modifications()}
 
+    elif action == "update_review":
+        return update_proposal_review(
+            args.get("modification_id"),
+            args.get("review") or {},
+            args.get("external_review_status") or "complete",
+        )
+
     elif action == "list_all":
         # All modifications with their real status (pending/applied/rejected/failed) — used to
         # answer "did it apply?" accurately instead of guessing.
@@ -1229,7 +1304,12 @@ def self_mod_tool_handler(args: Dict[str, Any]) -> Dict[str, Any]:
     
     elif action == "reject":
         mod_id = args.get("modification_id")
-        return reject_modification(mod_id)
+        return reject_modification(
+            mod_id,
+            args.get("reason") or args.get("rejection_reason") or "",
+            args.get("reviewer") or "user",
+            args.get("model") or "",
+        )
     
     elif action == "rollback":
         file_key = args.get("file")

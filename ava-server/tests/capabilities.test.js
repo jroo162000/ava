@@ -27,6 +27,12 @@ describe('Capabilities + Explain', () => {
     expect(c).toHaveProperty('bridge');
     expect(c.bridge).toHaveProperty('port');
     expect(c).toHaveProperty('llmProvider');
+    expect(c.runtime.voice).toMatchObject({
+      runnerPresent: true,
+      wakeWordMode: 'local-whisper-final-gate',
+    });
+    expect(c.runtime.voice.configuredServer).toMatch(/\/respond$/);
+    expect(c.runtime.voice.wakePhrasesConfigured).toBeGreaterThan(0);
   });
 
   it('GET /self/explain should provide identity, capability summary, and improvement model', async () => {
@@ -44,4 +50,3 @@ describe('Capabilities + Explain', () => {
     expect(Array.isArray(res.body.canDo.tools)).toBe(true);
   });
 });
-

@@ -55,6 +55,22 @@ def test_resolve_command_rejects_non_speech_vosk_hint():
     assert source == "none"
 
 
+def test_reply_for_command_routes_through_shared_server(monkeypatch):
+    ptt = load_ptt()
+    calls = []
+    monkeypatch.setattr(
+        ptt,
+        "_server_respond",
+        lambda command, config: calls.append((command, config)) or "One shared response.",
+    )
+
+    reply, source = ptt.reply_for_command("what time is it", {"server_url": "local"})
+
+    assert calls == [("what time is it", {"server_url": "local"})]
+    assert reply == "One shared response."
+    assert source == "server"
+
+
 def test_push_to_talk_cli_exposes_start_delay_and_prompt():
     src = PTT_PATH.read_text(encoding="utf-8")
 

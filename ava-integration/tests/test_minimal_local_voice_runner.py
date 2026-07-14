@@ -16,9 +16,9 @@ def test_minimal_runner_is_parallel_to_monolith_and_half_duplex():
     assert "WhisperModel" in src
     assert "PiperBinTTS" in src
     assert "LISTENING -> FINALIZING -> RESPONDING -> SPEAKING -> COOLDOWN -> LISTENING" in src
-    assert "self.tts.speak(text, on_chunk, frame_ms=100)" in src
+    assert "self.tts.speak(spoken, on_chunk, frame_ms=100)" in src
     assert "ignored_no_wake" in src
-    assert "_local_fact_reply" in src
+    assert "_server_respond(command, self.config)" in src
     assert 'default_blocklist = ["webcam", "c920e"]' in src
     assert "configured_input_blocked" in src
     assert "candidate_hot_rejected" in src
@@ -44,7 +44,7 @@ def test_minimal_runner_is_parallel_to_monolith_and_half_duplex():
     assert "ignored_asr_filler" in src
     assert "wake_gate=vosk" in src
     assert "AVA_LOCAL_WAKE_GATE_AFTER" in src
-    assert 'os.getenv("AVA_LOCAL_WAKE_GATE_AFTER", "0")' in src
+    assert 'os.getenv("AVA_LOCAL_WAKE_GATE_AFTER", "-1")' in src
     assert "ignored_wake_gate_no_wake" in src
     assert "wake_gate_short_bypass" in src
     assert "_wake_gate_partial_wake_hint" in src
@@ -66,7 +66,7 @@ def test_minimal_runner_is_parallel_to_monolith_and_half_duplex():
     assert "debug_wav reason=" in src
     assert '"wake_gate_block"' in src
     assert "AVA_ASR_TRACE_DIR" in src
-    assert '_log("tts=piper")' in src
+    assert "tts=piper" in src
     assert "AVA_LOCAL_VAD_MIN_START_RMS" in src
     assert '"local_start_rms", 250' in src
     assert '"local_start_noise_mult", 3.0' in src
@@ -109,11 +109,14 @@ def test_minimal_runner_is_parallel_to_monolith_and_half_duplex():
 def test_minimal_runner_launcher_uses_new_entrypoint():
     root = Path(__file__).parent.parent
     launcher = (root / "start_local_voice.bat").read_text(encoding="utf-8")
+    supervisor = (root.parent / "docs" / "start_ava.ps1").read_text(encoding="utf-8")
 
-    assert "python ava_local_voice.py" in launcher
+    assert "start_ava.ps1" in launcher
+    assert "-Action Start" in launcher
+    assert "python ava_local_voice.py" not in launcher
     assert "ava_standalone_realtime.py" not in launcher
-    assert "AVA_TTS_CHUNKING=0" in launcher
-    assert "AVA_TTS_SEGMENTING=0" in launcher
+    assert "$VoiceScript = Join-Path $IntegrationDir 'ava_local_voice.py'" in supervisor
+    assert "Start-ManagedProcess 'voice' $VoiceScript" in supervisor
 
     ui_launcher = (root / "start_ava_realtime_ui.bat").read_text(encoding="utf-8")
     assert "http://127.0.0.1:8765/api/status" in ui_launcher
@@ -369,7 +372,7 @@ def test_deterministic_wav_loader_builds_captured_utterance(tmp_path):
 
 def test_deterministic_input_wav_routes_through_same_handler(monkeypatch, tmp_path):
     runner = ava_local_voice.LocalVoiceRunner.__new__(ava_local_voice.LocalVoiceRunner)
-    runner.config = {}
+    runner.config = {"streaming": {"enabled": False}}
     runner.followup_until = 0.0
     runner.no_wake_streak = 0
     runner.wake_gate_after_no_wake = 0
@@ -378,6 +381,7 @@ def test_deterministic_input_wav_routes_through_same_handler(monkeypatch, tmp_pa
     runner.last_spoken_text = ""
 
     initialized = {}
+    server_commands = []
 
     def fake_initialize(*, input_enabled=True, playback_enabled=True):
         initialized["input_enabled"] = input_enabled
@@ -400,6 +404,11 @@ def test_deterministic_input_wav_routes_through_same_handler(monkeypatch, tmp_pa
     )
     monkeypatch.setattr(runner, "_transcribe", lambda _utterance: "hey ava what time is it")
     monkeypatch.setattr(runner, "_speak", lambda text: setattr(runner, "last_spoken_text", text))
+    monkeypatch.setattr(
+        ava_local_voice,
+        "_server_respond",
+        lambda text, _config: server_commands.append(text) or "Server answered once.",
+    )
 
     summary = runner.run_input_wav(tmp_path / "synthetic.wav", playback_enabled=False)
 
@@ -407,13 +416,14 @@ def test_deterministic_input_wav_routes_through_same_handler(monkeypatch, tmp_pa
     assert summary["accepted"] is True
     assert summary["transcript"] == "hey ava what time is it"
     assert summary["command"] == "what time is it"
-    assert summary["reply"].startswith("It's ")
+    assert server_commands == ["what time is it"]
+    assert summary["reply"] == "Server answered once."
     assert summary["tts_attempted"] is True
 
 
 def test_live_input_wav_routes_through_capture_loop(monkeypatch, tmp_path):
     runner = ava_local_voice.LocalVoiceRunner.__new__(ava_local_voice.LocalVoiceRunner)
-    runner.config = {}
+    runner.config = {"streaming": {"enabled": False}}
     runner.followup_until = 0.0
     runner.no_wake_streak = 0
     runner.wake_gate_after_no_wake = 0
@@ -423,6 +433,7 @@ def test_live_input_wav_routes_through_capture_loop(monkeypatch, tmp_path):
     runner.input_stream = None
 
     calls = []
+    server_commands = []
 
     def fake_initialize(*, input_enabled=True, playback_enabled=True):
         calls.append(("initialize", input_enabled, playback_enabled))
@@ -455,6 +466,11 @@ def test_live_input_wav_routes_through_capture_loop(monkeypatch, tmp_path):
     monkeypatch.setattr(runner, "_capture_utterance", fake_capture)
     monkeypatch.setattr(runner, "_transcribe", lambda _utterance: calls.append(("transcribe",)) or "hey ava what time is it")
     monkeypatch.setattr(runner, "_speak", lambda text: setattr(runner, "last_spoken_text", text))
+    monkeypatch.setattr(
+        ava_local_voice,
+        "_server_respond",
+        lambda text, _config: server_commands.append(text) or "Server answered once.",
+    )
 
     summary = runner.run_live_input_wav(tmp_path / "synthetic.wav", playback_enabled=False)
 
@@ -467,7 +483,8 @@ def test_live_input_wav_routes_through_capture_loop(monkeypatch, tmp_path):
     assert summary["mode"] == "live_input_wav"
     assert summary["accepted"] is True
     assert summary["command"] == "what time is it"
-    assert summary["reply"].startswith("It's ")
+    assert server_commands == ["what time is it"]
+    assert summary["reply"] == "Server answered once."
     assert summary["vad_start"] == 500
     assert summary["captured_peak_rms"] == 5200
     assert summary["tts_attempted"] is True

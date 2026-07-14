@@ -15,6 +15,42 @@ const STOP = new Set(['the', 'a', 'an', 'and', 'or', 'but', 'what', 'did', 'we',
   'my', 'i', 'it', 'that', 'this', 'with', 'was', 'were', 'they', 'them', 'how', 'when', 'where',
   'why', 'who', 'can', 'could', 'would', 'should', 'please', 'tell', 'know', 'say', 'said', 'get']);
 
+/**
+ * searchMemoryFiles — reads each curated file (USER.md, MEMORY.md), returns matched lines
+ * with filename, line number, and score based on query terms and exact phrase.
+ * @param {string[]} ts — array of query terms (lowercased, filtered)
+ * @param {string} ql — original lowercased trimmed query string (for exact-phrase bonus)
+ * @returns {Array<{source:string, label:string, date:string, score:number, text:string, line:number, filename:string}>}
+ */
+function searchMemoryFiles(ts, ql) {
+  const results = [];
+  const entries = [['USER profile', curatedMemory.paths.userPath()], ['AVA notes', curatedMemory.paths.memoryPath()]];
+  for (const [label, p] of entries) {
+    try {
+      const text = fs.readFileSync(p, 'utf8');
+      const lines = text.split('\n');
+      for (let i = 0; i < lines.length; i++) {
+        const line = lines[i];
+        if (!line.trim()) continue;
+        const low = line.toLowerCase();
+        const score = ts.reduce((s, t) => s + (low.includes(t) ? 1 : 0), 0) + (ql && low.includes(ql) ? 2 : 0);
+        if (score > 0) {
+          results.push({
+            source: 'memory',
+            label,
+            date: '',
+            score: score + 3,
+            text: line.trim(),
+            line: i + 1,
+            filename: path.basename(p)
+          });
+        }
+      }
+    } catch { /* file optional */ }
+  }
+  return results;
+}
+
 // Tier 1 #8: the conversation-logs location lives in ONE place now (utils/paths.js).
 function logsDir() { return avaPaths.conversationLogsDir(); }
 
@@ -30,17 +66,9 @@ export function search(query, limit = 8) {
   const results = [];
 
   // 1) curated memory files — distilled facts, highest priority
-  for (const [label, p] of [['USER profile', curatedMemory.paths.userPath()], ['AVA notes', curatedMemory.paths.memoryPath()]]) {
-    try {
-      const text = fs.readFileSync(p, 'utf8');
-      for (const line of text.split('\n')) {
-        if (!line.trim()) continue;
-        const low = line.toLowerCase();
-        const score = ts.reduce((s, t) => s + (low.includes(t) ? 1 : 0), 0) + (ql && low.includes(ql) ? 2 : 0);
-        if (score > 0) results.push({ source: 'memory', label, date: '', score: score + 3, text: line.trim() });
-      }
-    } catch { /* file optional */ }
-  }
+  // Use the new searchMemoryFiles helper for richer results (filename + line number)
+  const memoryFileResults = searchMemoryFiles(ts, ql);
+  for (const r of memoryFileResults) results.push(r);
 
   // 1b) saved skills (reusable how-tos)
   try { for (const s of skillStore.searchSkills(query, ts)) results.push(s); } catch { /* optional */ }

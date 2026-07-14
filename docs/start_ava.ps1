@@ -1,61 +1,234 @@
-<#
-Starts the full AVA stack locally so you can use the website URL.
+[CmdletBinding()]
+param(
+  [ValidateSet('Start', 'Stop', 'Restart', 'Status', 'Watch')]
+  [string]$Action = 'Start',
+  [int]$ServerPort = $(if ($env:AVA_PORT) { [int]$env:AVA_PORT } else { 5051 }),
+  [int]$ClientPort = $(if ($env:AVA_CLIENT_PORT) { [int]$env:AVA_CLIENT_PORT } else { 5173 }),
+  [switch]$NoWatchdog
+)
 
-It will:
-  1) Start the backend (ava-server) on http://127.0.0.1:5051
-  2) Start the frontend (ava-client) dev server on http://localhost:5173
+$ErrorActionPreference = 'Stop'
+$RepoRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
+$ServerDir = Join-Path $RepoRoot 'ava-server'
+$ClientDir = Join-Path $RepoRoot 'ava-client'
+$IntegrationDir = Join-Path $RepoRoot 'ava-integration'
+$IntegrationEnv = Join-Path $IntegrationDir '.env'
+$VoiceScript = Join-Path $IntegrationDir 'ava_local_voice.py'
+$PythonExe = Join-Path $IntegrationDir '.venv\Scripts\python.exe'
+$ServerEntry = Join-Path $ServerDir 'src\server.js'
+$ViteEntry = Join-Path $ClientDir 'node_modules\vite\bin\vite.js'
+$StatePath = Join-Path $ServerDir 'data\runtime-supervisor.json'
+$LogDir = Join-Path $RepoRoot 'logs\runtime'
+$SupervisorMarker = '-Action Watch -ServerPort'
+$script:Roles = [ordered]@{}
 
-Usage:
-  From the repo root:  ./start_ava.ps1
+function Ensure-Layout {
+  foreach ($path in @($ServerDir, $ClientDir, $IntegrationDir, $VoiceScript, $PythonExe, $ServerEntry, $ViteEntry)) {
+    if (-not (Test-Path -LiteralPath $path)) { throw "Required AVa component is missing: $path" }
+  }
+  New-Item -ItemType Directory -Force -Path (Split-Path $StatePath), $LogDir | Out-Null
+}
 
-Notes:
-  - Accept the Windows firewall prompt for Node.js if shown.
-  - If ports are busy, the script will tell you what to do.
-#>
+function Import-SelectedEnv([string]$Path, [string[]]$Names) {
+  if (-not (Test-Path -LiteralPath $Path)) { return }
+  foreach ($line in Get-Content -LiteralPath $Path) {
+    if ($line -notmatch '^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$') { continue }
+    $name = $Matches[1]
+    if ($Names -notcontains $name) { continue }
+    $value = $Matches[2].Trim()
+    if ($value.Length -ge 2) {
+      $quoted = ($value.StartsWith('"') -and $value.EndsWith('"')) -or
+        ($value.StartsWith("'") -and $value.EndsWith("'"))
+      if ($quoted) { $value = $value.Substring(1, $value.Length - 2) }
+    }
+    [Environment]::SetEnvironmentVariable($name, $value, [EnvironmentVariableTarget]::Process)
+  }
+}
 
-function Test-Port($Port){
+function Get-RawCommandProcesses([string]$Marker) {
+  @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
+    $_.CommandLine -and $_.CommandLine.IndexOf($Marker, [StringComparison]::OrdinalIgnoreCase) -ge 0
+  })
+}
+
+function Get-CommandProcesses([string]$Marker) {
+  $matches = @(Get-RawCommandProcesses $Marker)
+  $matchIds = @($matches | ForEach-Object { [int]$_.ProcessId })
+  @($matches | Where-Object { $matchIds -notcontains [int]$_.ParentProcessId })
+}
+
+function Stop-ProcessTree([int]$ProcessId) {
+  $children = @(Get-CimInstance Win32_Process -Filter "ParentProcessId=$ProcessId" -ErrorAction SilentlyContinue)
+  foreach ($child in $children) { Stop-ProcessTree ([int]$child.ProcessId) }
+  Stop-Process -Id $ProcessId -Force -ErrorAction SilentlyContinue
+}
+
+function Get-PortOwner([int]$Port) {
   try {
-    $net = (netstat -ano | Select-String ":$Port\s").ToString()
-    return -not [string]::IsNullOrWhiteSpace($net)
+    Get-NetTCPConnection -State Listen -LocalPort $Port -ErrorAction Stop | Select-Object -First 1
+  } catch { $null }
+}
+
+function Test-AvaHealth {
+  try {
+    $health = Invoke-RestMethod -Uri "http://127.0.0.1:$ServerPort/health" -TimeoutSec 8
+    return $health.ok -eq $true -and $null -ne $health.toolsCount
   } catch { return $false }
 }
 
-Write-Host "[AVA] Ensuring backend (5051) and frontend (5173) are running..." -ForegroundColor Cyan
+function Wait-Until([scriptblock]$Condition, [int]$TimeoutSeconds, [string]$Description) {
+  $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+  while ((Get-Date) -lt $deadline) {
+    if (& $Condition) { return }
+    Start-Sleep -Milliseconds 500
+  }
+  throw "Timed out waiting for $Description"
+}
 
-# 1) Start backend
-Push-Location "$PSScriptRoot/ava-server"
-try {
-  if (-not (Test-Path node_modules)) {
-    Write-Host "[AVA] Installing server deps..." -ForegroundColor Yellow
-    npm install
+function Register-Role([string]$Role, $Process, [string]$Marker, [bool]$Adopted) {
+  $script:Roles[$Role] = [ordered]@{
+    role = $Role
+    pid = [int]$Process.ProcessId
+    marker = $Marker
+    adopted = $Adopted
+    observedAt = (Get-Date).ToUniversalTime().ToString('o')
+  }
+}
+
+function Start-ManagedProcess(
+  [string]$Role,
+  [string]$Marker,
+  [string]$FilePath,
+  [string[]]$Arguments,
+  [string]$WorkingDirectory
+) {
+  $existing = @(Get-CommandProcesses $Marker | Sort-Object CreationDate)
+  if ($existing.Count -gt 0) {
+    Register-Role $Role $existing[0] $Marker $true
+    if ($existing.Count -gt 1) {
+      foreach ($duplicate in $existing | Select-Object -Skip 1) {
+        Stop-ProcessTree ([int]$duplicate.ProcessId)
+      }
+      Write-Warning "Stopped $($existing.Count - 1) duplicate $Role process(es)."
+    }
+    return
   }
 
-  if (Test-Port 5051) {
-    Write-Host "[AVA] Port 5051 already in use. Assuming server is running." -ForegroundColor Yellow
+  $stdout = Join-Path $LogDir "$Role.out.log"
+  $stderr = Join-Path $LogDir "$Role.err.log"
+  $argumentLine = @($Arguments | ForEach-Object {
+    $value = [string]$_
+    if ($value -match '[\s"]') { '"' + $value.Replace('"', '\"') + '"' } else { $value }
+  }) -join ' '
+  $process = Start-Process -FilePath $FilePath -ArgumentList $argumentLine -WorkingDirectory $WorkingDirectory `
+    -WindowStyle Hidden -RedirectStandardOutput $stdout -RedirectStandardError $stderr -PassThru
+  $cim = Get-CimInstance Win32_Process -Filter "ProcessId=$($process.Id)" -ErrorAction Stop
+  Register-Role $Role $cim $Marker $false
+}
+
+function Save-State {
+  $state = [ordered]@{
+    schemaVersion = 1
+    canonicalVoiceRunner = $VoiceScript
+    serverUrl = "http://127.0.0.1:$ServerPort"
+    clientUrl = "http://127.0.0.1:$ClientPort"
+    updatedAt = (Get-Date).ToUniversalTime().ToString('o')
+    roles = @($script:Roles.Values)
+  }
+  $state | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $StatePath -Encoding UTF8
+}
+
+function Start-Stack([bool]$StartWatchdog = $true) {
+  Ensure-Layout
+  # Keep voice-only credentials and backend selection scoped to managed AVa processes.
+  Import-SelectedEnv $IntegrationEnv @('AVA_TTS_KOKORO', 'ELEVENLABS_API_KEY', 'ELEVENLABS_VOICE_ID')
+  $node = (Get-Command node.exe -ErrorAction Stop).Source
+  $powershell = (Get-Command powershell.exe -ErrorAction Stop).Source
+  $env:AVA_INTEGRATION_DIR = $IntegrationDir
+  $env:AVA_SERVER_URL = "http://127.0.0.1:$ServerPort"
+  $env:AVA_PORT = [string]$ServerPort
+  $env:AVA_CLIENT_PORT = [string]$ClientPort
+  Remove-Item Env:DISABLE_AUTONOMY -ErrorAction SilentlyContinue
+
+  if (-not (Test-AvaHealth)) {
+    $owner = Get-PortOwner $ServerPort
+    if ($owner -and @(Get-CommandProcesses $ServerEntry).Count -eq 0) {
+      throw "Port $ServerPort is occupied by PID $($owner.OwningProcess), but it is not AVa's canonical server."
+    }
+    Start-ManagedProcess 'server' $ServerEntry $node @($ServerEntry) $ServerDir
+    Wait-Until { Test-AvaHealth } 120 'AVa server health'
   } else {
-    Write-Host "[AVA] Starting server on http://127.0.0.1:5051" -ForegroundColor Cyan
-    Start-Process powershell -ArgumentList '-NoExit','-Command','npm start' -WorkingDirectory (Get-Location)
+    $server = @(Get-CommandProcesses $ServerEntry | Select-Object -First 1)
+    if ($server.Count) { Register-Role 'server' $server[0] $ServerEntry $true }
+  }
+
+  $clientOwner = Get-PortOwner $ClientPort
+  $clientProcesses = @(Get-CommandProcesses $ViteEntry)
+  if ($clientOwner -and $clientProcesses.Count -eq 0) {
+    throw "Port $ClientPort is occupied by PID $($clientOwner.OwningProcess), but it is not AVa's UI."
+  }
+  Start-ManagedProcess 'client' $ViteEntry $node @($ViteEntry, '--host', '127.0.0.1', '--port', [string]$ClientPort, '--strictPort') $ClientDir
+  Wait-Until { $null -ne (Get-PortOwner $ClientPort) } 45 'AVa UI port'
+
+  Start-ManagedProcess 'voice' $VoiceScript $PythonExe @($VoiceScript) $IntegrationDir
+
+  if ($StartWatchdog -and -not $NoWatchdog) {
+    Start-ManagedProcess 'watchdog' $SupervisorMarker $powershell @(
+      '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $PSCommandPath,
+      '-Action', 'Watch', '-ServerPort', [string]$ServerPort, '-ClientPort', [string]$ClientPort, '-NoWatchdog'
+    ) $RepoRoot
+  }
+  Save-State
+}
+
+function Stop-Matching([string]$Marker, [string]$Role) {
+  $matches = @(Get-CommandProcesses $Marker | Sort-Object CreationDate -Descending)
+  foreach ($process in $matches) {
+    Stop-ProcessTree ([int]$process.ProcessId)
+  }
+  if ($matches.Count) { Write-Host "Stopped $Role ($($matches.Count) process(es))." }
+}
+
+function Stop-Stack {
+  Stop-Matching $SupervisorMarker 'watchdog'
+  Stop-Matching $VoiceScript 'voice'
+  Stop-Matching $ViteEntry 'client'
+  Stop-Matching $ServerEntry 'server'
+  if (Test-Path -LiteralPath $StatePath) {
+    $stopped = [ordered]@{ schemaVersion = 1; status = 'stopped'; updatedAt = (Get-Date).ToUniversalTime().ToString('o'); roles = @() }
+    $stopped | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $StatePath -Encoding UTF8
+  }
+}
+
+function Show-Status {
+  $items = @(
+    [pscustomobject]@{ Role = 'server'; Count = @(Get-CommandProcesses $ServerEntry).Count; Healthy = (Test-AvaHealth) }
+    [pscustomobject]@{ Role = 'client'; Count = @(Get-CommandProcesses $ViteEntry).Count; Healthy = ($null -ne (Get-PortOwner $ClientPort)) }
+    [pscustomobject]@{ Role = 'voice'; Count = @(Get-CommandProcesses $VoiceScript).Count; Healthy = (@(Get-CommandProcesses $VoiceScript).Count -eq 1) }
+    [pscustomobject]@{ Role = 'watchdog'; Count = @(Get-CommandProcesses $SupervisorMarker).Count; Healthy = (@(Get-CommandProcesses $SupervisorMarker).Count -eq 1) }
+  )
+  $items | Format-Table -AutoSize
+  Write-Host "UI: http://127.0.0.1:$ClientPort"
+  Write-Host "Server: http://127.0.0.1:$ServerPort"
+}
+
+switch ($Action) {
+  'Start' {
+    Start-Stack
+    Show-Status
+  }
+  'Stop' { Stop-Stack }
+  'Restart' {
+    Stop-Stack
     Start-Sleep -Seconds 2
+    Start-Stack
+    Show-Status
+  }
+  'Status' { Show-Status }
+  'Watch' {
+    while ($true) {
+      try { Start-Stack $false } catch { Write-Error $_ -ErrorAction Continue }
+      Start-Sleep -Seconds 15
+    }
   }
 }
-finally { Pop-Location }
-
-# 2) Start frontend
-Push-Location "$PSScriptRoot/ava-client"
-try {
-  if (-not (Test-Path node_modules)) {
-    Write-Host "[AVA] Installing client deps..." -ForegroundColor Yellow
-    npm install
-  }
-
-  if (Test-Port 5173) {
-    Write-Host "[AVA] Port 5173 already in use. Open http://localhost:5173" -ForegroundColor Green
-  } else {
-    Write-Host "[AVA] Starting client dev server on http://localhost:5173" -ForegroundColor Cyan
-    Start-Process powershell -ArgumentList '-NoExit','-Command','npm run dev -- --host --port 5173 --strictPort' -WorkingDirectory (Get-Location)
-  }
-}
-finally { Pop-Location }
-
-Write-Host "[AVA] Ready: Frontend http://localhost:5173  |  Backend http://127.0.0.1:5051" -ForegroundColor Green
-

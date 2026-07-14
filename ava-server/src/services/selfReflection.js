@@ -124,25 +124,27 @@ function _writeCursor(n) { try { fs.mkdirSync(path.dirname(CURSOR), { recursive:
 // Cache conversationLogger and curatedMemory once so _gatherEvidence reuses them. Loaded on first
 // call (not at import time) to keep the module side-effect-free at bootstrap.
 let _convLogger = null;
-let _curated = null;
+let _memoryHub = null;
 let _loading = false;
 
 async function _ensureLazyDeps() {
-  if (_convLogger && _curated) return;
+  if (_convLogger && _memoryHub) return;
   if (_loading) { while (_loading) await new Promise(r => setTimeout(r, 10)); return; }
   _loading = true;
   try {
-    const [conv, cur] = await Promise.all([
+    const [conv, memory] = await Promise.all([
       import('./conversationLogger.js'),
-      import('./curatedMemory.js'),
+      import('./memoryHub.js'),
     ]);
     _convLogger = conv.default;
-    _curated = cur.default;
+    _memoryHub = memory.default;
   } catch { /* will retry on next call */ } finally { _loading = false; }
 }
 
 /** User-friction keywords — when the user says these AVA needs to learn. */
-const FRICTION_PATTERNS = [/\b(stop|wrong|incorrect|no|fix|bad|terrible|awful|horrible|nonsense|rubbish|useless)\b/i];
+const FRICTION_PATTERNS = [
+  /\b(stop|wrong|incorrect|not what i|you (didn'?t|did not|aren'?t|are not)|you'?re not|still not|again|don'?t|do not|should have|need to|make sure|why did you|that'?s not|fix this|broke|broken|repeated|twice)\b/i,
+];
 
 /** Pure: given the raw jsonl lines and a start cursor, return { lessons, total } (distinct, trimmed). */
 export function _lessonsFromLines(lines, cursor = 0) {
@@ -171,24 +173,26 @@ export function _lessonsFromLines(lines, cursor = 0) {
  */
 export async function _gatherEvidence() {
   await _ensureLazyDeps();
-  if (!_convLogger || !_curated) return { stored: 0, error: 'deps_unavailable' };
-  const history = _convLogger.history;
+  if (!_convLogger || !_memoryHub) return { stored: 0, error: 'deps_unavailable' };
+  const history = _convLogger.getRecentHistoryAcrossDays(80);
   if (!Array.isArray(history) || history.length === 0) return { stored: 0, found: 0 };
-  // take last 10 entries (or all if fewer)
-  const slice = history.slice(-10);
+  const slice = history.slice(-80);
   const found = [];
-  for (const entry of slice) {
+  for (let index = 0; index < slice.length; index += 1) {
+    const entry = slice[index];
+    const role = entry?.direction || entry?.role;
+    if (role !== 'user' && role !== 'human') continue;
     const text = (entry && (entry.text || entry.content || entry.message || '')) || '';
     for (const pat of FRICTION_PATTERNS) {
       const m = text.match(pat);
       if (m) {
         let userText = text;
-        // try to isolate the user utterance if entry has role
-        if (entry.role === 'user' || entry.role === 'human') userText = text;
+        const prior = [...slice.slice(0, index)].reverse().find(item => (item?.direction || item?.role) === 'assistant');
         found.push({
-          ts: entry.ts || Date.now(),
-          role: entry.role || 'user',
+          ts: entry.ts || entry.unixTime || Date.now(),
+          role: 'user',
           snippet: userText.substring(0, 200),
+          priorAssistant: String(prior?.content || prior?.text || '').slice(0, 240),
           matched: m[0],
         });
         break;
@@ -199,14 +203,15 @@ export async function _gatherEvidence() {
   let stored = 0;
   for (const f of found) {
     try {
-      await _curated.store(`friction:${Date.now()}:${Math.random().toString(36).slice(2, 8)}`, {
-        text: `User friction detected: "${f.matched}" in: ${f.snippet}`,
+      await _memoryHub.upsert({
+        text: `User correction: ${f.snippet}${f.priorAssistant ? ` | Prior AVA response: ${f.priorAssistant}` : ''}`,
         type: 'warning',
-        priority: 3,
-        source: 'self-reflection.gatherEvidence',
-        tags: ['friction', 'user-feedback', 'self-reflection'],
-        role: 'assistant',
-        ts: f.ts,
+        priority: 5,
+        source: 'correction',
+        tags: ['correction', 'user-feedback', 'behavioral-learning'],
+        role: 'user',
+        created_at: f.ts,
+        meta: { matched: f.matched, priorAssistant: f.priorAssistant },
       });
       stored++;
     } catch { /* skip one failure */ }

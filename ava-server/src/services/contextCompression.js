@@ -7,6 +7,7 @@ import fs from 'fs';
 import path from 'path';
 import logger from '../utils/logger.js';
 import llmService from './llm.js';
+import avaPaths from '../utils/paths.js';
 
 // Rough token estimate: ~140 characters per 100 tokens (observed average for English text)
 function _estimateTokens(text) {
@@ -15,7 +16,7 @@ function _estimateTokens(text) {
 }
 import conversationLogger from './conversationLogger.js';
 
-const FILE = path.join(process.cwd(), 'data', 'lineage.json');
+const FILE = path.join(avaPaths.dataDir(), 'lineage.json');
 const TURN_TRIGGER = parseInt(process.env.AVA_COMPRESS_EVERY_TURNS || '20', 10); // start compressing past ~N turns
 const MIN_NEW = parseInt(process.env.AVA_COMPRESS_MIN_NEW || '8', 10);           // need this many new turns since last gen
 const THROTTLE_MS = 60000;

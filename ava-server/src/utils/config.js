@@ -7,29 +7,11 @@
 
 import fs from 'fs'
 import path from 'path'
-import { fileURLToPath } from 'url'
 import logger from './logger.js'
-
-const __filename = fileURLToPath(import.meta.url)
-const __dirname = path.dirname(__filename)
-const SERVER_ROOT = path.resolve(__dirname, '..', '..')
+import avaPaths from './paths.js'
 
 function resolveIntegrationDir() {
-  const home = process.env.USERPROFILE || process.env.HOME || ''
-  const candidates = [
-    process.env.AVA_INTEGRATION_DIR,
-    path.resolve(SERVER_ROOT, '..', 'ava-integration'),
-    path.resolve(process.cwd(), '..', 'ava-integration'),
-    home ? path.join(home, 'ava', 'ava-integration') : '',
-    home ? path.join(home, 'ava-integration') : ''
-  ].filter(Boolean)
-
-  for (const candidate of candidates) {
-    try {
-      if (fs.existsSync(candidate)) return candidate
-    } catch {}
-  }
-  return candidates[0] || path.resolve(SERVER_ROOT, '..', 'ava-integration')
+  return avaPaths.integrationDir()
 }
 
 // Key file mappings for fallback loading (DEPRECATED)
@@ -80,8 +62,7 @@ class Config {
     // Try to load .env from ava-integration directory
     const integrationPaths = [
       path.join(this.integrationDir, '.env'),
-      path.join(process.cwd(), '..', 'ava-integration', '.env'),
-      path.join(process.cwd(), '.env')
+      path.join(avaPaths.serverDir(), '.env')
     ];
 
     for (const envPath of integrationPaths) {
